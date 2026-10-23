@@ -95,6 +95,7 @@ Status :: enum u16 {
 	Not_Implemented     = 501,
 	Bad_Gateway         = 502,
 	Service_Unavailable = 503,
+	Gateway_Timeout     = 504,
 }
 
 status_text :: proc(s: Status) -> string {
@@ -145,6 +146,8 @@ status_text :: proc(s: Status) -> string {
 		return "Bad Gateway"
 	case .Service_Unavailable:
 		return "Service Unavailable"
+	case .Gateway_Timeout:
+		return "Gateway Timeout"
 	}
 	return "Unknown"
 }

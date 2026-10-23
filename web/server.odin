@@ -45,6 +45,10 @@ Server :: struct {
 	conns:     [dynamic]^Conn,
 	filters:   ^Filter,
 
+	// built-in chunked encoding filter, registered at listen time so a
+	// handler can opt in with `res.chunked = true` and nothing else
+	chunked_filter: Chunked_Filter,
+
 	// configuration
 	keep_alive:            bool,
 	max_requests_per_conn: int,
@@ -112,6 +116,8 @@ server_listen :: proc(s: ^Server) -> bool {
 	}
 	s.listen_socket = sock
 	intrinsics.volatile_store(&s.listening, true)
+	filter_chunked_init(&s.chunked_filter)
+	filter_add(s, &s.chunked_filter.filter)
 	s.accept_op = nbio.accept_poly(sock, s, on_accept)
 	s.sweep_op = nbio.timeout_poly(SWEEP_INTERVAL, s, on_sweep)
 	log_info("web: listening on %v", s.address)

@@ -17,11 +17,16 @@ machine). One TCP connection walks it once per pipelined request:
 The request-level parser states live inside parse_request / the body
 reader; keeping the two layers separate is what makes keep-alive and
 pipelining tractable.
+
+`Proxy` is a detour taken when the handler is a reverse proxy: the
+connection parks there while an upstream request is in flight, and the
+upstream response is relayed back through the normal Write path.
 */
 Conn_State :: enum {
 	Read_Head,
 	Read_Body,
 	Process,
+	Proxy,
 	Write,
 	Closed,
 }
@@ -49,6 +54,17 @@ Conn :: struct {
 	inbuf: Buf, // raw bytes not yet consumed (head + body + pipelined)
 	out:      Buf, // response head (and body) pending write
 	body_buf: Buf, // chunked request body staging
+
+	// proxy state (see proxy.odin); only live while state == .Proxy
+	proxy_req:      Buf, // serialized upstream request
+	proxy_buf:      Buf, // upstream response accumulator
+	proxy_sock:     net.TCP_Socket,
+	proxy_open:     bool,
+	proxy_op:       ^nbio.Operation,
+	proxy_cfg:      ^Proxy,
+	proxy_state:    Proxy_State,
+	proxy_head_len: int,
+	proxy_remaining: int,
 
 	req: Request,
 	res: Response,
@@ -81,6 +97,8 @@ conn_new :: proc(s: ^Server, socket: net.TCP_Socket, remote: net.Endpoint) -> ^C
 	buf_init(&c.inbuf, s.allocator)
 	buf_init(&c.out, s.allocator)
 	buf_init(&c.body_buf, s.allocator)
+	buf_init(&c.proxy_req, s.allocator)
+	buf_init(&c.proxy_buf, s.allocator)
 	append(&s.conns, c)
 	s.stats.conns_opened += 1
 	s.stats.conns_active = len(s.conns)
@@ -96,9 +114,16 @@ conn_destroy :: proc(c: ^Conn) {
 		nbio.close(c.res.file_handle)
 		c.res.file_open = false
 	}
+	// defensive: conn_close normally tears the upstream down first
+	if c.proxy_open {
+		nbio.close(c.proxy_sock)
+		c.proxy_open = false
+	}
 	buf_destroy(&c.inbuf)
 	buf_destroy(&c.out)
 	buf_destroy(&c.body_buf)
+	buf_destroy(&c.proxy_req)
+	buf_destroy(&c.proxy_buf)
 	mem.dynamic_arena_destroy(&c.scratch)
 	alloc := c.server.allocator
 	free(c, alloc)
@@ -126,6 +151,15 @@ conn_close :: proc(c: ^Conn) {
 	if c.op != nil {
 		nbio.remove(c.op)
 		c.op = nil
+	}
+	// cancel any in-flight upstream operation before its socket goes away
+	if c.proxy_op != nil {
+		nbio.remove(c.proxy_op)
+		c.proxy_op = nil
+	}
+	if c.proxy_open {
+		nbio.close(c.proxy_sock)
+		c.proxy_open = false
 	}
 	if s.on_conn_close != nil {
 		s.on_conn_close(s, c)
@@ -155,6 +189,10 @@ conn_drive :: proc(c: ^Conn) {
 			}
 		case .Process:
 			conn_process(c)
+		case .Proxy:
+			// parked: an upstream request is in flight; its callbacks
+			// drive the machine onwards
+			return
 		case .Write:
 			conn_begin_write(c)
 			return
@@ -331,6 +369,12 @@ conn_process :: proc(c: ^Conn) {
 		response_write_string(w, "404 page not found\n")
 	}
 
+	if c.state == .Proxy {
+		// the handler hijacked the connection into proxy mode; the
+		// upstream callbacks take it from here
+		return
+	}
+
 	// an explicit Connection header from the handler wins over negotiation
 	if v, ok := response_header(w, "Connection"); ok {
 		if eq_ignore_case(v, "close") {
@@ -439,12 +483,18 @@ conn_request_reset :: proc(c: ^Conn) {
 	mem.dynamic_arena_reset(&c.scratch)
 	buf_reset(&c.out)
 	buf_reset(&c.body_buf)
+	buf_reset(&c.proxy_req)
+	buf_reset(&c.proxy_buf)
 	c.req = {}
 	c.res = {}
 	c.body_remaining = 0
 	c.chunked = false
 	c.send_phase = .None
 	c.idle_since = {}
+	c.proxy_state = .None
+	c.proxy_head_len = 0
+	c.proxy_remaining = 0
+	c.proxy_cfg = nil
 }
 
 // conn_error emits a minimal error response and closes the connection

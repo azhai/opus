@@ -91,11 +91,13 @@ socket close）都能直接把 `^Conn` 传进回调，省掉了 C 风格 `void *
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ 用户代码：Handler / Router / Middleware / Static      │  ← Mongoose 式 API
+│ 用户代码：Handler / Router / Middleware / Static /    │  ← Mongoose 式 API
+│           Proxy                                      │
 ├─────────────────────────────────────────────────────┤
 │ server.odin    Server：listen/accept/sweep/run       │  ← 生命周期与配置
 │ router.odin    Router：两遍匹配 + 中间件链             │  ← lighttpd2 action 思想的
 │ static.odin    Static：stat 缓存 + sendfile           │     宿主语言实现
+│ proxy.odin     Proxy：上游转发 + hop-by-hop 过滤       │
 ├─────────────────────────────────────────────────────┤
 │ conn.odin      Conn：双层状态机 + 每连接 arena         │  ← lighttpd2 骨架
 │ request.odin   parse_request：零拷贝 header 视图        │
@@ -156,6 +158,12 @@ Odin 原生版）。收益：
 | `path_match` 中 `*` 通配检查置于 query 分离之前 | 否则 `/*` 无法匹配 `/`（"/" 的 qs 边界判断会先失败） |
 | HEAD 也发 `Content-Length` | RFC 7231 §4.3.2：HEAD 响应携带 GET 会有的长度，只是不带 body |
 | 0 字节文件：关闭 handle 发 `Content-Length: 0` | 避免对空文件发起 sendfile(0) 的边界情况 |
+| chunked filter 在 `server_listen` 自动注册 | handler 只需 `res.chunked = true`，不该被迫知道 filter 注册机制；chunked 编码是 HTTP 基础能力不是可选插件 |
+| 代理每请求新开上游连接 + `Connection: close` | 上游连接生命周期恰好一个请求，无需连接池、无需池锁、无半开连接清理；代价是每请求一次握手（路线图有池化） |
+| 代理完整缓冲上游响应后再中继 | 实现简单、可重新分帧（close-delimited → CL）、可完整错误处理；代价是内存随响应增长，路线图改流式 |
+| chunked 上游响应**透传分帧**而非解码重编码 | 避免二次拷贝，且天然支持 `TE: gzip, chunked` 等复合 codings；完整性用走查 chunk 大小判定（`proxy_chunked_complete`），不会被 payload 里的假终止序列骗到 |
+| close-delimited 上游响应由代理补 CL 重新分帧 | 缓冲已成事实，重分帧让客户端 keep-alive 不被破坏（nginx 同款行为） |
+| 未知上游状态码（599 等）连 reason phrase 透传 | `Status` 枚举只是常用子集；`Response.reason` 覆盖字段 + 整数→枚举强转实现完整透传 |
 | `nbio.Handle`(FD) 不可赋 nil | Odin distinct 整数类型语义；用 `file_open: bool` 标志表示"持有有效 handle" |
 | socket 异步关闭，`Conn` 在 close 回调里 free | `nbio.close_poly(socket, c, on_socket_closed)`：先 `nbio.remove(c.op)` 撤销在途操作防 UAF，关闭完成回调里 `free(c)` |
 | `server_run_until` 优雅 drain | 撤销 accept/sweep 操作后 tick 到 `nbio.num_waiting() == 0`，让在途关闭回调跑完，测试零泄漏 |
@@ -179,6 +187,21 @@ Odin 原生版）。收益：
 9. **测试里起服务线程：栈局部变量会悬空**——`integration_spin` 把 `Server`/`done`
    堆分配后传给线程，线程退出前 free。
 10. **`net.parse_endpoint`/`nbio.bound_endpoint` 返回多值**——注意 `ep, ok :=` 形式。
+11. **块注释会嵌套**——注释里出现 `/*` 序列（如文档示例中的路由模式
+    `"/api/*"`）会打开嵌套注释，必须自行配平或避开。写 doc.odin 的代码示例时
+    用字符串拼接 `"/api/" + "*"` 代替字面量。
+12. **nbio 操作的错误类型不统一**——`op.dial.err` 是 `Network_Error` 联合体
+    （`#shared_nil`），`op.recv.err`/`op.send.err` 是 `Recv_Error`/`Send_Error`
+    联合体（TCP/UDP 两个变体）。`.Timeout` 直接比较会因歧义报错，要先类型断言：
+    `if re, ok := op.recv.err.(net.TCP_Recv_Error); ok && re == .Timeout`。
+13. **整数→枚举强转可行**——`Status(u16(code))` 让代理能透传枚举外的状态码
+    （599 等），配合 `Response.reason` 覆盖字段保留上游 reason phrase。
+14. **`fmt.bprintf` 返回 string 不是长度**——`addr := fmt.bprintf(buf, ...)`，
+    结果视图在 buf 上，需要长期持有得 clone。
+15. **异步回调里"需要更多数据"必须自己重新武装**——`conn_drive` 的状态机模式下
+    各状态（head/body 解析）自己 arm recv；代理的 `proxy_advance` 是纯判断函数，
+    `on_proxy_recv` 必须在它返回后检查连接是否仍停在 `.Proxy`，是则重新
+    `proxy_recv_arm`。漏了这一步的征兆是 chunked/close-delimited 上游场景挂死。
 
 ## 5. 性能注意点
 
@@ -193,16 +216,19 @@ Odin 原生版）。收益：
 
 ## 6. 路线图
 
-已实现（v0.1）：
+已实现（v0.2）：
 
 - [x] HTTP/1.1 解析（零拷贝 header）、keep-alive、pipelining
 - [x] 请求体：Content-Length + chunked（含解码暂存与回滚）
 - [x] 响应构建、HEAD/204/304 语义、自动 Date/Server/Connection
-- [x] Filter 链 + 内置 chunked filter
+- [x] Filter 链 + 内置 chunked filter（listen 时自动注册，`res.chunked = true` 开箱即用）
 - [x] Router：`:param` / `*` 模式、405 + Allow、Odin 原生中间件链
 - [x] Static：TTL stat 缓存（含负缓存）、目录 index、sendfile 零拷贝、路径穿越防护
-- [x] 每连接 arena、非阻塞写、多档超时、连接数上限、优雅 drain
-- [x] 20 个测试（单测 + 集成），`odin test web/` 全过、零泄漏
+- [x] 反向代理：多上游 round-robin、前缀剥离、X-Forwarded-*/Via、hop-by-hop
+      双向过滤、三种上游分帧（CL 透传 / chunked 透传 / close-delimited 重分帧）
+      如实中继、1xx 跳过、未知状态码连 reason 透传、502/504 错误语义
+- [x] 每连接 arena、非阻塞写、多档超时（含上游 dial/send/recv）、连接数上限、优雅 drain
+- [x] 30 个测试（单测 + 集成），`odin test web/` 全过、零泄漏
 
 后续（按优先级）：
 
@@ -210,9 +236,12 @@ Odin 原生版）。收益：
 2. **Range 请求**：static 已发 `Accept-Ranges: none`，接通部分内容发送
    （sendfile 带 offset/length 即可）。
 3. **gzip/deflate filter**：响应侧 chunked + Content-Encoding 组合。
-4. **HTTP/1.1 严格模式**：如 `Transfer-Encoding` 与 `Content-Length` 同时出现
+4. **代理流式化**：当前代理完整缓冲上游响应（内存随响应大小线性增长）；
+   可复用 `send_phase` 两阶段机制做边收边转发，去掉缓冲上限焦虑。
+5. **上游 keep-alive 池**：按 upstream 维度复用连接，避免每请求一次握手。
+6. **HTTP/1.1 严格模式**：如 `Transfer-Encoding` 与 `Content-Length` 同时出现
    时的 smuggling 防护（当前 TE 优先，需按 RFC 7230 §3.3.3 加固）。
-5. **多 acceptor 线程**：`core:nbio` 是每线程事件循环，SO_REUSEPORT + N 个
+7. **多 acceptor 线程**：`core:nbio` 是每线程事件循环，SO_REUSEPORT + N 个
    `server_run` 即可水平扩展；`Server` 需要变成 per-thread 实例或加锁。
 
 ## 7. 测试策略
@@ -220,10 +249,16 @@ Odin 原生版）。收益：
 `odin test web/` 覆盖三层：
 
 - **纯函数单测**：parser（含畸形输入、OWS 修剪、URL 解码）、chunked 编解码、
-  router（param/405/通配/中间件链顺序）、response 序列化（GET/HEAD/空文件）。
+  router（param/405/通配/中间件链顺序）、response 序列化（GET/HEAD/空文件）、
+  proxy 解析（hop-by-hop 过滤表、chunked 走查、上游头解析的四种分帧决策 +
+  1xx 跳过 + 未知状态码、round-robin）。
 - **集成测试**：真实起服务（`thread.create` + `nbio` 事件循环线程）+ 阻塞 TCP
   客户端，覆盖请求响应闭环 + body 回显、畸形请求 400、chunked 请求体、
   pipelined 双请求、HEAD、空文件 sendfile。
+- **代理集成测试**：同时起两个 web 服务器（一个作上游 echo、一个作代理），
+  客户端穿代理验证 GET/POST body、前缀剥离、X-Forwarded-*/Via/Host 改写；
+  chunked 上游透传；另有一个 core:net 阻塞式"原始上游"夹具验证
+  close-delimited 重分帧；以及上游拒连（502）。
 - **泄漏检测**：Odin test runner 自带内存追踪；`integration_stop` 优雅 drain
   后连接全部关闭，测试结束时报零泄漏。
 

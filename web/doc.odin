@@ -25,10 +25,14 @@ What you get:
   - HTTP/1.1 parsing (zero-copy header slices), keep-alive, request
     bodies (Content-Length + chunked), timeouts, backpressure-aware
     non-blocking writes.
-  - A response builder, a `Filter` chain (chunked encoding built in,
-    gzip/TLS are extension points), a router with `:param`/`*` patterns
-    and an Odin-native middleware chain, and a static file handler with
-    stat caching and zero-copy `sendfile`.
+  - A response builder, a `Filter` chain (chunked encoding built in and
+    registered by default, gzip/TLS are extension points), a router with
+    `:param`/`*` patterns and an Odin-native middleware chain, and a
+    static file handler with stat caching and zero-copy `sendfile`.
+  - A reverse proxy: round-robin upstreams, prefix stripping,
+    X-Forwarded-For / X-Forwarded-Proto / Via headers, hop-by-hop
+    filtering, and faithful relaying of Content-Length / chunked /
+    close-delimited responses.
   - Per-connection arena allocation: all per-request scratch memory is
     freed in one shot between keep-alive requests.
 

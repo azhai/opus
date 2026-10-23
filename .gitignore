@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Odin build artifacts (odin build/test emit .o; keep .odin sources tracked)
+*.a
+*.o
+
+# Output of the go coverage tool
+bin/
+*.out
+
+# Logs
+*.log
+logs/
+
+# IDE
+.ai-memory/adr/
+findings.md
+progress.md
+task_plan.md
+.arts/
+.codearts/
+.codebuddy/
+.idea/
+.planning/
+.superpowers/
+.trae/
+.vscode/
+.workbuddy/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+tmp/

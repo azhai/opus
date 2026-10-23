@@ -19,6 +19,11 @@ Response :: struct {
 	conn:   ^Conn,
 	status: Status,
 
+	// reason overrides the reason phrase derived from `status` when
+	// non-empty. The proxy uses it to relay upstream phrases for status
+	// codes outside the Status enum.
+	reason: string,
+
 	headers: [dynamic]Header, // allocated on the connection scratch arena
 	body:    Buf,             // allocated on the connection scratch arena
 
@@ -45,6 +50,7 @@ response_init :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 response_reset :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 	w.conn = c
 	w.status = .OK
+	w.reason = ""
 	w.headers = nil
 	w.body = {}
 	w.file_open = false
@@ -183,7 +189,11 @@ response_build :: proc(w: ^Response, out: ^Buf, allocator: mem.Allocator) {
 	buf_append_string(out, "HTTP/1.1 ")
 	write_padded_i64(out, i64(w.status), 3)
 	buf_append_byte(out, ' ')
-	buf_append_string(out, status_text(w.status))
+	reason := status_text(w.status)
+	if len(w.reason) > 0 {
+		reason = w.reason
+	}
+	buf_append_string(out, reason)
 	buf_append_string(out, "\r\n")
 
 	for h in w.headers {
