@@ -108,12 +108,85 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 		entry = idx_entry
 	}
 
-	if !response_send_file_handle(res, fs_path, entry.size) {
+	ctype := mime_type(fs_path)
+	response_set_header(res, "Content-Type", ctype)
+	response_set_header(res, "Last-Modified", http_date(entry.mod_utc, conn_scratch(req.conn)))
+	response_set_header(res, "Accept-Ranges", "bytes")
+
+	// conditional GET: a fresh copy in the client's cache answers 304
+	if ims, ok := request_header(req, "If-Modified-Since"); ok {
+		if t, tok := parse_http_date(ims); tok && time.diff(entry.mod_utc, t) >= 0 {
+			static_not_modified(res)
+			return
+		}
+	}
+
+	if rng, ok := request_header(req, "Range"); ok {
+		ranges, count, decision := parse_byte_ranges(rng, entry.size)
+		switch decision {
+		case .Ignore:
+			// malformed or foreign unit: full response
+		case .Unsatisfiable:
+			static_range_unsatisfiable(res, entry.size)
+			return
+		case .Single, .Multi:
+			// If-Range: only apply the range when the validator says the
+			// file is unchanged since the client's copy
+			apply := true
+			if ir, has_ir := request_header(req, "If-Range"); has_ir {
+				apply = if_range_allowed(ir, entry.mod_utc)
+			}
+			if !apply {
+				static_send_full(res, fs_path, entry.size, ctype)
+				return
+			}
+			if decision == .Single {
+				r := ranges[0]
+				res.status = .Partial_Content
+				response_set_header(res, "Content-Range", content_range_value(r.start, r.start + r.length - 1, entry.size, conn_scratch(req.conn)))
+				if !response_send_file_range(res, fs_path, r.start, r.length) {
+					static_not_found(res)
+					return
+				}
+				return
+			}
+			// several ranges: multipart/byteranges, read into memory (the
+			// rare path; zero-copy is not worth it here)
+			boundary := multipart_boundary(conn_scratch(req.conn))
+			body, mok := range_multipart_body(fs_path, ranges[:count], boundary, ctype, entry.size, conn_scratch(req.conn))
+			if !mok {
+				static_not_found(res)
+				return
+			}
+			res.status = .Partial_Content
+			response_set_header(res, "Content-Type", concat_strings({"multipart/byteranges; boundary=", boundary}, conn_scratch(req.conn)))
+			response_write(res, body)
+			return
+		}
+	}
+
+	static_send_full(res, fs_path, entry.size, ctype)
+}
+
+// static_send_full streams the whole file (the no-Range path).
+static_send_full :: proc(res: ^Response, fs_path: string, size: i64, ctype: string) {
+	if !response_send_file_handle(res, fs_path, size) {
 		static_not_found(res)
 		return
 	}
-	response_set_header(res, "Content-Type", mime_type(fs_path))
-	response_set_header(res, "Accept-Ranges", "none")
+	response_set_header(res, "Content-Type", ctype)
+}
+
+static_not_modified :: proc(res: ^Response) {
+	res.status = .Not_Modified
+}
+
+// static_range_unsatisfiable answers 416 with the full length so the
+// client can pick a valid range.
+static_range_unsatisfiable :: proc(res: ^Response, size: i64) {
+	res.status = .Range_Not_Satisfiable
+	response_set_header(res, "Content-Range", unsatisfiable_content_range(size, conn_scratch(res.conn)))
+	response_write_string(res, "416 range not satisfiable\n")
 }
 
 static_not_found :: proc(res: ^Response) {

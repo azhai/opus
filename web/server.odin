@@ -41,6 +41,10 @@ Server :: struct {
 	handler:  Handler,
 	user_ptr: rawptr,
 
+	// tls wraps every accepted connection in an OpenSSL session. Nil (the
+	// default) serves plaintext HTTP.
+	tls: ^Tls_Config,
+
 	allocator: mem.Allocator,
 	conns:     [dynamic]^Conn,
 	filters:   ^Filter,
@@ -48,6 +52,11 @@ Server :: struct {
 	// built-in chunked encoding filter, registered at listen time so a
 	// handler can opt in with `res.chunked = true` and nothing else
 	chunked_filter: Chunked_Filter,
+
+	// built-in content-coding filter (gzip/deflate via Accept-Encoding),
+	// registered before the chunked filter so bodies are coded first and
+	// framed second
+	compress_filter: Compress_Filter,
 
 	// configuration
 	keep_alive:            bool,
@@ -62,10 +71,24 @@ Server :: struct {
 	on_conn_open:  Conn_Event,
 	on_conn_close: Conn_Event,
 
+	// on_stop runs on the event loop thread once the loop has stopped,
+	// while the loop is still usable. It is the place to release resources
+	// that nbio owns but the server does not, such as a proxy's pool of
+	// idle upstream connections.
+	on_stop: proc(s: ^Server),
+
 	stats: Stats,
 
 	listen_socket: net.TCP_Socket,
 	listening:     bool,
+	// bound_port is the port actually in use, which matters when the
+	// configured one was 0 (picked by the kernel)
+	bound_port: int,
+
+	// reuse_port sets SO_REUSEPORT before bind, which is what lets several
+	// server instances (one per acceptor thread) share an address. Only the
+	// server_run_multi path sets it.
+	reuse_port: bool,
 	done_flag:     ^bool,
 
 	accept_op: ^nbio.Operation,
@@ -109,19 +132,63 @@ server_destroy :: proc(s: ^Server) {
 // server_listen binds and starts accepting. Must be called from the thread
 // that runs the event loop.
 server_listen :: proc(s: ^Server) -> bool {
-	sock, err := nbio.listen_tcp(s.endpoint, 512)
+	sock, err := server_open_listener(s)
 	if err != nil {
 		log_error("web: listen on %v failed: %v", s.address, err)
 		return false
 	}
 	s.listen_socket = sock
+	if ep, ep_err := nbio.bound_endpoint(sock); ep_err == nil {
+		s.bound_port = ep.port
+	}
 	intrinsics.volatile_store(&s.listening, true)
+	filter_compress_init(&s.compress_filter)
+	filter_add(s, &s.compress_filter.filter)
 	filter_chunked_init(&s.chunked_filter)
 	filter_add(s, &s.chunked_filter.filter)
 	s.accept_op = nbio.accept_poly(sock, s, on_accept)
 	s.sweep_op = nbio.timeout_poly(SWEEP_INTERVAL, s, on_sweep)
 	log_info("web: listening on %v", s.address)
 	return true
+}
+
+/*
+server_open_listener creates, binds and listens on the server's endpoint.
+
+The plain path asks nbio for a listener. When `reuse_port` is set the socket
+is created and bound by hand instead, because SO_REUSEPORT has to be set
+before bind and nbio's listen_tcp does not do that - that option is what
+lets N acceptor threads share one address.
+*/
+server_open_listener :: proc(s: ^Server) -> (socket: net.TCP_Socket, err: net.Network_Error) {
+	if !s.reuse_port {
+		return nbio.listen_tcp(s.endpoint, 512)
+	}
+	family := net.family_from_endpoint(s.endpoint)
+	created, cerr := nbio.create_tcp_socket(family)
+	if cerr != nil {
+		return created, cerr
+	}
+	socket = created
+	net.set_option(socket, .Reuse_Address, true)
+	if !socket_set_reuse_port(socket) {
+		// without the option a second acceptor cannot share the address,
+		// so refuse instead of binding a listener that will not scale
+		log_error("web: SO_REUSEPORT unavailable on %v", s.address)
+		nbio.close(socket)
+		return socket, net.Listen_Error.Unsupported_Socket
+	}
+	if berr := net.bind(socket, s.endpoint); berr != nil {
+		log_error("web: bind %v failed: %v", s.address, berr)
+		nbio.close(socket)
+		return socket, net.Bind_Error.Address_In_Use
+	}
+	if !socket_listen(socket, 512) {
+		log_error("web: listen %v failed", s.address)
+		nbio.close(socket)
+		return socket, net.Listen_Error.Unknown
+	}
+	return socket, nil
 }
 
 on_accept :: proc(op: ^nbio.Operation, s: ^Server) {
@@ -144,6 +211,14 @@ on_accept :: proc(op: ^nbio.Operation, s: ^Server) {
 	}
 	net.set_option(client, .TCP_Nodelay, true)
 	c := conn_new(s, client, op.accept.client_endpoint)
+	if s.tls != nil {
+		if !tls_attach(c, s.tls) {
+			conn_close(c)
+			return
+		}
+		tls_start(c)
+		return
+	}
 	conn_recv_arm(c, s.header_timeout)
 }
 
@@ -207,22 +282,6 @@ server_run_until :: proc(s: ^Server, done: ^bool) -> (err: nbio.General_Error) {
 		return .Unsupported
 	}
 	err = nbio.run_until(done)
-
-	// Graceful drain: cancel the loop-level operations and let in-flight
-	// completions (e.g. socket close callbacks that free connections) run.
-	if s.accept_op != nil {
-		nbio.remove(s.accept_op)
-		s.accept_op = nil
-	}
-	if s.sweep_op != nil {
-		nbio.remove(s.sweep_op)
-		s.sweep_op = nil
-	}
-	for i in 0..<200 {
-		if nbio.num_waiting() == 0 {
-			break
-		}
-		nbio.tick(10 * time.Millisecond)
-	}
+	server_release(s)
 	return err
 }

@@ -6,7 +6,7 @@ import "core:net"
 import "core:time"
 
 /*
-Proxy forwards requests to upstream HTTP/1.1 servers and relays the
+Proxy forwards requests to upstream HTTP/1.1 servers and streams the
 responses back to the client (Mongoose's reverse proxy, wired into the
 nbio event loop).
 
@@ -29,25 +29,35 @@ pattern is a lone star segment, see path_match):
 
 Model:
 
-  - Every proxied request opens a fresh upstream connection and sends it
-    `Connection: close`, so no upstream keep-alive pool is needed. The
-    upstream socket's lifetime is exactly one request.
-  - The upstream response is fully buffered on the connection, then
-    relayed through the normal Write path. Large responses therefore cost
-    memory proportional to their size (bounded by max_body_size); a future
-    streaming mode can reuse the send_phase machinery.
+  - The response head is relayed as soon as the upstream head arrives, and
+    the body is then streamed: bytes move upstream -> client in recv-sized
+    pieces, with at most one piece buffered per direction. Memory no longer
+    grows with the response size, and the client starts receiving before
+    the upstream has finished.
+  - Upstream connections are kept alive and reused from a small per-host
+    pool (`keep_alive`, on by default). A pooled connection that turns out
+    to be stale is retried once on a fresh connection for idempotent
+    methods.
   - Hop-by-hop headers are dropped in both directions. `Host` is rewritten
     to the upstream, and `X-Forwarded-For` / `X-Forwarded-Proto` / `Via`
     are added on the way out.
-  - Upstream framing is relayed faithfully: Content-Length passes through,
-    a chunked body is passed through with its framing intact (completeness
-    is decided by walking the chunk sizes, not by decoding), and a body
-    with neither is buffered until upstream EOF and re-framed with a
-    Content-Length of the proxy's own.
+  - Upstream framing is relayed faithfully: Content-Length passes through
+    and is counted down as the body streams, a chunked body is passed
+    through with its framing intact (an incremental scanner decides when
+    the terminating chunk has gone by), and a body with neither is
+    re-framed as chunked on the way out so the client connection keeps its
+    keep-alive semantics (HTTP/1.0 clients get a close-delimited body
+    instead, since they cannot read chunked).
   - Multiple upstreams are load balanced round-robin.
 
-Errors: connect/send/read failures become 502, upstream read timeouts
-become 504, and the client connection is closed after an error response.
+Errors: connect/send/read failures become 502, upstream timeouts become
+504, and the client connection is closed after an error response. Once the
+head has reached the client the only honest signal left is a truncated
+body, so the connection is closed instead of appending an error page.
+
+The pool holds sockets created on this thread's event loop, so one Proxy
+belongs to one Server (and therefore one thread); give each acceptor
+thread its own Proxy when running several.
 */
 
 Proxy :: struct {
@@ -57,6 +67,23 @@ Proxy :: struct {
 	strip_prefix: string,          // "/api" is stripped from the client path
 	timeout:      time.Duration,   // per upstream operation (dial/send/recv)
 	allocator:    mem.Allocator,
+
+	// upstream connection reuse
+	keep_alive:        bool,
+	max_idle_per_host: int,
+	idle_timeout:      time.Duration,
+	pool:              [dynamic]Pool_Conn,
+
+	// counters, useful in /stats style handlers
+	pool_hits:   u64,
+	pool_misses: u64,
+}
+
+// Pool_Conn is one idle upstream connection waiting to be reused.
+Pool_Conn :: struct {
+	sock:       net.TCP_Socket,
+	upstream:   int,
+	idle_since: time.Time,
 }
 
 // proxy_init parses the upstream addresses ("127.0.0.1:9000", "[::1]:9000").
@@ -64,6 +91,10 @@ Proxy :: struct {
 proxy_init :: proc(p: ^Proxy, upstreams: []string, allocator := context.allocator) -> bool {
 	p.allocator = allocator
 	p.timeout = 10 * time.Second
+	p.keep_alive = true
+	p.max_idle_per_host = 16
+	p.idle_timeout = 30 * time.Second
+	p.pool = make([dynamic]Pool_Conn, allocator)
 	p.upstreams = make([dynamic]net.Endpoint, allocator)
 	p.hosts = make([dynamic]string, allocator)
 	for u in upstreams {
@@ -78,7 +109,36 @@ proxy_init :: proc(p: ^Proxy, upstreams: []string, allocator := context.allocato
 	return true
 }
 
+/*
+proxy_close_idle drops every idle upstream connection.
+
+Pooled sockets belong to the event loop, so this must run on the loop thread
+- typically from `Server.on_stop`, which the server calls once its loop has
+stopped but while nbio calls are still valid:
+
+	srv.on_stop = proc(s: ^web.Server) {
+		web.proxy_close_idle(cast(^web.Proxy) s.user_ptr)
+	}
+*/
+proxy_close_idle :: proc(p: ^Proxy) {
+	proxy_pool_close_all(p)
+}
+
+/*
+proxy_destroy releases the proxy's memory. It deliberately does not touch
+the pooled upstream sockets: those belong to the event loop and closing
+them from another thread (or after the loop is gone) is not safe. Release
+them first with `proxy_close_idle` from `Server.on_stop`; a leftover pool
+is reported here so the omission is noticeable.
+*/
 proxy_destroy :: proc(p: ^Proxy) {
+	if p.pool != nil && len(p.pool) > 0 {
+		log_error("web: proxy_destroy with %v idle upstream connection(s); call proxy_close_idle on the event loop thread", len(p.pool))
+	}
+	if p.pool != nil {
+		delete(p.pool)
+		p.pool = nil
+	}
 	if p.upstreams != nil {
 		delete(p.upstreams)
 		p.upstreams = nil
@@ -92,11 +152,64 @@ proxy_destroy :: proc(p: ^Proxy) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// idle upstream pool
+// ---------------------------------------------------------------------------
+
+proxy_pool_take :: proc(p: ^Proxy, upstream: int) -> (net.TCP_Socket, bool) {
+	now := nbio.now()
+	for i := 0; i < len(p.pool); i += 1 {
+		e := p.pool[i]
+		if e.upstream != upstream {
+			continue
+		}
+		unordered_remove(&p.pool, i)
+		i -= 1
+		if now != {} && time.diff(e.idle_since, now) > p.idle_timeout {
+			// sat too long: the peer may well be gone, do not gamble
+			nbio.close(e.sock)
+			continue
+		}
+		p.pool_hits += 1
+		return e.sock, true
+	}
+	p.pool_misses += 1
+	return {}, false
+}
+
+proxy_pool_put :: proc(p: ^Proxy, upstream: int, sock: net.TCP_Socket) {
+	if !p.keep_alive {
+		nbio.close(sock)
+		return
+	}
+	count := 0
+	for e in p.pool {
+		if e.upstream == upstream {
+			count += 1
+		}
+	}
+	if count >= p.max_idle_per_host {
+		nbio.close(sock)
+		return
+	}
+	append(&p.pool, Pool_Conn{sock = sock, upstream = upstream, idle_since = nbio.now()})
+}
+
+proxy_pool_close_all :: proc(p: ^Proxy) {
+	if p.pool == nil {
+		return
+	}
+	for e in p.pool {
+		nbio.close(e.sock)
+	}
+	clear(&p.pool)
+}
+
 // proxy_next_upstream picks the next upstream round-robin.
-proxy_next_upstream :: proc(p: ^Proxy) -> (net.Endpoint, string) {
+proxy_next_upstream :: proc(p: ^Proxy) -> (net.Endpoint, string, int) {
 	i := p.next % len(p.upstreams)
 	p.next = (p.next + 1) % len(p.upstreams)
-	return p.upstreams[i], p.hosts[i]
+	return p.upstreams[i], p.hosts[i], i
 }
 
 // proxy_serve is a `Handler` for `server.user_ptr = ^Proxy`.
@@ -109,6 +222,13 @@ proxy_serve :: proc(req: ^Request, res: ^Response) {
 		return
 	}
 	proxy_serve_root(p, req, res)
+}
+
+// proxy_method_retryable reports whether a request may be replayed on a
+// fresh connection when a pooled one turns out to be dead. Only methods
+// without side effects qualify.
+proxy_method_retryable :: proc(m: Method) -> bool {
+	return m == .Get || m == .Head || m == .Options
 }
 
 // proxy_serve_root is proxy_serve with an explicit proxy; use it when a
@@ -126,7 +246,8 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 		return
 	}
 	c.proxy_cfg = p
-	up, host := proxy_next_upstream(p)
+	up, host, index := proxy_next_upstream(p)
+	c.proxy_upstream = index
 
 	// target path: strip the configured prefix (on a segment boundary)
 	target := req.path
@@ -190,8 +311,11 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 	buf_append_string(b, SERVER_NAME)
 	buf_append_string(b, "\r\n")
 
-	// one upstream connection per request keeps the lifecycle trivial
-	buf_append_string(b, "Connection: close\r\n")
+	if p.keep_alive {
+		buf_append_string(b, "Connection: keep-alive\r\n")
+	} else {
+		buf_append_string(b, "Connection: close\r\n")
+	}
 	if len(req.body) > 0 {
 		buf_append_string(b, "Content-Length: ")
 		buf_append_string(b, int_to_string(i64(len(req.body)), conn_scratch(c)))
@@ -204,10 +328,43 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 
 	buf_reset(&c.proxy_buf)
 	c.proxy_state = .Head
+	c.proxy_framing = .None
+	c.proxy_scan = {}
 	c.proxy_head_len = 0
 	c.proxy_remaining = 0
+	c.proxy_body_done = false
+	c.proxy_client_started = false
+	c.proxy_upstream_close = false
+	c.proxy_retryable = false
 	c.state = .Proxy
-	c.proxy_op = nbio.dial_poly(up, c, on_proxy_dial, timeout = p.timeout)
+
+	if p.keep_alive {
+		if sock, ok := proxy_pool_take(p, index); ok {
+			c.proxy_sock = sock
+			c.proxy_open = true
+			c.proxy_pooled = true
+			c.proxy_retryable = proxy_method_retryable(req.method)
+			proxy_send_request(c)
+			return
+		}
+	}
+	c.proxy_pooled = false
+	proxy_start_dial(c, up)
+}
+
+proxy_start_dial :: proc(c: ^Conn, up: net.Endpoint) {
+	c.proxy_op = nbio.dial_poly(up, c, on_proxy_dial, timeout = c.proxy_cfg.timeout)
+}
+
+proxy_send_request :: proc(c: ^Conn) {
+	c.proxy_op = nbio.send_poly(
+		c.proxy_sock,
+		[][]byte{buf_slice(&c.proxy_req)},
+		c,
+		on_proxy_sent,
+		all = true,
+		timeout = c.proxy_cfg.timeout,
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +387,9 @@ on_proxy_dial :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 	c.proxy_sock = op.dial.socket
 	c.proxy_open = true
+	c.proxy_pooled = false
 	net.set_option(c.proxy_sock, .TCP_Nodelay, true)
-	c.proxy_op = nbio.send_poly(
-		c.proxy_sock,
-		[][]byte{buf_slice(&c.proxy_req)},
-		c,
-		on_proxy_sent,
-		all = true,
-		timeout = c.proxy_cfg.timeout,
-	)
+	proxy_send_request(c)
 }
 
 on_proxy_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
@@ -249,9 +400,9 @@ on_proxy_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 	if op.send.err != nil {
 		log_debug("web: proxy send failed: %v", op.send.err)
 		if se, ok := op.send.err.(net.TCP_Send_Error); ok && se == .Timeout {
-			proxy_fail(c, .Gateway_Timeout, "504 upstream write timeout\n")
+			proxy_upstream_failed(c, .Gateway_Timeout, "504 upstream write timeout\n")
 		} else {
-			proxy_fail(c, .Bad_Gateway, "502 upstream write failed\n")
+			proxy_upstream_failed(c, .Bad_Gateway, "502 upstream write failed\n")
 		}
 		return
 	}
@@ -259,6 +410,14 @@ on_proxy_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 }
 
 proxy_recv_arm :: proc(c: ^Conn) {
+	if c.proxy_cfg == nil {
+		// Defensive: every caller should be inside an active proxy request,
+		// but arming a read needs the proxy config for its timeout, so a
+		// late callback from a finished request must not reach nbio.
+		log_debug("web: proxy_recv_arm without an active request; closing")
+		conn_close(c)
+		return
+	}
 	c.proxy_op = nbio.recv_poly(
 		c.proxy_sock,
 		[][]byte{c.rbuf[:]},
@@ -276,42 +435,69 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 	if op.recv.err != nil {
 		if re, ok := op.recv.err.(net.TCP_Recv_Error); ok && re == .Timeout {
-			proxy_fail(c, .Gateway_Timeout, "504 upstream timeout\n")
+			if c.proxy_client_started {
+				// the client already has a partial body: all we can do is
+				// cut the connection so it sees a truncated response
+				log_debug("web: proxy upstream timed out mid-stream")
+				conn_close(c)
+				return
+			}
+			proxy_upstream_failed(c, .Gateway_Timeout, "504 upstream timeout\n")
 			return
 		}
-		// a reset mid-stream is only acceptable for close-delimited
-		// bodies that already have a head
-		if c.proxy_state == .Until_Close && buf_len(&c.proxy_buf) > 0 {
-			proxy_complete(c)
-			return
+		if c.proxy_framing == .Raw_To_Close || c.proxy_framing == .Reframe_Chunked {
+			// a reset mid-stream is only acceptable for close-delimited
+			// bodies that already have a head
+			if c.proxy_state == .Body {
+				proxy_body_finish(c)
+				return
+			}
 		}
 		log_debug("web: proxy recv failed: %v", op.recv.err)
-		proxy_fail(c, .Bad_Gateway, "502 upstream read failed\n")
+		proxy_upstream_failed(c, .Bad_Gateway, "502 upstream read failed\n")
 		return
 	}
 	n := op.recv.received
 	if n == 0 {
 		// upstream closed its write side: the body ends here for
 		// close-delimited responses, anything else is a short read
-		if c.proxy_state == .Until_Close {
-			proxy_complete(c)
-			return
+		if c.proxy_framing == .Raw_To_Close || c.proxy_framing == .Reframe_Chunked {
+			c.proxy_upstream_close = true
+			if c.proxy_state == .Body {
+				proxy_body_finish(c)
+				return
+			}
 		}
-		proxy_fail(c, .Bad_Gateway, "502 upstream closed early\n")
+		proxy_upstream_failed(c, .Bad_Gateway, "502 upstream closed early\n")
 		return
 	}
 	buf_append(&c.proxy_buf, c.rbuf[:n])
 	proxy_advance(c)
-	if c.state == .Proxy {
-		// response still incomplete: keep reading. proxy_complete /
-		// proxy_fail move the machine out of .Proxy when done.
-		proxy_recv_arm(c)
-	}
 }
 
-// proxy_advance parses the upstream head once available, then decides
-// whether the body is complete. Incomplete states leave a recv armed by
-// the caller's loop.
+// proxy_upstream_failed tears the upstream down and either retries on a
+// fresh connection (a pooled one that was already dead) or answers 502/504.
+proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
+	if c.proxy_open {
+		nbio.close(c.proxy_sock)
+		c.proxy_open = false
+	}
+	if c.proxy_retryable && !c.proxy_client_started && buf_len(&c.proxy_buf) == 0 {
+		// nothing of the response made it out: a stale keep-alive
+		// connection is the likely culprit, so dial once for real
+		c.proxy_retryable = false
+		log_debug("web: proxy retrying %v on a fresh connection", c.req.path)
+		proxy_start_dial(c, c.proxy_cfg.upstreams[c.proxy_upstream])
+		return
+	}
+	if c.proxy_client_started {
+		conn_close(c)
+		return
+	}
+	proxy_fail(c, status, msg)
+}
+
+// proxy_advance feeds buffered upstream bytes through the state machine.
 proxy_advance :: proc(c: ^Conn) {
 	if c.proxy_state == .Head {
 		for {
@@ -337,64 +523,178 @@ proxy_advance :: proc(c: ^Conn) {
 			}
 			break
 		}
+		proxy_stream_begin(c)
+		return
 	}
 
-	switch c.proxy_state {
-	case .Done:
-		// no body expected (204/304, or a HEAD request)
-		proxy_complete(c)
-	case .Content_Length:
-		if buf_len(&c.proxy_buf) >= c.proxy_head_len + c.proxy_remaining {
-			proxy_complete(c)
-		}
-	case .Chunked:
-		body := buf_slice(&c.proxy_buf)[c.proxy_head_len:]
-		if complete, _ := proxy_chunked_complete(body); complete {
-			proxy_complete(c)
-		}
+	proxy_pump(c)
+}
+
+// proxy_stream_begin relays the response head and starts the body stream.
+proxy_stream_begin :: proc(c: ^Conn) {
+	w := &c.res
+	c.proxy_state = .Body
+
+	switch c.proxy_framing {
+	case .None:
+		c.proxy_body_done = true
 	case .Until_Close:
-		// wait for upstream EOF
-	case .Head, .None:
-		// need more data
+		// the upstream delimited its body with EOF. Re-frame it so the
+		// client connection keeps its keep-alive semantics - unless it
+		// speaks HTTP/1.0, which cannot read chunked framing.
+		if c.req.version.major == 1 && c.req.version.minor == 0 {
+			c.proxy_framing = .Raw_To_Close
+			w.keep_alive = false
+		} else {
+			c.proxy_framing = .Reframe_Chunked
+			w.chunked = true
+			response_set_header(w, "Transfer-Encoding", "chunked")
+		}
+	case .Content_Length, .Chunked:
+		// framing already relayed from the upstream head
+	case .Reframe_Chunked, .Raw_To_Close:
+		// only ever set just above; nothing to relay
+	}
+
+	// the head goes out immediately; the body follows as it arrives.
+	// Serialize first, then drop the head bytes: header values are views
+	// into proxy_buf and only survive until response_build has copied them.
+	response_build(w, &c.out, conn_scratch(c))
+	buf_consume(&c.proxy_buf, c.proxy_head_len)
+	c.proxy_client_started = true
+	proxy_send_out(c)
+}
+
+proxy_send_out :: proc(c: ^Conn) {
+	// conn_flush_out encrypts when the client connection is TLS-wrapped and
+	// tells us whether it actually queued a send
+	if !conn_flush_out(c, on_proxy_stream_sent) {
+		proxy_pump(c)
 	}
 }
 
-// proxy_complete relays the buffered upstream response to the client and
-// re-enters the Write state.
-proxy_complete :: proc(c: ^Conn) {
-	if c.proxy_open {
-		nbio.close(c.proxy_sock)
-		c.proxy_open = false
+on_proxy_stream_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
+	c.op = nil
+	if c.closed {
+		return
 	}
-
-	w := &c.res
-	body_start := c.proxy_head_len
-	#partial switch c.proxy_state {
-	case .Content_Length:
-		body_end := body_start + c.proxy_remaining
-		if body_end > buf_len(&c.proxy_buf) {
-			body_end = buf_len(&c.proxy_buf)
-		}
-		buf_append(&w.body, buf_slice(&c.proxy_buf)[body_start:body_end])
-	case .Chunked:
-		// relay the framing bytes verbatim; completeness was decided by
-		// walking the chunk sizes in proxy_advance
-		body := buf_slice(&c.proxy_buf)[body_start:]
-		_, length := proxy_chunked_complete(body)
-		if length > len(body) {
-			length = len(body)
-		}
-		buf_append(&w.body, body[:length])
-	case .Until_Close:
-		buf_append(&w.body, buf_slice(&c.proxy_buf)[body_start:])
-	case .Done:
-		// no body
+	if op.send.err != nil {
+		log_debug("web: proxy client send failed: %v", op.send.err)
+		conn_close(c)
+		return
 	}
+	conn_after_send(c, op.send.sent)
+	proxy_pump(c)
+}
 
-	filter_apply_all(c.server, c)
-	response_build(w, &c.out, conn_scratch(c))
+/*
+proxy_pump alternates between pushing buffered body bytes at the client
+and pulling more from the upstream. Exactly one direction is in flight at
+a time, which is what keeps the buffers bounded.
+
+Both guards are load-bearing:
+
+  - `state != .Proxy`: a pump can finish the response, and the finish path
+    hands the connection back to the normal write/keep-alive machine, which
+    resets the per-request state. A send callback that pumps afterwards
+    would otherwise re-enter the proxy with `proxy_cfg` already cleared.
+
+  - `op != nil`: a client send is already in flight. Draining more body
+    into `c.out` now would (a) append behind bytes that are mid-send and
+    (b) arm a second send that overwrites `c.op`, so the first completion
+    would reset the buffer the second send still points at.
+*/
+proxy_pump :: proc(c: ^Conn) {
+	if c.closed || c.state != .Proxy || c.op != nil {
+		return
+	}
+	proxy_drain_body(c)
+	if buf_len(&c.out) > 0 {
+		proxy_send_out(c)
+		return
+	}
+	if c.proxy_body_done {
+		proxy_body_finish(c)
+		return
+	}
+	proxy_recv_arm(c)
+}
+
+// proxy_drain_body moves whatever body bytes are buffered into the client
+// output buffer, tracking the framing so completion is detected exactly.
+proxy_drain_body :: proc(c: ^Conn) {
+	for buf_len(&c.proxy_buf) > 0 && !c.proxy_body_done {
+		data := buf_slice(&c.proxy_buf)
+		switch c.proxy_framing {
+		case .Content_Length:
+			n := len(data)
+			if n > c.proxy_remaining {
+				n = c.proxy_remaining
+			}
+			buf_append(&c.out, data[:n])
+			buf_consume(&c.proxy_buf, n)
+			c.proxy_remaining -= n
+			if c.proxy_remaining <= 0 {
+				c.proxy_body_done = true
+			}
+		case .Chunked:
+			// relay the framing bytes verbatim; the scanner only counts
+			consumed, done, bad := proxy_chunk_scan_step(&c.proxy_scan, data)
+			if consumed > 0 {
+				buf_append(&c.out, data[:consumed])
+				buf_consume(&c.proxy_buf, consumed)
+			}
+			if done {
+				c.proxy_body_done = true
+			}
+			if bad {
+				// the upstream framing went bad mid-body: stop relaying
+				// and cut the connection so the client sees a truncation
+				c.proxy_upstream_close = true
+				c.res.keep_alive = false
+			}
+			if consumed == 0 {
+				return // need more data
+			}
+		case .Reframe_Chunked:
+			write_hex(&c.out, len(data))
+			buf_append_string(&c.out, "\r\n")
+			buf_append(&c.out, data)
+			buf_append_string(&c.out, "\r\n")
+			buf_consume(&c.proxy_buf, len(data))
+		case .Raw_To_Close:
+			buf_append(&c.out, data)
+			buf_consume(&c.proxy_buf, len(data))
+		case .None, .Until_Close:
+			c.proxy_body_done = true
+		}
+	}
+}
+
+// proxy_body_finish closes out the response: terminal chunk, upstream
+// release, and back into the normal write/keep-alive path.
+proxy_body_finish :: proc(c: ^Conn) {
+	if c.proxy_framing == .Reframe_Chunked {
+		buf_append_string(&c.out, "0\r\n\r\n")
+	}
+	proxy_release_upstream(c)
+	c.proxy_state = .Done
 	c.state = .Write
 	conn_drive(c)
+}
+
+// proxy_release_upstream either parks the upstream connection in the pool
+// or closes it.
+proxy_release_upstream :: proc(c: ^Conn) {
+	if !c.proxy_open {
+		return
+	}
+	c.proxy_open = false
+	if c.proxy_upstream_close || !c.proxy_cfg.keep_alive {
+		nbio.close(c.proxy_sock)
+		return
+	}
+	proxy_pool_put(c.proxy_cfg, c.proxy_upstream, c.proxy_sock)
 }
 
 // proxy_fail answers the client with a gateway error and closes the
@@ -418,13 +718,24 @@ proxy_fail :: proc(c: ^Conn, status: Status, msg: string) {
 // upstream response parsing
 // ---------------------------------------------------------------------------
 
+// Proxy_State is the relay's coarse phase: reading the head, streaming the
+// body, done. The body framing itself lives in Proxy_Framing.
 Proxy_State :: enum {
-	None,          // not proxying
-	Head,          // accumulating the upstream response head
-	Content_Length,// body length known
-	Chunked,       // chunked body, relayed with framing intact
-	Until_Close,   // body delimited by upstream EOF
-	Done,          // head complete, no body expected
+	None, // not proxying
+	Head, // accumulating the upstream response head
+	Body, // head relayed, body streaming
+	Done, // response complete
+}
+
+// Proxy_Framing is how the upstream delimited its body, and therefore how
+// the proxy relays it.
+Proxy_Framing :: enum {
+	None,            // no body expected
+	Content_Length,  // counted down as bytes pass
+	Chunked,         // relayed verbatim, scanner finds the end
+	Until_Close,     // upstream EOF, needs re-framing before it is relayed
+	Reframe_Chunked, // outgoing chunked coding, added by the proxy
+	Raw_To_Close,    // outgoing close-delimited body (HTTP/1.0 clients)
 }
 
 Head_Parse_Result :: enum {
@@ -436,7 +747,7 @@ Head_Parse_Result :: enum {
 // proxy_parse_head parses one upstream response head into the connection's
 // response: status (with the upstream reason phrase), headers (hop-by-hop
 // dropped, Content-Length/Transfer-Encoding passed through), and the body
-// framing decision in c.proxy_state / c.proxy_remaining.
+// framing decision in c.proxy_framing / c.proxy_remaining.
 //
 // Header values are zero-copy views into the head buffer, which must stay
 // alive until the response is written (the connection's proxy_buf does).
@@ -476,6 +787,8 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 	rest := head[line_end + 2:]
 	count := 0
 	has_cl := false
+	cl_value := ""
+	te_count := 0
 	te_chunked := false
 	for len(rest) > 0 {
 		// blank line terminates the head
@@ -498,15 +811,28 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 		if eq_ignore_case(key, "Transfer-Encoding") {
 			// checked before the hop-by-hop filter: the upstream framing
 			// is relayed verbatim, so its TE header must survive
-			if contains_ignore_case(value, "chunked") {
-				te_chunked = true
+			te_count += 1
+			te_chunked = te_chunked || contains_ignore_case(value, "chunked")
+		} else if eq_ignore_case(key, "Connection") {
+			// dropped, but remembered: a peer that wants to close will
+			// not be reused from the pool
+			if contains_ignore_case(value, "close") {
+				c.proxy_upstream_close = true
 			}
+			continue
 		} else if is_hop_by_hop_header(key) {
 			continue
 		} else if eq_ignore_case(key, "Content-Length") {
+			if has_cl && value != cl_value {
+				return .Malformed // conflicting Content-Length
+			}
+			if string_index_byte(value, ',') >= 0 {
+				return .Malformed // list-valued: ambiguous
+			}
 			if n, cok := parse_int(value); cok && n >= 0 {
 				c.proxy_remaining = n
 				has_cl = true
+				cl_value = value
 			}
 			// pass the header through verbatim
 		}
@@ -517,22 +843,32 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 		}
 	}
 
+	// strict framing (RFC 7230 section 3.3.3): an upstream that sends both
+	// TE and CL, or a TE whose final coding is not chunked, is a smuggling
+	// vector and is not relayed
+	if has_cl && te_count > 0 {
+		return .Malformed
+	}
+	if te_count > 0 && !te_chunked {
+		return .Malformed
+	}
+
 	// body framing decision
 	if code == 204 || code == 304 {
-		c.proxy_state = .Done
+		c.proxy_framing = .None
 	} else if c.req.method == .Head {
 		// a HEAD response carries the framing the GET would have had,
 		// but no body ever follows
-		c.proxy_state = .Done
+		c.proxy_framing = .None
 	} else if has_cl {
-		c.proxy_state = .Content_Length
+		c.proxy_framing = .Content_Length
+		if c.proxy_remaining == 0 {
+			c.proxy_framing = .None
+		}
 	} else if te_chunked {
-		c.proxy_state = .Chunked
+		c.proxy_framing = .Chunked
 	} else {
-		c.proxy_state = .Until_Close
-		// the upstream delimited its body with EOF; the proxy buffers it
-		// and re-frames it with a Content-Length of its own, so the
-		// client connection keeps its negotiated keep-alive semantics
+		c.proxy_framing = .Until_Close
 	}
 	return .Ok
 }
@@ -567,60 +903,158 @@ is_hop_by_hop_header :: proc(key: string) -> bool {
 		eq_ignore_case(key, "Upgrade")
 }
 
-// proxy_chunked_complete walks the chunked framing in src without decoding.
-// Returns whether the body (terminating chunk + trailer section) is fully
-// present, and its raw byte length including the terminator.
+// ---------------------------------------------------------------------------
+// incremental chunked scanner
+// ---------------------------------------------------------------------------
+
+// proxy_chunked_complete walks chunked framing in one shot, reporting
+// whether the body is fully present and its raw length. The relay itself
+// uses the incremental scanner below; this is the whole-buffer form.
 proxy_chunked_complete :: proc(src: []byte) -> (complete: bool, length: int) {
-	pos := 0
-	for {
-		nl := bytes_index(src[pos:], "\r\n")
-		if nl < 0 {
-			return false, 0
-		}
-		size_line := string(src[pos : pos + nl])
-		semi := string_index_byte(size_line, ';')
-		size_str := size_line
-		if semi >= 0 {
-			size_str = size_line[:semi]
-		}
-		if len(size_str) == 0 {
-			return false, 0
-		}
-		size := 0
-		for i in 0..<len(size_str) {
-			d := hex_nibble(size_str[i])
-			if d < 0 {
-				return false, 0
-			}
-			size = size * 16 + d
-			if size > MAX_CHUNK_SIZE {
-				return false, 0
-			}
-		}
-		pos += nl + 2
-
-		if size == 0 {
-			// trailer section, terminated by a blank line
-			for {
-				nl2 := bytes_index(src[pos:], "\r\n")
-				if nl2 < 0 {
-					return false, 0
-				}
-				if nl2 == 0 {
-					return true, pos + 2
-				}
-				pos += nl2 + 2
-			}
-		}
-
-		if pos + size + 2 > len(src) {
-			return false, 0
-		}
-		if src[pos + size] != '\r' || src[pos + size + 1] != '\n' {
-			return false, 0
-		}
-		pos += size + 2
+	scan: Chunk_Scan
+	consumed, done, bad := proxy_chunk_scan_step(&scan, src)
+	if !done || bad {
+		return false, 0
 	}
+	return true, consumed
+}
+
+// Chunk_Scan walks a chunked body byte by byte so the relay knows when the
+// terminating chunk (and its trailer section) has gone past, without ever
+// buffering the body itself.
+Chunk_Scan :: struct {
+	phase:    Chunk_Phase,
+	remaining: int, // bytes left in the current chunk
+	digits:   int,  // hex digits seen in the current size line
+	trail_pos: int, // 0 at line start, 1 after CR, 2 mid-line
+	finished: bool, // terminal chunk seen
+}
+
+Chunk_Phase :: enum {
+	Size,      // reading the hex size line
+	Size_CR,   // saw CR, expect LF
+	Data,      // inside chunk data
+	Data_CR,   // saw data, expect CR
+	Data_LF,   // saw CR, expect LF
+	Trailer,   // trailer section lines until a blank line
+}
+
+/*
+proxy_chunk_scan_step advances the scanner over `data` and reports how many
+bytes belong to the body so far (they are relayed verbatim) and whether the
+whole message is complete. A malformed size line stops the scan and reports
+completion, which ends the relay; the client then sees a truncated body
+rather than a silently corrupted one.
+*/
+proxy_chunk_scan_step :: proc(s: ^Chunk_Scan, data: []byte) -> (consumed: int, done: bool, bad: bool) {
+	for consumed < len(data) {
+		ch := data[consumed]
+		consumed += 1
+		switch s.phase {
+		case .Size:
+			switch {
+			case ch == '\r':
+				s.phase = .Size_CR
+			case ch == '\n':
+				// tolerate a bare LF
+				if s.remaining == 0 {
+					s.phase = .Trailer
+					s.trail_pos = 0
+				} else {
+					s.phase = .Data
+				}
+			case ch == ';':
+				// chunk extension: ignore until the line ends
+			case ch >= '0' && ch <= '9':
+				s.remaining = s.remaining * 16 + int(ch - '0')
+				s.digits += 1
+			case ch >= 'a' && ch <= 'f':
+				s.remaining = s.remaining * 16 + int(ch - 'a') + 10
+				s.digits += 1
+			case ch >= 'A' && ch <= 'F':
+				s.remaining = s.remaining * 16 + int(ch - 'A') + 10
+				s.digits += 1
+			case:
+				// malformed: stop here, the body ends truncated
+				s.finished = true
+				return consumed, true, true
+			}
+			if s.remaining > MAX_CHUNK_SIZE {
+				s.finished = true
+				return consumed, true, true
+			}
+		case .Size_CR:
+			if ch != '\n' {
+				s.finished = true
+				return consumed, true, true
+			}
+			if s.remaining == 0 {
+				s.phase = .Trailer
+				s.trail_pos = 0
+			} else {
+				s.phase = .Data
+			}
+		case .Data:
+			step := len(data) - (consumed - 1)
+			if step > s.remaining {
+				step = s.remaining
+			}
+			consumed += step - 1
+			s.remaining -= step
+			if s.remaining == 0 {
+				s.phase = .Data_CR
+			}
+		case .Data_CR:
+			if ch == '\r' {
+				s.phase = .Data_LF
+			} else {
+				s.finished = true
+				return consumed, true, true
+			}
+		case .Data_LF:
+			if ch != '\n' {
+				s.finished = true
+				return consumed, true, true
+			}
+			s.phase = .Size
+			s.remaining = 0
+			s.digits = 0
+		case .Trailer:
+			// only an empty line ends the trailer section, so the state
+			// has to remember whether the line seen so far had content
+			switch s.trail_pos {
+			case 0: // at line start
+				if ch == '\r' {
+					s.trail_pos = 1 // maybe an empty line
+				} else if ch == '\n' {
+					s.finished = true
+					return consumed, true, false
+				} else {
+					s.trail_pos = 2 // line has content
+				}
+			case 1: // CR right at line start: an empty line ends the body
+				if ch == '\n' {
+					s.finished = true
+					return consumed, true, false
+				}
+				s.trail_pos = 2
+			case 2: // mid-line
+				if ch == '\r' {
+					s.trail_pos = 3
+				}
+			case: // CR at the end of a non-empty line
+				if ch == '\n' {
+					s.trail_pos = 0 // next line starts fresh
+				} else {
+					s.trail_pos = 2
+				}
+			}
+		}
+	}
+	if s.phase == .Trailer && s.finished {
+		return consumed, true, false
+	}
+	return consumed, false, false
 }
 
 // is_dial_timeout recognizes a dial timeout inside the Network_Error

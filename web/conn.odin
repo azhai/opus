@@ -57,14 +57,30 @@ Conn :: struct {
 
 	// proxy state (see proxy.odin); only live while state == .Proxy
 	proxy_req:      Buf, // serialized upstream request
-	proxy_buf:      Buf, // upstream response accumulator
+	proxy_buf:      Buf, // upstream bytes not yet relayed
 	proxy_sock:     net.TCP_Socket,
 	proxy_open:     bool,
 	proxy_op:       ^nbio.Operation,
 	proxy_cfg:      ^Proxy,
 	proxy_state:    Proxy_State,
+	proxy_framing:  Proxy_Framing,
+	proxy_scan:     Chunk_Scan,
 	proxy_head_len: int,
 	proxy_remaining: int,
+
+	proxy_upstream:       int,  // index into proxy_cfg.upstreams
+	proxy_pooled:         bool, // the upstream socket came from the pool
+	proxy_retryable:      bool, // may be replayed on a fresh connection
+	proxy_client_started: bool, // response head reached the client
+	proxy_upstream_close: bool, // upstream asked for Connection: close
+	proxy_body_done:      bool, // upstream body fully relayed
+
+	// TLS state (see tls.odin); nil on a plaintext connection
+	tls:            ^Tls_Session,
+	tls_net:        []byte, // ciphertext received from the socket
+	tls_out:        Buf,    // ciphertext waiting to be sent
+	tls_file_buf:   []byte, // plaintext chunk of a file body
+	tls_file_offset: i64,
 
 	req: Request,
 	res: Response,
@@ -99,6 +115,7 @@ conn_new :: proc(s: ^Server, socket: net.TCP_Socket, remote: net.Endpoint) -> ^C
 	buf_init(&c.body_buf, s.allocator)
 	buf_init(&c.proxy_req, s.allocator)
 	buf_init(&c.proxy_buf, s.allocator)
+	buf_init(&c.tls_out, s.allocator)
 	append(&s.conns, c)
 	s.stats.conns_opened += 1
 	s.stats.conns_active = len(s.conns)
@@ -124,6 +141,8 @@ conn_destroy :: proc(c: ^Conn) {
 	buf_destroy(&c.body_buf)
 	buf_destroy(&c.proxy_req)
 	buf_destroy(&c.proxy_buf)
+	buf_destroy(&c.tls_out)
+	tls_destroy(c)
 	mem.dynamic_arena_destroy(&c.scratch)
 	alloc := c.server.allocator
 	free(c, alloc)
@@ -203,6 +222,10 @@ conn_drive :: proc(c: ^Conn) {
 }
 
 conn_recv_arm :: proc(c: ^Conn, timeout: time.Duration) {
+	if c.tls != nil {
+		tls_recv_arm(c, timeout)
+		return
+	}
 	c.op = nbio.recv_poly(c.socket, [][]byte{c.rbuf[:]}, c, on_recv, all = false, timeout = timeout)
 }
 
@@ -282,40 +305,140 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		c.res.keep_alive = false
 	}
 
-	// request body
-	te, has_te := request_header(req, "Transfer-Encoding")
-	if has_te && contains_ignore_case(te, "chunked") {
+	// request body framing, strict per RFC 7230 section 3.3.3
+	kind, blen, ferr := request_framing(req)
+	if ferr != .None {
+		conn_error(c, .Bad_Request, framing_error_message(ferr))
+		return true
+	}
+	switch kind {
+	case .Chunked:
 		c.chunked = true
 		c.state = .Read_Body
 		return true
-	}
-	if cl, has_cl := request_header(req, "Content-Length"); has_cl {
-		n, ok := parse_int(cl)
-		if !ok || n < 0 {
-			conn_error(c, .Bad_Request, "400 bad request\n")
-			return true
-		}
-		if n > c.server.max_body_size {
+	case .Length:
+		if blen > c.server.max_body_size {
 			conn_error(c, .Payload_Too_Large, "413 payload too large\n")
 			return true
 		}
-		if n == 0 {
+		if blen == 0 {
 			c.state = .Process
 			return true
 		}
-		if buf_len(&c.inbuf) >= n {
-			c.req.body = clone_bytes(buf_slice(&c.inbuf)[:n], conn_scratch(c))
-			buf_consume(&c.inbuf, n)
+		if buf_len(&c.inbuf) >= blen {
+			c.req.body = clone_bytes(buf_slice(&c.inbuf)[:blen], conn_scratch(c))
+			buf_consume(&c.inbuf, blen)
 			c.state = .Process
 			return true
 		}
-		c.body_remaining = n
+		c.body_remaining = blen
 		c.state = .Read_Body
 		return true
+	case .None:
 	}
 
 	c.state = .Process
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// strict request framing (RFC 7230 section 3.3.3)
+// ---------------------------------------------------------------------------
+
+// Body_Kind classifies how a request body is delimited after the strict
+// checks passed.
+Body_Kind :: enum {
+	None,    // no body
+	Length,  // Content-Length framing
+	Chunked, // Transfer-Encoding: chunked framing
+}
+
+// Framing_Error names why a request head was rejected.
+Framing_Error :: enum {
+	None,
+	TE_And_CL,      // Transfer-Encoding and Content-Length both present
+	TE_Unsupported, // final transfer coding is not chunked
+	CL_Conflict,    // duplicate or list-valued Content-Length
+	CL_Invalid,     // non-numeric or negative Content-Length
+}
+
+/*
+request_framing decides the request body framing, rejecting the ambiguous
+combinations that enable HTTP request smuggling (RFC 7230 section 3.3.3):
+
+  - Transfer-Encoding together with Content-Length: a middlebox reading
+    one header and the origin reading the other desynchronizes the
+    message stream. Rejected outright (nginx and lighttpd do the same).
+  - Transfer-Encoding whose final coding is not chunked: the library
+    relays only chunked framing, so anything else has no defined length.
+  - Duplicate or comma-listed Content-Length: RFC 7230 section 3.3.2
+    allows identical duplicates to collapse, but conflicting values are
+    a smuggling vector.
+*/
+request_framing :: proc(r: ^Request) -> (kind: Body_Kind, length: int, err: Framing_Error) {
+	te_count := 0
+	te_last := ""
+	cl_count := 0
+	cl_value := ""
+	for h in r.headers {
+		if eq_ignore_case(h.key, "Transfer-Encoding") {
+			te_count += 1
+			te_last = h.value
+		} else if eq_ignore_case(h.key, "Content-Length") {
+			cl_count += 1
+			if cl_count == 1 {
+				cl_value = h.value
+			} else if h.value != cl_value {
+				return .None, 0, .CL_Conflict
+			}
+			if string_index_byte(h.value, ',') >= 0 {
+				// a list in one header line: ambiguous, treat as conflict
+				return .None, 0, .CL_Conflict
+			}
+		}
+	}
+
+	if te_count > 0 {
+		if cl_count > 0 {
+			return .None, 0, .TE_And_CL
+		}
+		// the final coding must be chunked (RFC 7230 section 3.3.1)
+		last := te_last
+		for i := len(te_last) - 1; i >= 0; i -= 1 {
+			if te_last[i] == ',' {
+				last = te_last[i + 1:]
+				break
+			}
+		}
+		if !eq_ignore_case(trim_ows(last), "chunked") {
+			return .None, 0, .TE_Unsupported
+		}
+		return .Chunked, 0, .None
+	}
+
+	if cl_count == 0 {
+		return .None, 0, .None
+	}
+	n, ok := parse_int(cl_value)
+	if !ok || n < 0 {
+		return .None, 0, .CL_Invalid
+	}
+	return .Length, n, .None
+}
+
+framing_error_message :: proc(e: Framing_Error) -> string {
+	switch e {
+	case .TE_And_CL:
+		return "400 transfer-encoding and content-length conflict\n"
+	case .TE_Unsupported:
+		return "400 unsupported transfer-encoding\n"
+	case .CL_Conflict:
+		return "400 conflicting content-length\n"
+	case .CL_Invalid:
+		return "400 invalid content-length\n"
+	case .None:
+	}
+	return "400 bad request\n"
 }
 
 // conn_try_body accumulates the request body. Returns true when the machine
@@ -390,6 +513,10 @@ conn_process :: proc(c: ^Conn) {
 }
 
 conn_begin_write :: proc(c: ^Conn) {
+	if c.tls != nil {
+		tls_write_loop(c)
+		return
+	}
 	if buf_len(&c.out) == 0 {
 		conn_after_write(c)
 		return
@@ -402,6 +529,57 @@ conn_begin_write :: proc(c: ^Conn) {
 		all = true,
 		timeout = c.server.write_timeout,
 	)
+}
+
+/*
+conn_flush_out sends whatever is buffered in c.out, encrypting it first when
+the connection is wrapped in TLS. It returns false when there was nothing to
+send, so callers can continue synchronously.
+*/
+conn_flush_out :: proc(c: ^Conn, cb: proc(op: ^nbio.Operation, c: ^Conn)) -> bool {
+	if c.tls != nil {
+		if buf_len(&c.out) > 0 {
+			if !tls_encrypt(c, buf_slice(&c.out)) {
+				conn_close(c)
+				return true
+			}
+			buf_reset(&c.out)
+		}
+		if buf_len(&c.tls_out) == 0 {
+			return false
+		}
+		c.op = nbio.send_poly(
+			c.socket,
+			[][]byte{buf_slice(&c.tls_out)},
+			c,
+			cb,
+			all = true,
+			timeout = c.server.write_timeout,
+		)
+		return true
+	}
+	if buf_len(&c.out) == 0 {
+		return false
+	}
+	c.op = nbio.send_poly(
+		c.socket,
+		[][]byte{buf_slice(&c.out)},
+		c,
+		cb,
+		all = true,
+		timeout = c.server.write_timeout,
+	)
+	return true
+}
+
+// conn_after_send releases the buffer a completed send was reading from.
+conn_after_send :: proc(c: ^Conn, sent: int) {
+	c.server.stats.bytes_out += u64(sent)
+	if c.tls != nil {
+		buf_reset(&c.tls_out)
+		return
+	}
+	buf_reset(&c.out)
 }
 
 on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
@@ -426,7 +604,7 @@ on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 			w.file_handle,
 			c,
 			on_file_sent,
-			offset = 0,
+			offset = w.file_offset,
 			nbytes = int(w.file_size),
 			timeout = c.server.write_timeout,
 		)
@@ -492,8 +670,16 @@ conn_request_reset :: proc(c: ^Conn) {
 	c.send_phase = .None
 	c.idle_since = {}
 	c.proxy_state = .None
+	c.proxy_framing = .None
+	c.proxy_scan = {}
 	c.proxy_head_len = 0
 	c.proxy_remaining = 0
+	c.proxy_upstream = 0
+	c.proxy_pooled = false
+	c.proxy_retryable = false
+	c.proxy_client_started = false
+	c.proxy_upstream_close = false
+	c.proxy_body_done = false
 	c.proxy_cfg = nil
 }
 

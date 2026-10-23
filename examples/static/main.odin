@@ -21,6 +21,10 @@ main :: proc() {
 	if len(os.args) > 1 {
 		root = os.args[1]
 	}
+	address := "0.0.0.0:8080"
+	if len(os.args) > 2 {
+		address = os.args[2]
+	}
 
 	web.static_init(&files, root)
 	web.router_init(&router)
@@ -29,12 +33,12 @@ main :: proc() {
 	web.router_get(&router, "/*", static_files)
 
 	srv: web.Server
-	if !web.server_init(&srv, "0.0.0.0:8080") {
+	if !web.server_init(&srv, address) {
 		return
 	}
 	srv.handler = web.router_handle
 	srv.user_ptr = &router
-	fmt.printf("serving %v on http://0.0.0.0:8080\n", root)
+	fmt.printf("serving %v on http://%v\n", root, address)
 	if err := web.server_run(&srv); err != nil {
 		fmt.eprintfln("server error: %v", err)
 	}

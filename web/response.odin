@@ -30,6 +30,7 @@ Response :: struct {
 	file_handle: nbio.Handle,
 	file_open:   bool,
 	file_size:   i64,
+	file_offset: int, // first byte of the file to send (Range requests)
 	file_path:   string,
 
 	chunked:   bool,
@@ -55,6 +56,7 @@ response_reset :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 	w.body = {}
 	w.file_open = false
 	w.file_size = 0
+	w.file_offset = 0
 	w.file_path = ""
 	w.chunked = false
 	w.keep_alive = false
@@ -84,6 +86,13 @@ response_header :: proc(w: ^Response, key: string) -> (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// response_add_header appends a header without deduplicating. Use it for
+// headers that legitimately repeat (Set-Cookie); response_set_header
+// replaces instead.
+response_add_header :: proc(w: ^Response, key, value: string) {
+	append(&w.headers, Header{key = key, value = value})
 }
 
 response_write :: proc(w: ^Response, data: []byte) {
@@ -122,6 +131,26 @@ response_send_file :: proc(w: ^Response, path: string) -> bool {
 	w.file_handle = handle
 	w.file_open = true
 	w.file_size = size
+	w.file_path = path
+	buf_reset(&w.body)
+	return true
+}
+
+// response_send_file_range streams a byte range of a file: `offset` bytes
+// are skipped and `length` bytes are sent (sendfile with an offset, still
+// zero-copy). Used by the static handler for single-range 206 responses.
+response_send_file_range :: proc(w: ^Response, path: string, offset, length: i64) -> bool {
+	if file_pending(w) || offset < 0 || length < 0 {
+		return false
+	}
+	handle, ferr := nbio.open_sync(path)
+	if ferr != nil {
+		return false
+	}
+	w.file_handle = handle
+	w.file_open = true
+	w.file_size = length
+	w.file_offset = int(offset)
 	w.file_path = path
 	buf_reset(&w.body)
 	return true

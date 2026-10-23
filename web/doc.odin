@@ -25,19 +25,49 @@ What you get:
   - HTTP/1.1 parsing (zero-copy header slices), keep-alive, request
     bodies (Content-Length + chunked), timeouts, backpressure-aware
     non-blocking writes.
-  - A response builder, a `Filter` chain (chunked encoding built in and
-    registered by default, gzip/TLS are extension points), a router with
-    `:param`/`*` patterns and an Odin-native middleware chain, and a
-    static file handler with stat caching and zero-copy `sendfile`.
-  - A reverse proxy: round-robin upstreams, prefix stripping,
+  - Strict request framing per RFC 7230 section 3.3.3: `TE` + `CL`
+    together, a `TE` that does not end in chunked, and duplicated or
+    conflicting `Content-Length` are answered with 400 instead of being
+    resolved silently. The same rules apply to upstream responses, which
+    become 502 rather than being relayed.
+  - A response builder, a `Filter` chain (chunked encoding and
+    gzip/deflate content coding are built in and registered by default),
+    a router with `:param` / `*` patterns plus a Lua-pattern subset
+    (`(%w+)`, `(%d+)`, `[a-z]`, `.-`, ...) and an Odin-native middleware
+    chain, and a static file handler with stat caching and zero-copy
+    `sendfile`.
+  - Range requests (RFC 7233): single ranges stream zero-copy via
+    `sendfile` with an offset, multiple ranges answer as
+    `multipart/byteranges`, unsatisfiable ranges get 416 with a
+    `Content-Range` header carrying the full length.
+    `Last-Modified` / `If-Modified-Since` (304) and `If-Range` validators
+    are honored.
+  - Cookies: `response_set_cookie` / `request_cookie` with Path,
+    Domain, Expires, Max-Age, Secure, HttpOnly and SameSite.
+  - JSON responses: `response_json` marshals any Odin value with
+    `core:encoding/json` and sets the content type.
+  - A streaming reverse proxy: round-robin upstreams, prefix stripping,
     X-Forwarded-For / X-Forwarded-Proto / Via headers, hop-by-hop
-    filtering, and faithful relaying of Content-Length / chunked /
-    close-delimited responses.
+    filtering, faithful relaying of Content-Length / chunked /
+    close-delimited responses, and a pool of idle keep-alive upstream
+    connections (with a replay on a fresh connection when a pooled one
+    turns out to be stale). The response head reaches the client as soon
+    as it arrives; the body is relayed as it streams, so memory stays
+    bounded regardless of the response size.
+  - TLS, wrapped around the socket layer rather than the state machine:
+    attach a `Tls_Config` to the server (`srv.tls = &cfg`) and every
+    accepted connection gets an OpenSSL session. OpenSSL is loaded at
+    runtime through `core:dynlib`, so there is no build-time C
+    dependency. Handlers do not change at all.
+  - Multi-acceptor mode: `server_run_multi` starts one `Server` per
+    thread, each with its own event loop and its own SO_REUSEPORT
+    listener on the same address, so accept/read/write parallelize
+    across cores without any locking in the library.
   - Per-connection arena allocation: all per-request scratch memory is
     freed in one shot between keep-alive requests.
 
-Not included (deliberately): TLS (plug a `Filter` over the socket layer),
-HTTP/2, a config-file language, dynamic module loading.
+Not included (deliberately): HTTP/2, a config-file language, dynamic
+module loading, multi-process management (hand it to a supervisor).
 
 Quick start:
 

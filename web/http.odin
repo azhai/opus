@@ -75,6 +75,7 @@ Status :: enum u16 {
 	OK                  = 200,
 	Created             = 201,
 	Accepted            = 202,
+	Partial_Content     = 206,
 	No_Content          = 204,
 	Moved_Permanently   = 301,
 	Found               = 302,
@@ -90,6 +91,7 @@ Status :: enum u16 {
 	Payload_Too_Large   = 413,
 	URI_Too_Long        = 414,
 	Unsupported_Media    = 415,
+	Range_Not_Satisfiable = 416,
 	Header_Too_Large    = 431,
 	Internal_Error      = 500,
 	Not_Implemented     = 501,
@@ -106,6 +108,8 @@ status_text :: proc(s: Status) -> string {
 		return "Created"
 	case .Accepted:
 		return "Accepted"
+	case .Partial_Content:
+		return "Partial Content"
 	case .No_Content:
 		return "No Content"
 	case .Moved_Permanently:
@@ -136,6 +140,8 @@ status_text :: proc(s: Status) -> string {
 		return "URI Too Long"
 	case .Unsupported_Media:
 		return "Unsupported Media Type"
+	case .Range_Not_Satisfiable:
+		return "Range Not Satisfiable"
 	case .Header_Too_Large:
 		return "Request Header Fields Too Large"
 	case .Internal_Error:

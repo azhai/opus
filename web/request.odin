@@ -28,6 +28,9 @@ Request :: struct {
 	body:      []byte,
 	keep_alive: bool,
 	params:    []Param,
+	// captures holds the positional captures of a pattern route
+	// (patterns containing '(', '%' or '['), 1-based via request_capture.
+	captures: []string,
 }
 
 request_header :: proc(r: ^Request, name: string) -> (value: string, ok: bool) {
@@ -69,6 +72,16 @@ request_param :: proc(r: ^Request, name: string) -> (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// request_capture returns the idx-th positional capture of a pattern
+// route (1-based, like odin-http's req.url_params). Only filled when the
+// matched route pattern used pattern syntax.
+request_capture :: proc(r: ^Request, idx: int) -> (string, bool) {
+	if idx < 1 || idx > len(r.captures) {
+		return "", false
+	}
+	return r.captures[idx - 1], true
 }
 
 request_body_string :: proc(r: ^Request) -> string {
