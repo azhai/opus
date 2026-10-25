@@ -41,7 +41,21 @@ main :: proc() {
 - Filter 输出管线：chunked 编码与 gzip/deflate 内容编码内置且默认注册
   （按 `Accept-Encoding` 协商，只压可压缩类型、跳过 `sendfile` 文件路径）
 - Router：`:param` / `*` 模式、Lua 模式子集（`(%w+)` / `(%d+)` / `[a-z]` / `.-`，
-  回溯 VM + 捕获栈）、405 + `Allow`、Odin 原生中间件链（无闭包）
+  回溯 VM + 捕获栈）、405 + `Allow`、HEAD 自动回落到同名 GET 路由、Odin 原生
+  中间件链（无闭包，支持全局链 + 路由级链）；未命中路径也走中间件链，末端才回
+  404/405
+- 应用层 helper（对标 Fiber/Echo 的 context）：`request_hostname` /
+  `request_scheme` / `request_client_ip` / `request_content_type` /
+  `request_is_ajax` / `request_accepts` / `request_json`、`response_json_status` /
+  `response_error` / `response_download` / `response_clear_cookie` 等
+- 内置中间件：request id、访问日志、CORS（含预检）、Basic/Bearer/API-Key 认证、
+  正文限额、安全响应头、禁缓存、表单解析、Range+ETag、流式反缓冲；可全局注册，
+  也可用 `router_use_route` **只挂到某一条路由**（认证只护 `/admin`）
+- 表单正文：`middleware_form` 一次解析 `application/x-www-form-urlencoded` 与
+  `multipart/form-data`，字段进 `request_form` / `request_form_value`，上传文件
+  进 `request_files` / `request_file`（限字段数与单文件大小，超限 413）
+- SSE：`sse_start` / `sse_event` / `sse_comment` / `sse_retry` / `sse_close`，
+  chunked 分帧 + 浏览器自动重连语义，handler 不需要自己拼帧
 - Cookie：`response_set_cookie` / `request_cookie`，支持 Path/Domain/Expires/
   Max-Age/Secure/HttpOnly/SameSite，Set-Cookie 不折叠
 - JSON：`response_json` 直接序列化任意 Odin 值（`core:encoding/json`）
@@ -118,6 +132,15 @@ odin run examples/https
 curl -k --noproxy '*' https://127.0.0.1:8443/
 curl -k --noproxy '*' https://127.0.0.1:8443/ https://127.0.0.1:8443/  # keep-alive
 
+# 专用中间件（按路由挂载：认证 / 表单上传 / Range+ETag / SSE）
+odin run examples/middleware -- 127.0.0.1:8091
+curl --noproxy '*' -r 10-19 localhost:8091/report.csv          # 206
+curl --noproxy '*' -I localhost:8091/report.csv                # ETag / Accept-Ranges
+curl --noproxy '*' -u admin:secret localhost:8091/admin         # 401 -> 200
+curl --noproxy '*' -H 'X-API-Key: key-live-1' localhost:8091/api/keys
+curl --noproxy '*' -F name=ada -F avatar=@README.md localhost:8091/submit
+curl -N --noproxy '*' localhost:8091/events                    # SSE
+
 # 多 acceptor 线程（4 线程跑 10 秒，退出时打印每线程请求数）
 odin run examples/threads
 odin run examples/threads -- 8 127.0.0.1:8099 10
@@ -137,7 +160,11 @@ web/
   conn.odin      Conn：双层状态机、每连接 arena、读写驱动
   request.odin   parse_request：请求行 + 零拷贝 header
   response.odin  response_*：构建、sendfile 切换、自动头
-  router.odin    Router：段式 + Lua 模式匹配、中间件链
+  router.odin    Router：段式 + Lua 模式匹配、全局链 + 路由级链
+  middleware.odin 通用中间件：request id、访问日志、CORS、限额、安全头、反缓冲
+  auth.odin      auth 中间件：Basic / Bearer / API-Key + principal
+  form.odin      form 中间件：urlencoded + multipart 解析、上传限额
+  middleware_range.odin  Range/ETag 中间件（handler 只写完整正文）
   range.odin     Range：字节范围解析、multipart/byteranges、HTTP-date 解析
   static.odin    Static：stat 缓存、目录 index、MIME
   cookie.odin    Cookie：Set-Cookie 序列化、请求解析
@@ -148,12 +175,19 @@ web/
   socket_posix.odin   SO_REUSEPORT / listen 的系统调用补充（非 Windows）
   socket_windows.odin 同名 stub（Windows 无连接分发语义）
   filter.odin    Filter 链 + chunked 编解码
+  stream.odin    Hijack 后的流式辅助：写头、写帧、对端探测
+  sse.odin       SSE：sse_start/event/comment/retry/close（chunked 帧）
   compress.odin  gzip/deflate 编码器 + 内容协商 filter
   http.odin      Method / Status / Header / mime / http_date
+  uri.odin       url_decode/url_encode + url_path_clean（路径规范化）
+  html.odin      html_escape
   buffer.odin    Buf 与字节工具
   log.odin       分级日志（WEB_DEBUG 门控）
   testdata/      TLS 自签证书（cert.pem / key.pem）
   web_test.odin  单测 + 集成测试
+  context_test.odin   Request/Response 应用层 helper 的单测
+  middleware_test.odin 通用中间件的单测
+  middleware_purpose_test.odin  认证/表单/Range/SSE 中间件的单测 + SSE 集成测试
 examples/
   hello/         最小服务
   api/           router + 中间件 + 模式捕获 + Cookie + JSON
@@ -161,6 +195,7 @@ examples/
   proxy/         反向代理（/api 前缀剥离转发 + 本地 /health + 连接池清理）
   https/         TLS（自签证书 + keep-alive）
   threads/       多 acceptor 线程（每线程请求数统计）
+  middleware/    按路由挂载的专用中间件：认证 / 表单 / Range+ETag / SSE
   www/           静态测试资源
 docs/
   research.md    调研与设计文档
@@ -189,15 +224,26 @@ srv.handler = web.router_handle   // 或交给 router
 srv.user_ptr = &router            // router/static 等用户状态挂这里
 ```
 
-**请求侧**：`request_header` / `request_query` / `request_param` /
-`request_cookie` / `request_cookies` / `request_body_string`；解析结果
-`req.method`、`req.path`、`req.params`、`req.captures`。
+**请求侧**：`request_header` / `request_query` / `request_query_all` /
+`request_query_params` / `request_param` / `request_capture` /
+`request_cookie` / `request_cookies` / `request_body_string` /
+`request_json`（正文反序列化到任意 Odin 值）；解析结果 `req.method`、
+`req.path`、`req.params`、`req.captures`。
+
+上下文类（对齐 Echo 的 `Host/Hostname/RealIP/IsAjax/Accepts`、Fiber 的
+`Hostname/IP/BodyParser`）：`request_host` / `request_hostname` /
+`request_scheme` / `request_remote_addr` / `request_client_ip` /
+`request_content_type` / `request_is_ajax` / `request_accepts` /
+`request_id`。
 
 **响应侧**：`response_status` / `response_set_header` / `response_add_header`
-（Set-Cookie 等可重复头）/ `response_write` / `response_write_string` /
-`response_send_file` / `response_redirect` / `response_json` /
-`response_set_cookie`。
-框架自动补 `Date`/`Server`/`Connection`/`Content-Length`。
+（Set-Cookie 等可重复头）/ `response_remove_header` / `response_set_content_type`
+/ `response_write` / `response_write_string` / `response_send_file` /
+`response_redirect` / `response_json` / `response_json_status` /
+`response_error` / `response_download`（附件）/ `response_set_disposition` /
+`response_set_cookie` / `response_clear_cookie`。
+框架自动补 `Date`/`Server`/`Connection`/`Content-Length`；`response_body_size`
+给日志/计量用（内存体或 sendfile 文件大小）。
 
 **Cookie / JSON / 模式路由**
 
@@ -234,6 +280,114 @@ my_middleware :: proc(m: ^web.Middleware, r: ^web.Router, idx: int,
 }
 ```
 
+未命中的路径也要过中间件链（末端回 404/405）：这样 CORS 预检（一个没有路由
+注册的 `OPTIONS`）、404 的访问日志、统一的安全头都能生效。`router_all` 注册
+的路由对所有方法生效。
+
+**内置中间件**（`router_use` 全局注册，或 `router_use_route` 挂到单条路由；需要
+配置的从 `ud` 传 `^Xxx_Config`，`nil` 即默认值）
+
+| 过程 | 作用 | 配置 |
+|---|---|---|
+| `middleware_request_id` | 复用/生成 `X-Request-Id`，写回响应头并挂到 `request_id(req)` | — |
+| `middleware_logger` | 每请求一行：状态、方法、路径、字节数、耗时、id、客户端 IP、认证主体 | — |
+| `middleware_secure_headers` | `nosniff` / `X-Frame-Options` / `Referrer-Policy`，可加 CSP、HSTS | `Secure_Headers_Config` |
+| `middleware_no_cache` | `Cache-Control: no-store` 等，给登录页/API 用 | — |
+| `middleware_cors` | 预检直接回 204 不跑路由；按 Origin 白名单决定回 `*` 还是回显 + `Vary: Origin` | `CORS_Config` |
+| `middleware_basic_auth` | `Authorization: Basic`，等时比较，401 带 `WWW-Authenticate` | `Basic_Auth_Config` |
+| `middleware_bearer_auth` | `Authorization: Bearer <token>`，令牌表白名单，401 带 `error="invalid_token"` | `Bearer_Auth_Config` |
+| `middleware_api_key` | 自定义头（默认 `X-API-Key`）+ 可选 query 兜底 | `API_Key_Config` |
+| `middleware_body_limit` | 按 `Content-Length` 提前回 413（chunked 仍由 `Server.max_body_size` 兜底） | `Body_Limit_Config` |
+| `middleware_form` | 解析 urlencoded / multipart 正文一次并缓存；非表单正文 415、畸形 400、超限 413 | `Form_Config` |
+| `middleware_range` | handler 只管写完整正文：单 range → 206 + `Content-Range`，不可满足 → 416，`etag = true` 再加内容哈希 ETag + `If-None-Match` → 304 | `Range_Config` |
+| `middleware_no_buffer` | `X-Accel-Buffering: no` + `no-transform`，阻止代理缓冲流式响应 | — |
+
+三种认证都会把认证主体写到 `req.principal`（`request_principal(req)` 读取），
+`middleware_logger` 的日志行里带 `user=`，401 与 200 都能追到同一个令牌。
+
+```odin
+cors_cfg := web.CORS_Config {
+	origins           = []string{"https://admin.example"},
+	allow_credentials = true,
+	expose_headers    = "X-Total-Count",
+}
+web.router_use(&router, web.middleware_request_id)     // 先：id 进日志
+web.router_use(&router, web.middleware_logger)
+web.router_use(&router, web.middleware_secure_headers)
+web.router_use(&router, web.middleware_cors, &cors_cfg) // 配置要活得比 server 长
+```
+
+顺序即执行顺序（`router_use` 追加）；跨切面的放前面，鉴权/路由相关的放后面，
+被拒的请求也还能有 id 和日志。`ud` 里的配置必须是包级变量或堆分配，别传栈上
+临时值。没有 recover 中间件——Odin 没有异常，断言失败直接结束进程，进程级
+容错交给 supervisor。
+
+**按路由挂载**（`router_use_route`：同一套中间件，只护一条路由）
+
+```odin
+report := web.router_get(&router, "/report.csv", report_handler)
+admin  := web.router_get(&router, "/admin", admin_handler)
+submit := web.router_add(&router, web.Method.Post, "/submit", submit_handler)
+// 全部路由注册完再挂：追加路由可能搬动路由表，使上面拿到的指针失效
+web.router_use_route(report, web.middleware_range, &range_cfg)     // Range + ETag
+web.router_use_route(admin,  web.middleware_basic_auth, &admin_cfg)
+web.router_use_route(submit, web.middleware_form, &form_cfg)
+```
+
+路由级链在全局链之后、handler 之前执行；中间件实现不用改（`router_next` 对
+`r == nil` 走请求上挂的链）。所以 `middleware_basic_auth` 既能在全局链里保护
+整个站点，也能只保护 `/admin`。
+
+**表单与上传**
+
+```odin
+// 单字段
+name, ok := web.request_form_value(req, "name")
+// 全部字段 / 上传文件
+for p in web.request_form(req) { ... }
+if f, ok := web.request_file(req, "avatar"); ok {
+	// f.filename 已去掉路径成分，f.content_type 可能为空，f.data 是请求体的视图
+}
+```
+
+`request_form` / `request_files` 自己也会惰性解析（默认限额），`middleware_form`
+只是把这一步提前，并让错误变成 400/413/415 而不是空结果。
+
+**Range + ETag（普通 handler 也能 206/304）**
+
+```odin
+range_cfg := web.Range_Config{etag = true}
+web.router_use_route(report, web.middleware_range, &range_cfg)
+
+report_handler :: proc(req: ^web.Request, res: ^web.Response) {
+	web.response_write_string(res, csv)   // 照常写完整正文
+}
+```
+
+中间件在 handler 之后按请求头改写响应：单 range 切片 + 206 + `Content-Range`、
+不可满足 416 + `bytes */size`、多 range 忽略（回 200 全文）、`If-None-Match` 命中
+304。`sendfile`/chunked 响应自动跳过（前者已由 static 零拷贝处理，后者没有长度）。
+ETag 是正文的 FNV-1a 64 哈希，弱比较、跨重启稳定。
+
+**SSE（服务端事件）**
+
+```odin
+events :: proc(req: ^web.Request, res: ^web.Response) {
+	w, ok := web.sse_start(res)       // hijack + chunked 响应头
+	if !ok { return }
+	defer web.sse_close(&w)          // 写终止块并关连接，幂等
+	_ = web.sse_retry(&w, 2000)      // 客户端断线后 2s 重连
+	for i in 0..<10 {
+		if !web.sse_event(&w, "tick", "tick", "1") { return }  // false = 对端已断
+	}
+}
+```
+
+`data` 里的换行会自动拆成多行 `data:`；`sse_comment` 兼作 keep-alive（客户端
+忽略 `:` 行，但代理不会因空闲断开）。代价要说清：handler 跑在事件循环线程上，
+一条 SSE 流会占住那条线程直到结束——少量仪表盘没问题，公开广播流请用
+`server_run_multi` 让其它线程继续服务，或另起专门的流服务。
+
 **Static**
 
 ```odin
@@ -242,6 +396,24 @@ web.static_init(&files, "./www")
 srv.user_ptr = &files
 srv.handler = web.static_serve
 ```
+
+**Hijack / 流式**（SSE、长轮询：响应跨请求，只能把 socket 接管过来）
+
+```odin
+sock, ok := web.response_hijack(res)   // 之后 server 不再管这条连接，由调用方关
+if ok {
+	_ = net.set_blocking(sock, true)
+	// content_length = -1：无长度、close 分帧（自己带 Connection 头则不覆盖）
+	web.stream_write_head(sock, .OK, []web.Header{{"Content-Type", "text/event-stream"}}, -1)
+	for {
+		if !web.stream_write(sock, frame) { break }   // false = 对端已断
+		if web.stream_peer_closed(sock) { break }     // 空闲期探测断开
+	}
+}
+```
+
+SSE 不必手写这些：`sse_start` / `sse_event` / `sse_comment` / `sse_retry` /
+`sse_close` 已经在 hijack 之上做好 chunked 分帧与响应头（见上一节）。
 
 **Proxy**（反向代理）
 
@@ -332,7 +504,8 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 
 ## 测试覆盖
 
-`odin test web/` 共 61 个用例：parser / chunked / router / response 序列化 /
+`odin test web/` 共 97 个用例（69 主测试 + 7 context + 8 通用中间件 + 13 专用
+中间件）：parser / chunked / router / response 序列化 /
 proxy 解析与分帧决策 / cookie 序列化与解析 / JSON / Lua 模式匹配（22 组模式
 用例）/ Range 解析（14 组语法用例）/ HTTP-date 解析 / If-Range / 严格分帧
 （15 组用例）/ CRC32 与 deflate-gzip 往返 / 可压缩类型判定 单测，加 20 多个
@@ -341,7 +514,10 @@ pipelined 双请求、HEAD、空文件 sendfile、代理 GET/POST、chunked 上�
 close-delimited 上游重分帧、上游拒连 502、Cookie、JSON、模式路由、静态
 Range 全路径：单 range 206 / 多 range multipart / 416 / 304 / If-Range、
 gzip 内容协商与 chunked 组合、代理流式早发 / 失效池重试 / 池命中计数、
-3 acceptor 共享端口、TLS 配置 / GET / keep-alive / 200 KiB 静态文件逐字节比对），
+3 acceptor 共享端口、TLS 配置 / GET / keep-alive / 200 KiB 静态文件逐字节比对、
+SSE 事件流），以及中间件层的 Bearer/API-Key 认证（含 challenge 文案与
+principal 传递）、表单 urlencoded/multipart/限额/415/400/413、Range 中间件的
+206/416/ETag/304/If-Range/跳过文件响应、路由级中间件隔离。
 Odin test runner 内存追踪零泄漏。
 
 ## 与 odin-http 的关系

@@ -2215,6 +2215,43 @@ test_gzip_roundtrip :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_gzip_distance_codes :: proc(t: ^testing.T) {
+	// Every distance code must survive a strict inflater. DIST_EXTRA widens
+	// once per *pair* of codes, so a single off-by-one there shifts the bit
+	// stream by one bit as soon as a match is farther than 128 bytes: lenient
+	// decoders still round-trip short repetitive payloads (all matches close
+	// together), which is exactly how that bug hid. Walk one distance per
+	// code instead: filler, then the same 64 bytes repeated at exactly that
+	// distance.
+	BLOCK :: 64
+	for code in 0..<30 {
+		arena_buf: [192 << 10]byte
+		arena: mem.Arena
+		mem.arena_init(&arena, arena_buf[:])
+		alloc := mem.arena_allocator(&arena)
+
+		dist := DIST_BASE[code]
+		src := make([]byte, dist + BLOCK, alloc)
+		// high-entropy bytes: no accidental long match except the crafted one
+		x := u32(0x9E3779B9)
+		for i in 0..<len(src) {
+			x = x * 1664525 + 1013904223
+			src[i] = byte(x >> 24)
+		}
+		copy(src[dist:], src[:BLOCK])
+
+		gz := gzip_compress(src, alloc)
+		out: bytes.Buffer
+		err := gzip.load_from_bytes(gz, &out)
+		testing.expectf(t, err == nil, "distance code %d (dist %d): %v", code, dist, err)
+		if err == nil {
+			testing.expectf(t, len(out.buf) == len(src), "distance code %d (dist %d): inflated %d bytes, want %d", code, dist, len(out.buf), len(src))
+			testing.expectf(t, mem.compare(out.buf[:], src) == 0, "distance code %d (dist %d): payload mismatch", code, dist)
+		}
+	}
+}
+
+@(test)
 test_content_type_compressible :: proc(t: ^testing.T) {
 	testing.expect(t, content_type_compressible("text/html"))
 	testing.expect(t, content_type_compressible("TEXT/CSS"))
@@ -3102,4 +3139,176 @@ test_integration_tls_static_file :: proc(t: ^testing.T) {
 	if len(body) == len(content) {
 		testing.expect(t, mem.compare(body, content) == 0)
 	}
+}
+
+@(test)
+test_mime_type_for :: proc(t: ^testing.T) {
+	Case :: struct {
+		path, want: string,
+	}
+	cases := []Case{
+		{"/a/index.html", "text/html; charset=utf-8"},
+		{"/a/index.HTML", "text/html; charset=utf-8"}, // extension case-insensitive
+		{"/a/x.js", "text/javascript; charset=utf-8"},
+		{"/a/x.json", "application/json"},
+		{"/a/x.svg", "image/svg+xml"},
+		{"/a/x.woff2", "font/woff2"},
+		{"/a/x.conf", "text/plain; charset=utf-8"},
+		{"/a.b/c", "application/octet-stream"}, // no extension across '/'
+		{"/a/x.", "application/octet-stream"},
+		{"/a/x.unknown", "application/octet-stream"},
+	}
+	for c in cases {
+		testing.expectf(t, mime_type_for(c.path) == c.want, "%s → %s, want %s", c.path, mime_type_for(c.path), c.want)
+	}
+
+	// charset=false is the byte-exact form (uhttpd-style headers)
+	testing.expect_value(t, mime_type_for("/a/x.html", false), "text/html")
+	testing.expect_value(t, mime_type_for("/a/x.js", false), "text/javascript")
+	testing.expect_value(t, mime_type_for("/a/x.png", false), "image/png")
+}
+
+@(test)
+test_status_text :: proc(t: ^testing.T) {
+	testing.expect_value(t, status_text(.OK), "OK")
+	testing.expect_value(t, status_text(.See_Other), "See Other")
+	testing.expect_value(t, status_text(.Temporary_Redirect), "Temporary Redirect")
+	testing.expect_value(t, status_text(.Length_Required), "Length Required")
+	testing.expect_value(t, status_text(.Header_Too_Large), "Request Header Fields Too Large")
+	testing.expect_value(t, status_text(Status(599)), "Unknown")
+}
+
+// ---------------------------------------------------------------------------
+// URI / request / response helpers
+// ---------------------------------------------------------------------------
+
+@(test)
+test_url_decode_encode :: proc(t: ^testing.T) {
+	// decoding allocates for escaped input; keep it in an arena like a request
+	backing: [4096]u8
+	ar: mem.Arena
+	mem.arena_init(&ar, backing[:])
+	old := context.allocator
+	context.allocator = mem.arena_allocator(&ar)
+	defer context.allocator = old
+
+	testing.expect_value(t, url_decode("a+b%20c%2Fd"), "a b c/d")
+	testing.expect_value(t, url_decode("100%25"), "100%")
+	testing.expect_value(t, url_decode("bad%zz"), "bad%zz") // malformed escape stays literal
+	testing.expect_value(t, url_decode("trunc%2"), "trunc%2")
+	testing.expect_value(t, url_encode("a b/c?d=e~"), "a+b%2Fc%3Fd%3De~")
+}
+
+@(test)
+test_url_path_clean :: proc(t: ^testing.T) {
+	backing: [4096]u8
+	ar: mem.Arena
+	mem.arena_init(&ar, backing[:])
+	old := context.allocator
+	context.allocator = mem.arena_allocator(&ar)
+	defer context.allocator = old
+
+	Case :: struct {
+		raw:   string,
+		want:  string,
+		state: Path_State,
+	}
+	cases := []Case{
+		{"/", "/", .Ok},
+		{"/a//b/./c", "/a/b/c", .Ok},
+		{"/a/b/?q=1#f", "/a/b", .Ok},
+		{"/a%2Fb", "/a/b", .Ok},
+		{"/a/%2e%2e/b", "", .Escaping},
+		{"/../etc/passwd", "", .Escaping},
+		{"/a%zz", "", .Bad},
+		{"/a%00b", "", .Bad},
+		{"no-slash", "", .Bad},
+	}
+	for c in cases {
+		got, state := url_path_clean(c.raw)
+		testing.expectf(t, state == c.state, "%s: state %v, want %v", c.raw, state, c.state)
+		if state == .Ok {
+			testing.expect_value(t, got, c.want)
+		}
+	}
+}
+
+@(test)
+test_request_query_and_form :: proc(t: ^testing.T) {
+	backing: [8192]u8
+	ar: mem.Arena
+	mem.arena_init(&ar, backing[:])
+	old := context.allocator
+	context.allocator = mem.arena_allocator(&ar)
+	defer context.allocator = old
+
+	r := Request{query = "name=odin+lang&empty=&flag&x=%41&name=second"}
+	v, ok := request_query(&r, "name")
+	testing.expect(t, ok)
+	testing.expect_value(t, v, "odin lang")
+
+	x, okx := request_query(&r, "x")
+	testing.expect(t, okx)
+	testing.expect_value(t, x, "A")
+
+	_, ok_missing := request_query(&r, "missing")
+	testing.expect(t, !ok_missing)
+
+	all := request_query_all(&r, "name")
+	testing.expect_value(t, len(all), 2)
+	if len(all) == 2 {
+		testing.expect_value(t, all[1], "second")
+	}
+
+	r.body = tb("username=root&password=a+b&note=%2Ftmp")
+	form := request_form(&r)
+	testing.expect_value(t, len(form), 3)
+	pw, _ := request_form_value(&r, "password")
+	testing.expect_value(t, pw, "a b")
+	note, _ := param_get(form, "note")
+	testing.expect_value(t, note, "/tmp")
+
+	flag_req := Request{body = tb("flag")}
+	flag, ok_flag := request_form_value(&flag_req, "flag")
+	testing.expect(t, ok_flag)
+	testing.expect_value(t, flag, "")
+}
+
+@(test)
+test_response_helpers :: proc(t: ^testing.T) {
+	w: Response
+	response_init(&w, nil, context.allocator)
+	defer {
+		delete(w.headers)
+		buf_destroy(&w.body)
+	}
+
+	response_text(&w, .Created, "hi")
+	testing.expect_value(t, w.status, Status.Created)
+	ct, ok := response_header(&w, "content-type")
+	testing.expect(t, ok)
+	testing.expect_value(t, ct, "text/plain; charset=utf-8")
+	testing.expect_value(t, string(buf_slice(&w.body)), "hi")
+
+	response_html(&w, .OK, "<b>x</b>")
+	ct2, _ := response_header(&w, "Content-Type")
+	testing.expect_value(t, ct2, "text/html; charset=utf-8")
+	testing.expect_value(t, string(buf_slice(&w.body)), "hi<b>x</b>")
+
+	response_no_content(&w)
+	testing.expect_value(t, w.status, Status.No_Content)
+	testing.expect_value(t, buf_len(&w.body), 0)
+}
+
+@(test)
+test_html_escape :: proc(t: ^testing.T) {
+	backing: [4096]u8
+	ar: mem.Arena
+	mem.arena_init(&ar, backing[:])
+	old := context.allocator
+	context.allocator = mem.arena_allocator(&ar)
+	defer context.allocator = old
+
+	testing.expect_value(t, html_escape("plain text"), "plain text")
+	testing.expect_value(t, html_escape(`<a href="x">'&'</a>`), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;")
 }

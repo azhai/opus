@@ -30,3 +30,10 @@ response_json :: proc(w: ^Response, v: any) -> json.Marshal_Error {
 	response_write(w, data)
 	return nil
 }
+
+// response_json_status is response_json with the status set in the same
+// call (Echo's c.JSON(code, i), Fiber's c.Status(...).JSON(...)).
+response_json_status :: proc(w: ^Response, status: Status, v: any) -> json.Marshal_Error {
+	w.status = status
+	return response_json(w, v)
+}

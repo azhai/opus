@@ -34,8 +34,31 @@ What you get:
     gzip/deflate content coding are built in and registered by default),
     a router with `:param` / `*` patterns plus a Lua-pattern subset
     (`(%w+)`, `(%d+)`, `[a-z]`, `.-`, ...) and an Odin-native middleware
-    chain, and a static file handler with stat caching and zero-copy
-    `sendfile`.
+    chain - router-wide or attached to a single route with
+    `router_use_route`. HEAD is served by the GET route when no HEAD route
+    exists. Unmatched requests still walk the middleware chain before the
+    404/405 terminal answers. A static file handler with stat caching and
+    zero-copy `sendfile` rounds out the routing layer.
+  - Application-level context helpers, the surface a Go developer expects
+    from Fiber/Echo: `request_hostname`, `request_scheme`,
+    `request_client_ip`, `request_content_type`, `request_is_ajax`,
+    `request_accepts`, `request_json`, plus `response_json_status`,
+    `response_error`, `response_download` and `response_clear_cookie`.
+  - Middleware, split by purpose:
+      request id, access log (with the authenticated principal), CORS,
+      security headers, no-cache, no-buffer for streams;
+      auth - basic, bearer tokens and API keys, all comparing in constant
+      time and installing `request_principal`;
+      form - urlencoded and multipart parsing, files included, parsed once
+      per request with field/size limits;
+      range - Range and ETag over a body an ordinary handler produced, so
+      a handler that writes the whole representation still answers 206,
+      416 and 304 correctly.
+    Configured ones take their settings through `Middleware.ud`, since
+    Odin has no closures.
+  - Server-sent events: `sse_start` / `sse_event` / `sse_comment` /
+    `sse_retry` / `sse_close` hijack the connection and speak chunked
+    framing, so a handler emits events instead of bytes.
   - Range requests (RFC 7233): single ranges stream zero-copy via
     `sendfile` with an offset, multiple ranges answer as
     `multipart/byteranges`, unsatisfiable ranges get 416 with a

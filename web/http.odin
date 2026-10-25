@@ -13,6 +13,10 @@ Method :: enum u8 {
 	Patch,
 	Trace,
 	Connect,
+	// All is a route-table wildcard, never a request method: a route
+	// registered with it answers every verb (`router_all`). `method_from_string`
+	// never returns it.
+	All,
 	Unknown,
 }
 
@@ -62,6 +66,9 @@ method_string :: proc(m: Method) -> string {
 		return "UNKNOWN"
 	case .Connect:
 		return "CONNECT"
+	case .All:
+		// only reachable from a route table, so this is a label, not a method
+		return "ALL"
 	}
 	return "UNKNOWN"
 }
@@ -79,7 +86,9 @@ Status :: enum u16 {
 	No_Content          = 204,
 	Moved_Permanently   = 301,
 	Found               = 302,
+	See_Other           = 303,
 	Not_Modified        = 304,
+	Temporary_Redirect  = 307,
 	Bad_Request         = 400,
 	Unauthorized        = 401,
 	Forbidden           = 403,
@@ -88,6 +97,7 @@ Status :: enum u16 {
 	Not_Acceptable      = 406,
 	Request_Timeout     = 408,
 	Conflict            = 409,
+	Length_Required     = 411,
 	Payload_Too_Large   = 413,
 	URI_Too_Long        = 414,
 	Unsupported_Media    = 415,
@@ -116,8 +126,12 @@ status_text :: proc(s: Status) -> string {
 		return "Moved Permanently"
 	case .Found:
 		return "Found"
+	case .See_Other:
+		return "See Other"
 	case .Not_Modified:
 		return "Not Modified"
+	case .Temporary_Redirect:
+		return "Temporary Redirect"
 	case .Bad_Request:
 		return "Bad Request"
 	case .Unauthorized:
@@ -134,6 +148,8 @@ status_text :: proc(s: Status) -> string {
 		return "Request Timeout"
 	case .Conflict:
 		return "Conflict"
+	case .Length_Required:
+		return "Length Required"
 	case .Payload_Too_Large:
 		return "Payload Too Large"
 	case .URI_Too_Long:
@@ -183,9 +199,20 @@ eq_ignore_case :: proc(a, b: string) -> bool {
 	return true
 }
 
-// mime_type maps a file extension to a content type.
+// mime_type maps a file path's extension to a content type, with
+// "; charset=utf-8" on textual types. Shorthand for mime_type_for(path).
 mime_type :: proc(path: string) -> string {
-	// find the last '.' after the last '/'
+	return mime_type_for(path)
+}
+
+// mime_type_for maps a file path's extension to a Content-Type. Extensions
+// are matched case-insensitively against the segment after the last '.'
+// (never across a '/'); unknown ones become application/octet-stream.
+//
+// charset decides whether textual types carry "; charset=utf-8". Pass false
+// when the caller must emit byte-exact headers (e.g. to mirror uhttpd), and
+// true for the browser-friendly default.
+mime_type_for :: proc(path: string, charset := true) -> string {
 	dot := -1
 	for i := len(path) - 1; i >= 0; i -= 1 {
 		c := path[i]
@@ -197,45 +224,75 @@ mime_type :: proc(path: string) -> string {
 			break
 		}
 	}
-	if dot < 0 {
+	if dot < 0 || dot + 1 >= len(path) {
 		return "application/octet-stream"
 	}
-	ext := path[dot:]
-	switch ext {
-	case ".html", ".htm":
-		return "text/html; charset=utf-8"
-	case ".css":
-		return "text/css; charset=utf-8"
-	case ".js", ".mjs":
-		return "text/javascript; charset=utf-8"
-	case ".json":
+
+	// Lowercase into a stack buffer: the table is ASCII and no known
+	// extension is longer than this, so no allocation is needed per call.
+	raw := path[dot + 1:]
+	buf: [16]u8
+	if len(raw) > len(buf) {
+		return "application/octet-stream"
+	}
+	n := len(raw)
+	for i in 0..<n {
+		c := raw[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		buf[i] = c
+	}
+
+	switch string(buf[:n]) {
+	case "html", "htm":
+		return charset ? "text/html; charset=utf-8" : "text/html"
+	case "css":
+		return charset ? "text/css; charset=utf-8" : "text/css"
+	case "js", "mjs":
+		return charset ? "text/javascript; charset=utf-8" : "text/javascript"
+	case "json":
 		return "application/json"
-	case ".txt", ".md":
-		return "text/plain; charset=utf-8"
-	case ".xml":
+	case "txt", "md", "conf", "log":
+		return charset ? "text/plain; charset=utf-8" : "text/plain"
+	case "xml":
 		return "application/xml"
-	case ".svg":
+	case "svg":
 		return "image/svg+xml"
-	case ".png":
+	case "png":
 		return "image/png"
-	case ".jpg", ".jpeg":
+	case "jpg", "jpeg":
 		return "image/jpeg"
-	case ".gif":
+	case "gif":
 		return "image/gif"
-	case ".webp":
+	case "bmp":
+		return "image/bmp"
+	case "webp":
 		return "image/webp"
-	case ".ico":
+	case "ico":
 		return "image/x-icon"
-	case ".pdf":
+	case "pdf":
 		return "application/pdf"
-	case ".zip":
+	case "zip":
 		return "application/zip"
-	case ".wasm":
+	case "gz":
+		return "application/x-gzip"
+	case "tar":
+		return "application/x-tar"
+	case "mp4":
+		return "video/mp4"
+	case "mp3":
+		return "audio/mpeg"
+	case "wav":
+		return "audio/x-wav"
+	case "wasm":
 		return "application/wasm"
-	case ".woff":
+	case "woff":
 		return "font/woff"
-	case ".woff2":
+	case "woff2":
 		return "font/woff2"
+	case "sh":
+		return "application/x-shellscript"
 	}
 	return "application/octet-stream"
 }

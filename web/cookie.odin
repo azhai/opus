@@ -87,15 +87,29 @@ cookie_string :: proc(c: Cookie, allocator := context.allocator) -> string {
 // response_set_header this never replaces: each cookie gets its own
 // header line, as Set-Cookie does not fold (RFC 6265 section 3.4).
 response_set_cookie :: proc(w: ^Response, c: Cookie) {
-	alloc := context.allocator
-	if w.conn != nil {
-		alloc = conn_scratch(w.conn)
-	}
-	s := cookie_string(c, alloc)
+	s := cookie_string(c, response_allocator(w))
 	if len(s) == 0 {
 		return
 	}
 	response_add_header(w, "Set-Cookie", s)
+}
+
+// response_clear_cookie expires a cookie: empty value, Max-Age=0 and an
+// Expires in the past, which is the only combination every browser honours
+// (Echo's c.ClearCookie). `path` must match the cookie being removed.
+response_clear_cookie :: proc(w: ^Response, name: string, path := "/") {
+	if len(name) == 0 {
+		return
+	}
+	alloc := response_allocator(w)
+	b: Buf
+	buf_init(&b, alloc)
+	defer buf_destroy(&b)
+	buf_append_string(&b, name)
+	buf_append_string(&b, "=; Path=")
+	buf_append_string(&b, path)
+	buf_append_string(&b, "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+	response_add_header(w, "Set-Cookie", clone_string(string(buf_slice(&b)), alloc))
 }
 
 // request_cookie returns the value of the named cookie from the request's

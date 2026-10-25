@@ -1,6 +1,8 @@
 package web
 
+import "core:encoding/json"
 import "core:mem"
+import "core:net"
 
 MAX_HEADERS :: 128
 
@@ -18,19 +20,38 @@ a stable copy made when the body has fully arrived. Both live until the
 request is done.
 */
 Request :: struct {
-	conn:      ^Conn,
-	method:    Method,
-	version:   HTTP_Version,
-	target:    string,
-	path:      string,
-	query:     string,
-	headers:   []Header,
-	body:      []byte,
+	conn:       ^Conn,
+	method:     Method,
+	version:    HTTP_Version,
+	target:     string,
+	path:       string,
+	query:      string,
+	headers:    []Header,
+	body:       []byte,
 	keep_alive: bool,
-	params:    []Param,
+	params:     []Param,
 	// captures holds the positional captures of a pattern route
 	// (patterns containing '(', '%' or '['), 1-based via request_capture.
 	captures: []string,
+	// id is the request identifier installed by middleware_request_id;
+	// empty when that middleware is not in the chain. Read it through
+	// request_id rather than the field.
+	id: string,
+	// principal is the authenticated identity installed by an auth
+	// middleware (basic auth user, bearer/API-key token name). Read it
+	// through request_principal.
+	principal: string,
+	// form/files hold the decoded body of a form request (either encoding)
+	// and are filled at most once per request, by middleware_form or by the
+	// lazy request_form / request_files accessors.
+	form:       []Param,
+	files:      []Form_File,
+	form_state: Form_State,
+	// route is the route table entry that matched (nil for an unmatched
+	// path) and chain is its route-local middleware chain. Package-internal
+	// plumbing for the router.
+	route: ^Route,
+	chain: []Middleware,
 }
 
 request_header :: proc(r: ^Request, name: string) -> (value: string, ok: bool) {
@@ -42,8 +63,21 @@ request_header :: proc(r: ^Request, name: string) -> (value: string, ok: bool) {
 	return "", false
 }
 
-// request_query returns the first value of key in the raw query string.
+// request_allocator is where decoded query/form storage goes: the connection
+// scratch arena in a live request, context.allocator for detached requests
+// (unit tests, synthetic handlers).
+request_allocator :: proc(r: ^Request) -> mem.Allocator {
+	if r.conn != nil {
+		return conn_scratch(r.conn)
+	}
+	return context.allocator
+}
+
+// request_query returns the first value of key in the query string (Echo's
+// QueryParam, Fiber's Query). Keys and values are form-decoded ('+' → space,
+// %XX), so callers compare and use the decoded forms.
 request_query :: proc(r: ^Request, key: string) -> (string, bool) {
+	alloc := request_allocator(r)
 	q := r.query
 	for len(q) > 0 {
 		end := string_index_byte(q, '&')
@@ -58,8 +92,95 @@ request_query :: proc(r: ^Request, key: string) -> (string, bool) {
 		if eq < 0 {
 			continue
 		}
-		if pair[:eq] == key {
-			return pair[eq + 1:], true
+		if url_decode(pair[:eq], alloc) == key {
+			return url_decode(pair[eq + 1:], alloc), true
+		}
+	}
+	return "", false
+}
+
+// request_query_all returns every value for key, in order (Echo's
+// QueryParams; repeated query keys are legitimate).
+request_query_all :: proc(r: ^Request, key: string) -> []string {
+	alloc := request_allocator(r)
+	out := make([dynamic]string, alloc)
+	q := r.query
+	for len(q) > 0 {
+		end := string_index_byte(q, '&')
+		pair := q
+		if end >= 0 {
+			pair = q[:end]
+			q = q[end + 1:]
+		} else {
+			q = ""
+		}
+		eq := string_index_byte(pair, '=')
+		if eq < 0 {
+			continue
+		}
+		if url_decode(pair[:eq], alloc) == key {
+			append(&out, url_decode(pair[eq + 1:], alloc))
+		}
+	}
+	return out[:]
+}
+
+// form_parse parses an application/x-www-form-urlencoded body into
+// name/value pairs. '+' and %XX are decoded; malformed escapes are kept
+// literally, the same tolerance browsers apply to query strings. Empty
+// segments are skipped, and a key without '=' maps to an empty value.
+form_parse :: proc(body: string, allocator: mem.Allocator = context.allocator) -> []Param {
+	out := make([dynamic]Param, allocator)
+	i := 0
+	for i <= len(body) {
+		j := i
+		for j < len(body) && body[j] != '&' {
+			j += 1
+		}
+		item := body[i:j]
+		if len(item) > 0 {
+			eq := string_index_byte(item, '=')
+			name, value: string
+			if eq >= 0 {
+				name = item[:eq]
+				value = item[eq + 1:]
+			} else {
+				name = item
+			}
+			append(&out, Param {
+				name  = url_decode(name, allocator),
+				value = url_decode(value, allocator),
+			})
+		}
+		i = j + 1
+		if j >= len(body) {
+			break
+		}
+	}
+	return out[:]
+}
+
+// request_form parses the request body as a form and returns its fields. Both
+// encodings are handled: application/x-www-form-urlencoded directly, and
+// multipart/form-data through the same parser `middleware_form` uses (read
+// uploads with request_files / request_file). The result is cached on the
+// request, so a handler may call this repeatedly.
+request_form :: proc(r: ^Request) -> []Param {
+	form_ensure_parsed(r, nil)
+	return r.form
+}
+
+// request_form_value returns the first value of key from the form body.
+request_form_value :: proc(r: ^Request, key: string) -> (string, bool) {
+	return param_get(request_form(r), key)
+}
+
+// param_get returns the first value for name in a name/value list; it works
+// for both query and form results (first wins, like Echo's FormValue).
+param_get :: proc(params: []Param, name: string) -> (string, bool) {
+	for p in params {
+		if p.name == name {
+			return p.value, true
 		}
 	}
 	return "", false
@@ -86,6 +207,200 @@ request_capture :: proc(r: ^Request, idx: int) -> (string, bool) {
 
 request_body_string :: proc(r: ^Request) -> string {
 	return string(r.body)
+}
+
+// ---------------------------------------------------------------------------
+// Context helpers — the accessors application code expects from a Go web
+// framework's context (Echo's Host/Hostname/RealIP/IsAjax/Accepts, Fiber's
+// Queries/IP/BodyParser equivalent). Strings stay views into the request
+// buffers unless a decode or parse is involved, in which case storage comes
+// from the request arena.
+// ---------------------------------------------------------------------------
+
+// request_id returns the identifier installed by middleware_request_id
+// (empty when that middleware is not in the chain).
+request_id :: proc(r: ^Request) -> string {
+	return r.id
+}
+
+// request_query_params returns every query parameter in order, decoded the
+// same way request_query decodes a single key (Echo's QueryParams, Fiber's
+// Queries). Repeated keys stay repeated.
+request_query_params :: proc(r: ^Request) -> []Param {
+	return form_parse(r.query, request_allocator(r))
+}
+
+// request_content_type returns the media type of the request body with its
+// parameters dropped and lowercased: "application/json", not
+// "Application/JSON; charset=utf-8". Empty when the header is absent.
+request_content_type :: proc(r: ^Request) -> string {
+	v, ok := request_header(r, "Content-Type")
+	if !ok {
+		return ""
+	}
+	if semi := string_index_byte(v, ';'); semi >= 0 {
+		v = v[:semi]
+	}
+	return ascii_lower(trim_ows(v), request_allocator(r))
+}
+
+// request_host returns the Host header as sent, port included. Empty for an
+// HTTP/1.0 request without one.
+request_host :: proc(r: ^Request) -> string {
+	host, _ := request_header(r, "Host")
+	return host
+}
+
+// request_hostname returns the Host header without its port; an IPv6 literal
+// loses its brackets ("[::1]:80" -> "::1") to match Fiber's Hostname.
+request_hostname :: proc(r: ^Request) -> string {
+	host := request_host(r)
+	if len(host) == 0 {
+		return ""
+	}
+	if host[0] == '[' {
+		if close := string_index_byte(host, ']'); close > 0 {
+			return host[1:close]
+		}
+		return host
+	}
+	if colon := last_index_byte(host, ':'); colon >= 0 {
+		return host[:colon]
+	}
+	return host
+}
+
+// request_scheme reports "https" for a TLS connection, "http" otherwise.
+// Behind a reverse proxy the client-facing scheme is X-Forwarded-Proto; this
+// reports the transport the server itself terminates.
+request_scheme :: proc(r: ^Request) -> string {
+	if r.conn != nil && r.conn.tls != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// request_remote_addr returns the peer endpoint as "ip:port".
+request_remote_addr :: proc(r: ^Request) -> string {
+	if r.conn == nil {
+		return ""
+	}
+	return net.endpoint_to_string(r.conn.remote, request_allocator(r))
+}
+
+// request_client_ip returns the originating client address: X-Real-IP, else
+// the leftmost X-Forwarded-For entry, else the socket peer. Proxies append
+// to X-Forwarded-For, so the leftmost entry is the client (Echo's RealIP).
+request_client_ip :: proc(r: ^Request) -> string {
+	if v, ok := request_header(r, "X-Real-IP"); ok {
+		if t := trim_ows(v); len(t) > 0 {
+			return t
+		}
+	}
+	if v, ok := request_header(r, "X-Forwarded-For"); ok {
+		first := v
+		if comma := string_index_byte(v, ','); comma >= 0 {
+			first = v[:comma]
+		}
+		if t := trim_ows(first); len(t) > 0 {
+			return t
+		}
+	}
+	if r.conn == nil {
+		return ""
+	}
+	return net.address_to_string(r.conn.remote.address, request_allocator(r))
+}
+
+// request_is_ajax reports an XMLHttpRequest, using the X-Requested-With
+// convention jQuery and friends still send.
+request_is_ajax :: proc(r: ^Request) -> bool {
+	v, ok := request_header(r, "X-Requested-With")
+	return ok && eq_ignore_case(trim_ows(v), "XMLHttpRequest")
+}
+
+// request_accepts answers content negotiation for a single media type
+// against the Accept header: an exact match, "type/*" and "*/*" all count,
+// and q=0 entries are refusals. A missing or empty Accept header accepts
+// everything (RFC 7231 section 5.3.2).
+request_accepts :: proc(r: ^Request, media_type: string) -> bool {
+	accept, ok := request_header(r, "Accept")
+	if !ok || len(trim_ows(accept)) == 0 {
+		return true
+	}
+	alloc := request_allocator(r)
+	// media type parameters are not part of negotiation
+	wanted := media_type
+	if semi := string_index_byte(wanted, ';'); semi >= 0 {
+		wanted = wanted[:semi]
+	}
+	want := ascii_lower(trim_ows(wanted), alloc)
+	rest := accept
+	for len(rest) > 0 {
+		item := rest
+		if comma := string_index_byte(rest, ','); comma >= 0 {
+			item = rest[:comma]
+			rest = rest[comma + 1:]
+		} else {
+			rest = ""
+		}
+		item = trim_ows(item)
+		if len(item) == 0 {
+			continue
+		}
+		token, params := item, ""
+		if semi := string_index_byte(item, ';'); semi >= 0 {
+			token = trim_ows(item[:semi])
+			params = item[semi + 1:]
+		}
+		if accept_q_is_zero(params) {
+			continue
+		}
+		got := ascii_lower(token, alloc)
+		if got == "*/*" || got == want {
+			return true
+		}
+		if len(got) >= 2 && got[len(got) - 1] == '*' && got[len(got) - 2] == '/' {
+			prefix := got[:len(got) - 1] // "text/" out of "text/*"
+			if len(want) >= len(prefix) && eq_ignore_case(want[:len(prefix)], prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// request_json unmarshals the request body into v (Echo's Bind for JSON
+// bodies, Fiber's BodyParser without the form branch). Decoded storage comes
+// from the request arena. This reports parse failures only; a handler that
+// must reject non-JSON bodies should check request_content_type first.
+request_json :: proc(r: ^Request, v: ^$T, spec := json.DEFAULT_SPECIFICATION) -> json.Unmarshal_Error {
+	return json.unmarshal(r.body, v, spec, request_allocator(r))
+}
+
+// accept_q_is_zero reports a q=0 parameter, an explicit refusal. Only a
+// literal zero counts: q=0.000 refuses, q=0.5 does not.
+accept_q_is_zero :: proc(params: string) -> bool {
+	i := string_index(params, "q=")
+	if i < 0 {
+		return false
+	}
+	j := i + 2
+	if j >= len(params) || params[j] != '0' {
+		return false
+	}
+	zero := true
+	j += 1
+	if j < len(params) && params[j] == '.' {
+		j += 1
+		for j < len(params) && params[j] >= '0' && params[j] <= '9' {
+			if params[j] != '0' {
+				zero = false
+			}
+			j += 1
+		}
+	}
+	return zero
 }
 
 Parse_Error :: enum {
@@ -252,6 +567,33 @@ trim_ows :: proc(s: string) -> string {
 		end -= 1
 	}
 	return s[start:end]
+}
+
+last_index_byte :: proc(s: string, c: byte) -> int {
+	for i := len(s) - 1; i >= 0; i -= 1 {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// ascii_lower lowercases ASCII letters. The input is returned as a view when
+// it is already lowercase; otherwise the copy lives on `allocator`.
+ascii_lower :: proc(s: string, allocator: mem.Allocator) -> string {
+	for i in 0..<len(s) {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			out := make([]byte, len(s), allocator)
+			copy(out, transmute([]byte)s)
+			for j in i..<len(s) {
+				if out[j] >= 'A' && out[j] <= 'Z' {
+					out[j] += 'a' - 'A'
+				}
+			}
+			return string(out)
+		}
+	}
+	return s
 }
 
 hex_nibble :: proc(c: byte) -> int {

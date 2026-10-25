@@ -20,6 +20,10 @@ Route :: struct {
 	method:  Method,
 	pattern: string,
 	handler: Handler,
+	// middlewares are route-local: they run after the router-wide chain and
+	// before `handler`, so auth or a body parser can be attached to one
+	// route. Empty for a plain route.
+	middlewares: [dynamic]Middleware,
 }
 
 // Middleware is a chain link. `proc_` receives the router, its own index,
@@ -40,6 +44,12 @@ router_init :: proc(r: ^Router, allocator := context.allocator) {
 
 router_destroy :: proc(r: ^Router) {
 	if r.routes != nil {
+		for i in 0..<len(r.routes) {
+			if r.routes[i].middlewares != nil {
+				delete(r.routes[i].middlewares)
+				r.routes[i].middlewares = nil
+			}
+		}
 		delete(r.routes)
 		r.routes = nil
 	}
@@ -50,7 +60,12 @@ router_destroy :: proc(r: ^Router) {
 }
 
 router_add :: proc(r: ^Router, method: Method, pattern: string, handler: Handler) -> ^Route {
-	append(&r.routes, Route{method = method, pattern = pattern, handler = handler})
+	append(&r.routes, Route {
+		method      = method,
+		pattern     = pattern,
+		handler     = handler,
+		middlewares = make([dynamic]Middleware, r.allocator),
+	})
 	return &r.routes[len(r.routes) - 1]
 }
 
@@ -74,12 +89,52 @@ router_delete :: proc(r: ^Router, pattern: string, handler: Handler) -> ^Route {
 	return router_add(r, .Delete, pattern, handler)
 }
 
+router_patch :: proc(r: ^Router, pattern: string, handler: Handler) -> ^Route {
+	return router_add(r, .Patch, pattern, handler)
+}
+
+// router_options registers the OPTIONS handler for a path. Registering one
+// is optional: CORS preflights are usually answered by middleware_cors
+// before the route table is consulted.
+router_options :: proc(r: ^Router, pattern: string, handler: Handler) -> ^Route {
+	return router_add(r, .Options, pattern, handler)
+}
+
+// router_all registers a route that answers every request method. It exists
+// for endpoints whose contract is genuinely method-agnostic - health probes
+// and reverse-proxy liveness checks do not promise to use GET - so that a
+// POST to such a path answers instead of falling through to 405.
+router_all :: proc(r: ^Router, pattern: string, handler: Handler) -> ^Route {
+	return router_add(r, .All, pattern, handler)
+}
+
 router_use :: proc(r: ^Router, m: Middleware_Proc, ud: rawptr = nil) {
 	append(&r.middlewares, Middleware{proc_ = m, ud = ud})
 }
 
+/*
+router_use_route attaches a middleware to one route instead of the whole
+router: it runs after every router-wide middleware and before the route's
+handler. This is what makes a purpose-built middleware usable on a single
+endpoint - auth in front of /admin, a form parser on /upload - without
+guarding inside the handler.
+
+`route` is the pointer a `router_*` registration call returned. Register the
+route, attach its middlewares right away, and only then add more routes:
+appending to the route table can move it, which would invalidate the pointer.
+*/
+router_use_route :: proc(route: ^Route, m: Middleware_Proc, ud: rawptr = nil) {
+	append(&route.middlewares, Middleware{proc_ = m, ud = ud})
+}
+
 // router_handle is a `Handler`: point `server.handler` at it and stash the
 // router in `server.user_ptr`.
+//
+// Unmatched requests still walk the middleware chain, with a terminal that
+// answers 404 (or `r.not_found`) or 405 + `Allow`. That is what makes
+// cross-cutting middleware useful on the edges: a CORS preflight is an
+// OPTIONS request that no route registered, and a request id / access log
+// line for a 404 is exactly as valuable as for a 200.
 router_handle :: proc(req: ^Request, res: ^Response) {
 	s := req.conn.server
 	r := cast(^Router) s.user_ptr
@@ -90,30 +145,77 @@ router_handle :: proc(req: ^Request, res: ^Response) {
 	}
 
 	route, method_ok := router_match(r, req, conn_scratch(req.conn))
-	if route == nil {
-		if r.not_found != nil {
-			r.not_found(req, res)
-			return
-		}
-		res.status = .Not_Found
-		response_write_string(res, "404 page not found\n")
-		return
+	switch {
+	case route == nil:
+		router_next(r, 0, router_fallthrough_not_found, req, res)
+	case !method_ok:
+		router_next(r, 0, router_fallthrough_method_not_allowed, req, res)
+	case:
+		req.route = route
+		router_next(r, 0, router_route_terminal, req, res)
 	}
-	if !method_ok {
-		res.status = .Method_Not_Allowed
-		response_set_header(res, "Allow", route_allowed_methods(r, route, conn_scratch(req.conn)))
-		response_write_string(res, "405 method not allowed\n")
-		return
-	}
-	router_next(r, 0, route.handler, req, res)
 }
 
+// router_route_terminal is the end of the router-wide chain: it either calls
+// the route handler directly or runs the route's own middleware chain first.
+// The route is carried on the request because `Handler` has no user data.
+router_route_terminal :: proc(req: ^Request, res: ^Response) {
+	route := req.route
+	if route == nil {
+		router_fallthrough_not_found(req, res)
+		return
+	}
+	if len(route.middlewares) == 0 {
+		route.handler(req, res)
+		return
+	}
+	req.chain = route.middlewares[:]
+	// A nil router tells router_next to walk `req.chain`, which is how one
+	// Middleware_Proc implementation serves both a router-wide chain and a
+	// single-route one.
+	router_next(nil, 0, route.handler, req, res)
+}
+
+// router_fallthrough_not_found is the chain terminal for an unmatched path.
+// The router is re-read from the server because `Handler` carries no user
+// data; rematching only happens on the 404 path.
+router_fallthrough_not_found :: proc(req: ^Request, res: ^Response) {
+	r := cast(^Router) req.conn.server.user_ptr
+	if r != nil && r.not_found != nil {
+		r.not_found(req, res)
+		return
+	}
+	res.status = .Not_Found
+	response_write_string(res, "404 page not found\n")
+}
+
+// router_fallthrough_method_not_allowed is the chain terminal for a path
+// that exists under other methods; the `Allow` header lists them.
+router_fallthrough_method_not_allowed :: proc(req: ^Request, res: ^Response) {
+	r := cast(^Router) req.conn.server.user_ptr
+	res.status = .Method_Not_Allowed
+	if r != nil {
+		if route, _ := router_match(r, req, conn_scratch(req.conn)); route != nil {
+			response_set_header(res, "Allow", route_allowed_methods(r, route, conn_scratch(req.conn)))
+		}
+	}
+	response_write_string(res, "405 method not allowed\n")
+}
+
+// router_next runs one link of a middleware chain. `r` is the router whose
+// chain is being walked; nil means "the chain stored on the request", which
+// is how route-local middleware reuses the same Middleware_Proc signature as
+// router-wide middleware.
 router_next :: proc(r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	if idx >= len(r.middlewares) {
+	chain := req.chain
+	if r != nil {
+		chain = r.middlewares[:]
+	}
+	if idx >= len(chain) {
 		final(req, res)
 		return
 	}
-	m := &r.middlewares[idx]
+	m := &chain[idx]
 	m.proc_(m, r, idx, final, req, res)
 }
 
@@ -128,10 +230,10 @@ router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (ro
 	params := make([dynamic]Param, allocator)
 	captures := make([dynamic]string, allocator)
 
-	// first pass: method + path
+	// first pass: method + path (.All routes accept any request method)
 	for i in 0..<len(r.routes) {
 		candidate := &r.routes[i]
-		if candidate.method != req.method {
+		if candidate.method != req.method && candidate.method != .All {
 			continue
 		}
 		clear(&params)
@@ -140,6 +242,25 @@ router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (ro
 			req.params = params[:]
 			req.captures = captures[:]
 			return candidate, true
+		}
+	}
+
+	// HEAD falls back to the GET route: RFC 7231 section 4.3.2 requires HEAD
+	// wherever GET is offered, and the response builder already drops the
+	// body (it keeps the length the GET would have had).
+	if req.method == .Head {
+		for i in 0..<len(r.routes) {
+			candidate := &r.routes[i]
+			if candidate.method != .Get {
+				continue
+			}
+			clear(&params)
+			clear(&captures)
+			if path_match(candidate.pattern, req.path, &params, &captures) {
+				req.params = params[:]
+				req.captures = captures[:]
+				return candidate, true
+			}
 		}
 	}
 
@@ -165,7 +286,7 @@ route_allowed_methods :: proc(r: ^Router, route: ^Route, allocator: mem.Allocato
 	buf_init(&b, allocator)
 	defer buf_destroy(&b)
 	for i in 0..<len(r.routes) {
-		if r.routes[i].pattern == route.pattern {
+		if r.routes[i].pattern == route.pattern && r.routes[i].method != .All {
 			if buf_len(&b) > 0 {
 				buf_append_string(&b, ", ")
 			}

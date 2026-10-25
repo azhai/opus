@@ -128,7 +128,11 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 │ server.odin    Server：listen/accept/sweep/run       │  ← 生命周期与配置
 │ threads.odin   多 acceptor：server_run_multi / on_stop│
 │ router.odin    Router：段式 + Lua 模式匹配 + 中间件链    │  ← lighttpd2 action 思想的
-│ static.odin    Static：stat 缓存 + sendfile           │     宿主语言实现
+│ middleware.odin 通用中间件：id/日志/CORS/限额/安全头    │     宿主语言实现
+│ auth.odin      auth 中间件：Basic / Bearer / API-Key   │
+│ form.odin      form 中间件：urlencoded + multipart     │
+│ middleware_range.odin  Range/ETag 中间件（handler 无感）│
+│ static.odin    Static：stat 缓存 + sendfile           │
 │ proxy.odin     Proxy：流式中继 + 上游连接池            │
 │ cookie.odin    Cookie：Set-Cookie 序列化 / 请求解析   │
 │ json.odin      response_json（core:encoding/json）   │
@@ -139,6 +143,8 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 │ filter.odin    Filter 链 + chunked 编解码              │
 │ compress.odin  gzip/deflate 编码器 + 内容协商          │
 │ tls.odin       TLS：OpenSSL 运行时加载 + memory BIO    │
+│ sse.odin       SSE：chunked 帧 + 事件/注释/重连        │
+│ stream.odin    hijack 后的裸 socket 写辅助             │
 │ socket_*.odin  SO_REUSEPORT / listen（posix/windows）  │
 ├─────────────────────────────────────────────────────┤
 │ buffer.odin    Buf + 工具函数                          │
@@ -216,6 +222,11 @@ Odin 原生版）。收益：
 | 测试起服务用栈上 arena 传 `router_match` | 该过程用传入 allocator 建 params/captures 数组且不负责释放（正常路径由每连接 arena 重置代管）；单测里传 `context.allocator` 会泄漏，照旧例传 `mem.arena_allocator(&arena)` |
 | 压缩器状态从 `context.allocator` 分配 | 匹配表（hash head + prev）共 256 KiB，放栈上会撞穿测试线程的 arena（表现为 payload 第 0 字节就段错误）；`prev` 无需清零——只能经 `head` 项读到 |
 | 内容编码先于传输编码 | filter 链顺序为 compress → chunked：先把 body 压缩（`Content-Encoding`），再由 chunked filter 分帧（`Transfer-Encoding`）。`sendfile` 文件体与不可压缩类型直接跳过压缩，保住零拷贝 |
+| 中间件分「通用」与「专用」，并且能按路由挂载 | 全局链适合跨切面（id/日志/安全头），鉴权与正文解析往往只对一两条路由有意义——全局注册等于给所有路由加成本。做法：`Route.middlewares` 存路由级链，`router_handle` 命中后在全局链末端（`router_route_terminal`）把路由指针交给 `req.route`，`router_use_route` 追加；`router_next(nil, ...)` 表示「走请求上挂的链」，因此同一个 `Middleware_Proc` 既能服务全局链也能服务单路由链，中间件实现零改动 |
+| 认证只做「令牌表 + 等时比较」，不做会话/用户库 | Basic/Bearer/API-Key 覆盖的是服务间调用与单一管理凭据；引入用户表、密码哈希、会话存储是另一个产品（且会拖进持久化与迁移）。三种方案都写 `req.principal`，日志可归因；`WWW-Authenticate` 文案区分「没带凭据」与 `error="invalid_token"`（RFC 6750 §3） |
+| `middleware_range` 放在 handler 之后改写响应 | Range/ETag 的正确性与「正文从哪来」无关，只与「正文是什么」有关：handler 照常写完整正文，中间件按 `Range` 切片、按内容哈希算 ETag。这样 CSV 导出、生成的 JSON、模板页都能白拿 206/304，而 `sendfile`/chunked 响应自动跳过（前者已零拷贝、后者没有长度）。ETag 用正文 FNV-1a 64 而非 mtime：生成型响应没有 mtime，且跨重启稳定 |
+| multipart 解析全内存，限额而非流式落盘 | `Server.max_body_size` 已经给整包设上限，`MAX_FORM_FILE_SIZE` 再压单个 part；在这个量级（联系表单、头像、CSV 导入）流式落盘只增加复杂度。判定「文件」看 `filename` 参数而不是 Content-Type：浏览器给文本字段不发 Content-Type、给空文件框发 `filename=""`，按类型判定会把空文件变成字段 |
+| SSE 走 hijack + chunked，而不是「chunked 普通响应」 | handler 是同步的，普通响应只有在 handler 返回后才能落盘，做不出「持续推送」。hijack 拿到底层 socket 后自己写 chunked 帧，客户端仍看到合法 HTTP/1.1 响应与干净的结束块（`0\r\n\r\n`），不必靠关连接表达结束。代价是那条事件循环线程被占用，缓解手段是多 acceptor 线程 |
 
 ---
 
@@ -288,6 +299,24 @@ Odin 原生版）。收益：
     `target^ = cast(T) ptr`。
 24. **参数名 `c` 与 `c.int(...)` 冲突**——Odin 里 `c` 是核心包名，过程参数
     取名为 `c` 时 `c.int(x)` 会被解析成参数，用 `i32(x)` 代替。
+25. **router 的 `Handler` 没有 user data，路由级链只能挂在请求上**——
+    `router_route_terminal` 拿不到"当前是哪条路由"，只能让 `router_handle`
+    先把 `req.route = route` 记下，再由末端把 `route.middlewares` 挂到
+    `req.chain`。`router_next` 因此要多一个分支：`r == nil` 时走 `req.chain`。
+26. **`router_*` 返回的 `^Route` 会被后续注册搬走**——`routes` 是 dynamic array，
+    `append` 扩容即搬家，之前拿到的指针悬空。规矩：先注册完全部路由，再
+    `router_use_route` 挂中间件（示例与文档都这么写）。
+27. **HEAD 不会自动落到 GET 路由**——路由器第一遍按 method 精确匹配，GET-only
+    的路由上 `curl -I` 得到 405。RFC 7231 §4.3.2 要求 GET 存在处 HEAD 必须可用，
+    因此在精确匹配失败后补一遍「HEAD → `.Get`」，body 由 `response_build`
+    统一裁掉（长度仍按 GET 计算）。
+28. **`%v` 日志里 `req.principal` 为空是正常的**——认证中间件在全局链上通常排在
+    logger 之后，logger 是在 `router_next` 返回后才写日志，所以能拿到主体；
+    若把 logger 排在 auth 之前仍然可见，但把 auth 放在 *路由级* 链上时，
+    只有进入该路由的请求才有 `user=`。排查"日志没有 user"先看注册位置。
+29. **`transmute([]byte)` 需要已定型表达式**——`transmute([]byte) "0\r\n\r\n"`
+    报 "Cannot transmute untyped expression"，先 `s := "0..."` 再
+    `transmute([]byte) s`（或 `[]byte(s)` 走复制）。
 
 ## 5. 性能注意点
 
@@ -304,6 +333,11 @@ Odin 原生版）。收益：
   无限增长；吞吐受限于「发完才收」，胜在内存恒定。
 - **TLS 的额外拷贝**：每个方向多一次 `SSL_write`/`SSL_read` 与一份 `tls_out`
   缓冲；文件体无 `sendfile`，按 64 KiB 分块加密发送。
+- **`middleware_range` 的哈希成本**：每条启用了 `etag = true` 的路由，每个响应
+  过一次 FNV-1a（1 GB/s 量级，45 字节的 CSV 只有几十纳秒）；范围切片只在命中
+  `Range` 时复制一次，其余路径零额外分配。它先于 compress filter 计算 ETag，
+  两个编码变体共用一个标签——压缩 filter 会加 `Vary: Accept-Encoding`，
+  对缓存安全，但严格按编码区分标签需要 filter 后再打标（暂未做）。
 
 ## 6. 路线图
 
@@ -343,7 +377,15 @@ Odin 原生版）。收益：
       挂在既有连接状态机上（handler 无感），文件体分块加密发送
 - [x] 多 acceptor 线程：`SO_REUSEPORT`（手写 posix） + 每线程 `Server`/事件循环，
       `server_run_multi` 一次拉起，端口 0 时回填共享
-- [x] 61 个测试（单测 + 集成），`odin test web/` 全过、零泄漏
+- [x] 专用中间件：auth（Basic / Bearer / API-Key，等时比较 + `principal`）、
+      form（urlencoded + multipart，解析一次并缓存，字段/文件限额）、
+      range（普通 handler 也能 206/416，内容哈希 ETag + 304）、
+      no-buffer（阻止代理缓冲流式响应）
+- [x] 路由级中间件链：`router_use_route` 把任意 `Middleware_Proc` 只挂到一条
+      路由（`router_next(nil, ...)` 走请求上挂的链，中间件实现零改动）
+- [x] HEAD 自动回落到同名 GET 路由（RFC 7231 §4.3.2）
+- [x] SSE：`sse_start/event/comment/retry/close`，chunked 分帧 + 重连语义
+- [x] 97 个测试（单测 + 集成），`odin test web/` 全过、零泄漏
 
 后续（按优先级）：
 
@@ -353,6 +395,10 @@ Odin 原生版）。收益：
 3. **代理健康检查 / 主动摘除**：当前只有「取到失效连接再重拨」，没有对上游
    的探测与权重。
 4. **多进程模型**：继续交给外部 supervisor（gorch 等），库不介入。
+5. **异步 handler / 真正并发的流**：现在 SSE 跑在事件循环线程上，一条长流占住
+   一条线程；要做万人订阅的推送需要把 handler 变成异步续延（状态机化）。
+6. **表单上传落盘**：multipart 目前全在内存（受 `max_body_size` 与
+   `max_file_size` 约束）；大文件上传需要临时文件 + 流式解析。
 
 ## 7. 测试策略
 
@@ -377,6 +423,16 @@ Odin 原生版）。收益：
   逐字节比对；OpenSSL 不可用时整段跳过而不是失败。
 - **多 acceptor 测试**：3 个 `Server` 共享一个临时端口，30 个连接全部拿到
   200 且 `bound_port` 一致；分发到多个 acceptor 的断言只在 Linux 生效。
+- **专用中间件测试**（`middleware_purpose_test.odin`，13 个）：不建 socket，
+  用合成 `Conn` 走真实 `router_handle` 派发，所以链的顺序、短路与
+  路由级链都按生产路径执行。覆盖 Bearer 的三种 challenge 文案与 principal
+  传递、API-Key 的头/query 两种取法、表单 urlencoded 与 multipart（含
+  「文件名去路径」「类型保留」）、415/400/413 三条错误分支、表单惰性解析
+  与缓存命中、Range 的 206（含 suffix range）/416/多 range 忽略、ETag 与
+  `If-None-Match`/`*`、`If-Range` 命中与过期两种走向、跳过 `sendfile` 响应、
+  路由级中间件隔离（同一 handler 只有挂了 auth 的路由才 401）。
+- **SSE 集成测试**：真实 socket 上跑一遍 `sse_start/retry/comment/event/close`，
+  断言响应头、chunked 帧内的 `event:`/`id:`/`data:` 字段、终止块 `0\r\n\r\n`。
 - **泄漏检测**：Odin test runner 自带内存追踪；`integration_stop` 优雅 drain
   后连接全部关闭，测试结束时报零泄漏。
 

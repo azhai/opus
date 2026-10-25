@@ -34,11 +34,19 @@ MAX_CHAIN  :: 128     // match-finder steps per position
 MIN_MATCH  :: 3
 MAX_MATCH  :: 258
 
-// RFC 1951 section 3.2.5: length and distance code tables
+// RFC 1951 section 3.2.5: length and distance code tables.
+//
+// Every entry here is consumed bit-exactly by the decoder, so a single wrong
+// one silently desyncs the stream from that point on. `DIST_EXTRA` in
+// particular is *not* the rank of the code: the width grows once per pair of
+// distance codes (129..192 and 193..256 both carry 6 extra bits), so the
+// 30 entries only reach 13 — an off-by-one in this table shows up as
+// `Bad_Distance` in strict inflaters (gzip, zlib) for any match farther than
+// 128 bytes, while lenient ones may still round-trip short payloads.
 LENGTH_BASE := [29]int{3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258}
 LENGTH_EXTRA := [29]int{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
 DIST_BASE := [30]int{1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577}
-DIST_EXTRA := [30]int{0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 7, 7, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15}
+DIST_EXTRA := [30]int{0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13}
 
 // CRC-32 (RFC 1952), built lazily on first use
 CRC32_TABLE: [256]u32

@@ -96,6 +96,27 @@ response_add_header :: proc(w: ^Response, key, value: string) {
 	append(&w.headers, Header{key = key, value = value})
 }
 
+// response_set_content_type is response_set_header("Content-Type", ct) with
+// an empty value treated as "no header at all".
+response_set_content_type :: proc(w: ^Response, content_type: string) {
+	if len(content_type) == 0 {
+		response_remove_header(w, "Content-Type")
+		return
+	}
+	response_set_header(w, "Content-Type", content_type)
+}
+
+// response_allocator is where a header value that outlives the handler call
+// has to be allocated: the connection arena for a live response (headers are
+// serialized after the handler returns), context.allocator otherwise
+// (synthetic responses in tests).
+response_allocator :: proc(w: ^Response) -> mem.Allocator {
+	if w.conn != nil {
+		return conn_scratch(w.conn)
+	}
+	return context.allocator
+}
+
 response_write :: proc(w: ^Response, data: []byte) {
 	if file_pending(w) {
 		return
@@ -105,6 +126,35 @@ response_write :: proc(w: ^Response, data: []byte) {
 
 response_write_string :: proc(w: ^Response, s: string) {
 	response_write(w, transmute([]byte)s)
+}
+
+// response_send writes status, an optional Content-Type and the body in one
+// call (Echo's c.Blob shape). The body is copied into the response buffer;
+// the Content-Type is stored by reference, so it must outlive the handler
+// call (a literal, or storage from the request/connection arena).
+response_send :: proc(w: ^Response, status: Status, content_type, body: string) {
+	w.status = status
+	if content_type != "" {
+		response_set_header(w, "Content-Type", content_type)
+	}
+	response_write_string(w, body)
+}
+
+// response_text writes a text/plain; charset=utf-8 body (Echo's c.String).
+response_text :: proc(w: ^Response, status: Status, body: string) {
+	response_send(w, status, "text/plain; charset=utf-8", body)
+}
+
+// response_html writes a text/html; charset=utf-8 body (Echo's c.HTML).
+response_html :: proc(w: ^Response, status: Status, body: string) {
+	response_send(w, status, "text/html; charset=utf-8", body)
+}
+
+// response_no_content sends a bodyless response (Echo's c.NoContent).
+response_no_content :: proc(w: ^Response, status: Status = .No_Content) {
+	w.status = status
+	buf_reset(&w.body)
+	w.file_open = false
 }
 
 // response_send_file switches the response to zero-copy file streaming.
@@ -163,6 +213,91 @@ response_redirect :: proc(w: ^Response, location: string, code: Status = .Found)
 	response_write_string(w, "redirecting to ")
 	response_write_string(w, location)
 	response_write_string(w, "\n")
+}
+
+// response_error writes a plain-text error body: the status text when
+// `message` is empty (Echo's c.NoContent + HTTPError shape, without the JSON
+// envelope). The status is set for the caller.
+response_error :: proc(w: ^Response, status: Status, message := "") {
+	w.status = status
+	response_set_content_type(w, "text/plain; charset=utf-8")
+	if len(message) > 0 {
+		response_write_string(w, message)
+	} else {
+		response_write_string(w, status_text(status))
+	}
+	response_write_string(w, "\n")
+}
+
+// response_body_size reports what the response will actually carry: the
+// in-memory body, or the file size for a sendfile response. Middleware that
+// logs or accounts for bytes uses this instead of poking at `body`.
+response_body_size :: proc(w: ^Response) -> i64 {
+	if file_pending(w) {
+		return w.file_size
+	}
+	return i64(buf_len(&w.body))
+}
+
+Disposition :: enum {
+	Inline,
+	Attachment,
+}
+
+disposition_string :: proc(d: Disposition) -> string {
+	switch d {
+	case .Inline:
+		return "inline"
+	case .Attachment:
+		return "attachment"
+	}
+	return "attachment"
+}
+
+// response_set_disposition sets Content-Disposition. The filename is quoted
+// and its '"' / '\' characters escaped; non-ASCII names are emitted as-is
+// (RFC 6266 allows raw UTF-8 in the quoted form).
+response_set_disposition :: proc(w: ^Response, kind: Disposition, filename: string) {
+	if len(filename) == 0 {
+		response_set_header(w, "Content-Disposition", disposition_string(kind))
+		return
+	}
+	alloc := response_allocator(w)
+	b: Buf
+	buf_init(&b, alloc)
+	defer buf_destroy(&b)
+	buf_append_string(&b, disposition_string(kind))
+	buf_append_string(&b, "; filename=\"")
+	for i in 0..<len(filename) {
+		c := filename[i]
+		if c == '"' || c == '\\' {
+			buf_append_byte(&b, '\\')
+		}
+		buf_append_byte(&b, c)
+	}
+	buf_append_byte(&b, '"')
+	// clone: the header outlives this call and buf_destroy may release the
+	// scratch (the pattern every header value in this file follows)
+	response_set_header(w, "Content-Disposition", clone_string(string(buf_slice(&b)), alloc))
+}
+
+// response_download sends a file as a download: Content-Type from the name,
+// Content-Disposition: attachment, then the zero-copy file body (Echo's
+// c.Attachment). Returns false after answering 500 when the file cannot be
+// streamed.
+response_download :: proc(w: ^Response, path, filename: string) -> bool {
+	name := filename
+	if len(name) == 0 {
+		name = path
+	}
+	response_set_content_type(w, mime_type(name))
+	response_set_disposition(w, .Attachment, name)
+	if !response_send_file(w, path) {
+		response_remove_header(w, "Content-Disposition")
+		response_error(w, .Internal_Error, "")
+		return false
+	}
+	return true
 }
 
 file_pending :: proc(w: ^Response) -> bool {
