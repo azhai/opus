@@ -35,16 +35,68 @@ Usage:
 	defer web.tls_config_destroy(&cfg)
 */
 Tls_Config :: struct {
-	ctx:  rawptr, // SSL_CTX*
-	cert: string,
-	key:  string,
+	ctx:        rawptr, // SSL_CTX*
+	cert:       string,
+	key:        string,
+	resumption: Tls_Resumption,
 }
+
+/*
+Tls_Resumption is how the server lets a returning client skip the expensive
+half of the handshake.
+
+A full handshake costs a ECDHE agreement and a certificate signature - on a
+small box that is tens of thousands of cycles, and on a phone link it is two
+extra round trips. Resumption replaces it with a lookup (session id) or a
+sealed blob (ticket) and a single-flight HMAC, which is the difference
+between 12 ms and 2 ms for the second and every later request.
+
+Two mechanisms, both on by default:
+
+  - `cache` is OpenSSL's server-side session-id cache, keyed by the 32-byte
+    id the client echoes back in ClientHello. It needs `SSL_CTX` storage,
+    so it only resumes while this process lives - fine for a single
+    instance, useless across a restart or a second machine.
+  - `tickets` sends the session state to the client encrypted under a key
+    the server keeps (TLS 1.2 stateless tickets and the TLS 1.3
+    NewSessionTicket message). Nothing is stored server-side, so resumption
+    survives a restart-free process swap and works across processes that
+    share the key.
+
+`id_context` binds a cached session to this context. OpenSSL refuses to
+resume a session whose id context differs, which is what stops a session
+minted by a different certificate (another vhost in the same process) from
+being replayed here. Empty means "derive it from the certificate path"; it
+is hashed down to SSL_MAX_SID_CTX_LENGTH bytes either way.
+*/
+Tls_Resumption :: struct {
+	cache:       bool,
+	cache_size:  int,    // entries; 0 keeps OpenSSL's default
+	timeout:     int,    // seconds a session stays resumable; 0 keeps the default
+	tickets:     bool,
+	num_tickets: int,    // TLS 1.3 tickets per handshake; 0 keeps the default (2)
+	id_context:  string,
+}
+
+// TLS_RESUMPTION_DEFAULT is what tls_config_init uses when the caller does
+// not say otherwise: both mechanisms on, everything else OpenSSL's choice.
+TLS_RESUMPTION_DEFAULT :: Tls_Resumption {
+	cache   = true,
+	tickets = true,
+}
+
+// TLS_RESUMPTION_OFF disables every form of resumption. A server that
+// terminates sessions for high-value traffic may prefer it: resumption
+// keeps the identifier stable across connections, which some audit regimes
+// read as "one long session" rather than "N authenticated handshakes".
+TLS_RESUMPTION_OFF :: Tls_Resumption{}
 
 Tls_Session :: struct {
 	ssl:         rawptr, // SSL*
 	rbio:        rawptr, // BIO* (owned by ssl after SSL_set_bio)
 	wbio:        rawptr,
 	handshaking: bool,
+	resumed:     bool, // this handshake was abbreviated (SSL_session_reused)
 	eof:         bool, // clean close_notify received
 	failed:      bool, // fatal protocol error
 }
@@ -58,6 +110,24 @@ SSL_ERROR_SYSCALL       :: 5
 SSL_ERROR_ZERO_RETURN   :: 6
 SSL_FILETYPE_PEM        :: 1
 
+// SSL_CTX_ctrl command numbers (ssl.h). The session-cache accessors are
+// preprocessor macros over SSL_CTX_ctrl, so the numbers are the only
+// portable way to reach them through a dynamic loader.
+SSL_CTRL_SET_SESS_CACHE_SIZE :: 42
+SSL_CTRL_SET_SESS_CACHE_MODE :: 44
+
+SSL_SESS_CACHE_OFF    :: 0x0000
+SSL_SESS_CACHE_CLIENT :: 0x0001
+SSL_SESS_CACHE_SERVER :: 0x0002
+
+// SSL_MAX_SID_CTX_LENGTH bounds the session id context OpenSSL will keep.
+SSL_MAX_SID_CTX_LENGTH :: 32
+
+// TLS_DEFAULT_NUM_TICKETS is how many NewSessionTicket messages a TLS 1.3
+// handshake sends. One is enough for a client that reconnects once; two
+// lets it hold one in reserve for a rapid second reconnect.
+TLS_DEFAULT_NUM_TICKETS :: 2
+
 // TLS_FILE_CHUNK is how much of a file body is read, encrypted and sent per
 // round trip. There is no sendfile equivalent once TLS is in the way.
 TLS_FILE_CHUNK :: 64 << 10
@@ -70,9 +140,21 @@ TLS_FILE_CHUNK :: 64 << 10
 Tls_Api :: struct {
 	ctx_new:                  proc(method: rawptr) -> rawptr,
 	ctx_free:                 proc(ctx: rawptr),
+	ctx_ctrl:                 proc(ctx: rawptr, cmd: c.int, larg: c.long, parg: rawptr) -> c.long,
 	ctx_use_certificate_file: proc(ctx: rawptr, file: cstring, kind: c.int) -> c.int,
 	ctx_use_private_key_file: proc(ctx: rawptr, file: cstring, kind: c.int) -> c.int,
 	ctx_check_private_key:    proc(ctx: rawptr) -> c.int,
+	ctx_set_timeout:          proc(ctx: rawptr, seconds: c.long) -> c.long,
+	ctx_set_session_id_context: proc(ctx: rawptr, sid_ctx: rawptr, len: c.uint) -> c.int,
+	ctx_set_num_tickets:      proc(ctx: rawptr, n: c.size_t) -> c.int,
+	ctx_sess_set_new_cb:      proc(ctx: rawptr, cb: rawptr),
+	session_reused:           proc(ssl: rawptr) -> c.int,
+	get_version:              proc(ssl: rawptr) -> cstring,
+	get1_session:             proc(ssl: rawptr) -> rawptr,
+	set_session:              proc(ssl: rawptr, session: rawptr) -> c.int,
+	session_free:             proc(session: rawptr),
+	session_is_resumable:     proc(session: rawptr) -> c.int,
+	session_up_ref:           proc(session: rawptr) -> c.int,
 	server_method:            proc() -> rawptr,
 	client_method:            proc() -> rawptr,
 	ssl_new:                  proc(ctx: rawptr) -> rawptr,
@@ -190,9 +272,21 @@ tls_load :: proc() -> bool {
 	ok := true
 	ok &= tls_symbol(ssl_lib, "SSL_CTX_new", &TLS.ctx_new)
 	ok &= tls_symbol(ssl_lib, "SSL_CTX_free", &TLS.ctx_free)
+	ok &= tls_symbol(ssl_lib, "SSL_CTX_ctrl", &TLS.ctx_ctrl)
 	ok &= tls_symbol(ssl_lib, "SSL_CTX_use_certificate_file", &TLS.ctx_use_certificate_file)
 	ok &= tls_symbol(ssl_lib, "SSL_CTX_use_PrivateKey_file", &TLS.ctx_use_private_key_file)
 	ok &= tls_symbol(ssl_lib, "SSL_CTX_check_private_key", &TLS.ctx_check_private_key)
+	ok &= tls_symbol(ssl_lib, "SSL_CTX_set_timeout", &TLS.ctx_set_timeout)
+	ok &= tls_symbol(ssl_lib, "SSL_CTX_set_session_id_context", &TLS.ctx_set_session_id_context)
+	ok &= tls_symbol(ssl_lib, "SSL_CTX_set_num_tickets", &TLS.ctx_set_num_tickets)
+	ok &= tls_symbol(ssl_lib, "SSL_CTX_sess_set_new_cb", &TLS.ctx_sess_set_new_cb)
+	ok &= tls_symbol(ssl_lib, "SSL_session_reused", &TLS.session_reused)
+	ok &= tls_symbol(ssl_lib, "SSL_get_version", &TLS.get_version)
+	ok &= tls_symbol(ssl_lib, "SSL_get1_session", &TLS.get1_session)
+	ok &= tls_symbol(ssl_lib, "SSL_set_session", &TLS.set_session)
+	ok &= tls_symbol(ssl_lib, "SSL_SESSION_free", &TLS.session_free)
+	ok &= tls_symbol(ssl_lib, "SSL_SESSION_is_resumable", &TLS.session_is_resumable)
+	ok &= tls_symbol(ssl_lib, "SSL_SESSION_up_ref", &TLS.session_up_ref)
 	ok &= tls_symbol(ssl_lib, "TLS_server_method", &TLS.server_method)
 	ok &= tls_symbol(ssl_lib, "TLS_client_method", &TLS.client_method)
 	ok &= tls_symbol(ssl_lib, "SSL_new", &TLS.ssl_new)
@@ -245,8 +339,16 @@ tls_last_error :: proc() -> string {
 tls_config_init loads the certificate chain and private key into an
 SSL_CTX. Both files are PEM. Returns false (and logs) on any failure,
 including libssl not being available at all.
+
+`resumption` defaults to TLS_RESUMPTION_DEFAULT (session cache + tickets),
+so existing three-argument calls get abbreviated handshakes for free. Pass
+TLS_RESUMPTION_OFF - or a tuned Tls_Resumption - to change that.
 */
-tls_config_init :: proc(cfg: ^Tls_Config, cert_file, key_file: string) -> bool {
+tls_config_init :: proc(
+	cfg: ^Tls_Config,
+	cert_file, key_file: string,
+	resumption := TLS_RESUMPTION_DEFAULT,
+) -> bool {
 	cfg^ = {}
 	if !tls_load() {
 		return false
@@ -276,8 +378,106 @@ tls_config_init :: proc(cfg: ^Tls_Config, cert_file, key_file: string) -> bool {
 	cfg.ctx = ctx
 	cfg.cert = cert_file
 	cfg.key = key_file
-	log_info("web: tls: serving with %v", cert_file)
+	cfg.resumption = resumption
+	tls_apply_resumption(cfg)
+	log_info("web: tls: serving with %v%v", cert_file, cfg.resumption.cache || cfg.resumption.tickets ? " (resumption on)" : "")
 	return true
+}
+
+/*
+tls_config_set_resumption changes the resumption policy of a live context.
+Sessions already handed out stay valid; the new settings apply to
+handshakes started from now on. Returns false when OpenSSL rejected a
+setting (it logs which).
+
+Use it to turn resumption off under load-shedding or security review
+without tearing the listener down - the SSL_CTX is shared by every
+accepted connection, so the change is immediate and thread-safe in the
+sense that OpenSSL's cache is internally locked.
+*/
+tls_config_set_resumption :: proc(cfg: ^Tls_Config, resumption: Tls_Resumption) -> bool {
+	if cfg.ctx == nil {
+		return false
+	}
+	cfg.resumption = resumption
+	return tls_apply_resumption(cfg)
+}
+
+@(private)
+tls_apply_resumption :: proc(cfg: ^Tls_Config) -> bool {
+	r := cfg.resumption
+	ctx := cfg.ctx
+
+	mode := c.long(SSL_SESS_CACHE_OFF)
+	if r.cache {
+		mode = SSL_SESS_CACHE_SERVER
+	}
+	// SSL_CTX_ctrl answers with the *previous* mode here, not with a
+	// success flag, so the return value is deliberately not checked
+	_ = TLS.ctx_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, mode, nil)
+	if r.cache && r.cache_size > 0 {
+		// Best effort: a context with a full cache evicts rather than
+		// errors, so a refusal here is not worth failing the server over.
+		_ = TLS.ctx_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_SIZE, c.long(r.cache_size), nil)
+	}
+	if r.timeout > 0 {
+		_ = TLS.ctx_set_timeout(ctx, c.long(r.timeout))
+	}
+
+	// Without a session id context OpenSSL refuses to cache a TLS 1.2
+	// session at all, which is the silent half of the resumption story.
+	id_ctx := tls_session_id_context(r.id_context, cfg.cert)
+	if TLS.ctx_set_session_id_context(ctx, rawptr(&id_ctx[0]), c.uint(len(id_ctx))) != 1 {
+		log_error("web: tls: cannot set session id context: %v", tls_last_error())
+		return false
+	}
+
+	if r.tickets {
+		// OpenSSL's own default is 2 for TLS 1.3, but it is a build-time
+		// choice; naming it here makes the behaviour independent of how
+		// the library was configured.
+		n := r.num_tickets
+		if n <= 0 {
+			n = TLS_DEFAULT_NUM_TICKETS
+		}
+		_ = TLS.ctx_set_num_tickets(ctx, c.size_t(n))
+	} else {
+		// 0 disables the TLS 1.3 NewSessionTicket message, and with it
+		// ticket-based resumption for both protocol versions
+		_ = TLS.ctx_set_num_tickets(ctx, 0)
+	}
+	return true
+}
+
+/*
+tls_session_id_context builds the 32-byte context OpenSSL binds a cached
+session to. An explicit `id` wins; otherwise the certificate path is hashed,
+which keeps two vhosts in one process (different certs) from sharing
+sessions while staying stable across restarts.
+*/
+tls_session_id_context :: proc(id, cert: string) -> [SSL_MAX_SID_CTX_LENGTH]byte {
+	out: [SSL_MAX_SID_CTX_LENGTH]byte
+	src := id
+	if len(src) == 0 {
+		src = cert
+	}
+	if len(src) == 0 {
+		src = "web-odin"
+	}
+	// FNV-1a stretched over the buffer: the context only has to be
+	// distinct and stable, not secret.
+	h: u64 = 0xcbf29ce484222325
+	for i in 0..<len(src) {
+		h = (h ~ u64(src[i])) * 0x100000001b3
+	}
+	seed := h
+	for i := 0; i < SSL_MAX_SID_CTX_LENGTH; i += 1 {
+		if i % 8 == 0 && i > 0 {
+			seed = seed * 0x100000001b3 ~ 0x9e3779b97f4a7c15
+		}
+		out[i] = byte(seed >> uint((i % 8) * 8))
+	}
+	return out
 }
 
 tls_config_destroy :: proc(cfg: ^Tls_Config) {
@@ -354,6 +554,14 @@ tls_handshake_step :: proc(c: ^Conn) {
 		ret := TLS.do_handshake(s.ssl)
 		if ret == 1 {
 			s.handshaking = false
+			// Report the abbreviated path so a deployment can see whether
+			// resumption is actually happening (a client that never
+			// stores the ticket looks exactly like a broken cache).
+			s.resumed = TLS.session_reused(s.ssl) == 1
+			c.server.stats.tls_handshakes += 1
+			if s.resumed {
+				c.server.stats.tls_resumed += 1
+			}
 			break
 		}
 		err := TLS.get_error(s.ssl, ret)

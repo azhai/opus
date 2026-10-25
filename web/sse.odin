@@ -33,10 +33,34 @@ as a keep-alive because a line starting with ':' is ignored by the client
 but keeps idle-timeout proxies from dropping the connection.
 */
 
+/*
+Sse_Writer owns the hijacked socket and two reusable scratch buffers: one
+for the field lines of the event being built, one for the chunked frame that
+wraps them. A stream can emit an event per second for hours, so the writer
+deliberately does not allocate per event - it grows these two buffers to
+their high-water mark and reuses them.
+
+Pass it by pointer (`w, ok := sse_start(res); defer sse_close(&w)`) and do
+not copy it: a copy would share the buffer pointers and double-free on close.
+*/
 Sse_Writer :: struct {
 	socket:    net.TCP_Socket,
 	ok:        bool,
 	allocator: mem.Allocator,
+	payload:   Buf,
+	frame:     Buf,
+}
+
+// sse_last_event_id returns the reconnection cursor the client sent
+// (Last-Event-ID), or "" on a first connection. Resume a stream from it:
+// the browser sends it on every automatic reconnect after a dropped
+// connection, which is what makes `sse_event(..., id = ...)` worth setting.
+sse_last_event_id :: proc(req: ^Request) -> string {
+	v, ok := request_header(req, "Last-Event-ID")
+	if !ok {
+		return ""
+	}
+	return trim_ows(v)
 }
 
 /*
@@ -54,6 +78,8 @@ sse_start :: proc(res: ^Response, extra_headers: []Header = nil, allocator := co
 		return {}, false
 	}
 	w = Sse_Writer{socket = socket, ok = true, allocator = allocator}
+	buf_init(&w.payload, allocator)
+	buf_init(&w.frame, allocator)
 
 	b: Buf
 	buf_init(&b, allocator)
@@ -78,10 +104,21 @@ sse_start :: proc(res: ^Response, extra_headers: []Header = nil, allocator := co
 	buf_append_string(&b, "\r\n")
 
 	if !stream_write(socket, buf_slice(&b)) {
+		sse_release(&w)
 		net.close(socket)
 		return {}, false
 	}
 	return w, true
+}
+
+// sse_release frees the scratch buffers. Separated from sse_close because
+// sse_close also has to end the HTTP response, which only happens once the
+// head was written successfully.
+sse_release :: proc(w: ^Sse_Writer) {
+	buf_destroy(&w.payload)
+	buf_destroy(&w.frame)
+	w.payload = {}
+	w.frame = {}
 }
 
 /*
@@ -95,19 +132,18 @@ sse_event :: proc(w: ^Sse_Writer, data: string, event := "", id := "") -> bool {
 	if !w.ok {
 		return false
 	}
-	p: Buf
-	buf_init(&p, w.allocator)
-	defer buf_destroy(&p)
+	p := &w.payload
+	buf_reset(p)
 
 	if len(event) > 0 {
-		buf_append_string(&p, "event: ")
-		buf_append_string(&p, event)
-		buf_append_byte(&p, '\n')
+		buf_append_string(p, "event: ")
+		buf_append_string(p, event)
+		buf_append_byte(p, '\n')
 	}
 	if len(id) > 0 {
-		buf_append_string(&p, "id: ")
-		buf_append_string(&p, id)
-		buf_append_byte(&p, '\n')
+		buf_append_string(p, "id: ")
+		buf_append_string(p, id)
+		buf_append_byte(p, '\n')
 	}
 	rest := data
 	for {
@@ -119,16 +155,16 @@ sse_event :: proc(w: ^Sse_Writer, data: string, event := "", id := "") -> bool {
 		} else {
 			rest = ""
 		}
-		buf_append_string(&p, "data: ")
-		buf_append_string(&p, line)
-		buf_append_byte(&p, '\n')
+		buf_append_string(p, "data: ")
+		buf_append_string(p, line)
+		buf_append_byte(p, '\n')
 		if nl < 0 {
 			break
 		}
 	}
-	buf_append_byte(&p, '\n')
+	buf_append_byte(p, '\n')
 
-	return sse_frame(w, buf_slice(&p))
+	return sse_frame(w, buf_slice(p))
 }
 
 // sse_comment sends a comment line. Clients ignore it; it keeps proxies and
@@ -137,13 +173,12 @@ sse_comment :: proc(w: ^Sse_Writer, text: string) -> bool {
 	if !w.ok {
 		return false
 	}
-	p: Buf
-	buf_init(&p, w.allocator)
-	defer buf_destroy(&p)
-	buf_append_string(&p, ": ")
-	buf_append_string(&p, text)
-	buf_append_string(&p, "\n\n")
-	return sse_frame(w, buf_slice(&p))
+	p := &w.payload
+	buf_reset(p)
+	buf_append_string(p, ": ")
+	buf_append_string(p, text)
+	buf_append_string(p, "\n\n")
+	return sse_frame(w, buf_slice(p))
 }
 
 // sse_retry tells the client how long to wait before reconnecting.
@@ -151,13 +186,12 @@ sse_retry :: proc(w: ^Sse_Writer, milliseconds: int) -> bool {
 	if !w.ok {
 		return false
 	}
-	p: Buf
-	buf_init(&p, w.allocator)
-	defer buf_destroy(&p)
-	buf_append_string(&p, "retry: ")
-	buf_append_string(&p, int_to_string(i64(milliseconds), w.allocator))
-	buf_append_string(&p, "\n\n")
-	return sse_frame(w, buf_slice(&p))
+	p := &w.payload
+	buf_reset(p)
+	buf_append_string(p, "retry: ")
+	buf_append_string(p, int_to_string(i64(milliseconds), w.allocator))
+	buf_append_string(p, "\n\n")
+	return sse_frame(w, buf_slice(p))
 }
 
 // sse_closed probes the peer without blocking (a closed tab sends FIN).
@@ -178,21 +212,22 @@ sse_close :: proc(w: ^Sse_Writer) {
 	terminator := "0\r\n\r\n"
 	_ = stream_write(w.socket, transmute([]byte) terminator)
 	net.close(w.socket)
+	sse_release(w)
 }
 
 // sse_frame wraps a payload in one chunk: "<hex length>\r\n<data>\r\n".
+// `payload` may be `w.payload` - the frame buffer is a separate one.
 sse_frame :: proc(w: ^Sse_Writer, payload: []byte) -> bool {
 	if !w.ok || len(payload) == 0 {
 		return w.ok
 	}
-	b: Buf
-	buf_init(&b, w.allocator)
-	defer buf_destroy(&b)
-	write_hex(&b, len(payload))
-	buf_append_string(&b, "\r\n")
-	buf_append(&b, payload)
-	buf_append_string(&b, "\r\n")
-	if !stream_write(w.socket, buf_slice(&b)) {
+	b := &w.frame
+	buf_reset(b)
+	write_hex(b, len(payload))
+	buf_append_string(b, "\r\n")
+	buf_append(b, payload)
+	buf_append_string(b, "\r\n")
+	if !stream_write(w.socket, buf_slice(b)) {
 		w.ok = false
 		return false
 	}

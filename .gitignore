@@ -17,6 +17,11 @@ bin/
 web.bin.dSYM/
 *.out
 
+# Stray example binaries built at the repo root, and upload spool dirs
+/static
+/uploads/
+/examples/*/uploads/
+
 # Logs
 *.log
 logs/

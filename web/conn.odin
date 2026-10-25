@@ -27,6 +27,7 @@ Conn_State :: enum {
 	Read_Body,
 	Process,
 	Proxy,
+	Async, // handler deferred; a continuation owns the rest (see async.odin)
 	Write,
 	Closed,
 }
@@ -34,6 +35,30 @@ Conn_State :: enum {
 Send_Phase :: enum {
 	None,
 	File,
+}
+
+/*
+Body_Sink consumes a request body as it arrives instead of accumulating it in
+`Request.body`. It exists so an upload can be written out while it is being
+received: the alternative - buffer the whole body, then hand it to a handler -
+makes a large upload cost as much RAM as it is large.
+
+A sink is installed before the body is read (see `Server.on_head` /
+`upload_sink_attach`) and is called with
+
+  - `write` for each chunk, in order. Returning false aborts the request with
+    a 400 and leaves the reason in the sink;
+  - `finish` once, after the last byte. Returning false also aborts;
+  - `teardown` exactly once, from `conn_close` or from the keep-alive reset -
+    whatever the sink created (temp files) is released here.
+
+The zero Body_Sink means "no sink": the body is buffered as before.
+*/
+Body_Sink :: struct {
+	write:    proc(ud: rawptr, chunk: []byte) -> bool,
+	finish:   proc(ud: rawptr) -> bool,
+	teardown: proc(ud: rawptr),
+	ud:       rawptr,
 }
 
 /*
@@ -85,6 +110,10 @@ Conn :: struct {
 	req: Request,
 	res: Response,
 
+	// body_sink diverts the request body as it arrives (upload.odin);
+	// `Request.body` stays empty when one is installed
+	body_sink: Body_Sink,
+
 	body_remaining: int,
 	chunked:        bool,
 	requests:       int,
@@ -95,6 +124,13 @@ Conn :: struct {
 	send_phase:  Send_Phase,
 
 	op:      ^nbio.Operation,
+
+	// async parking (see async.odin): a deferred response keeps the request
+	// alive across event loop turns, and async_op watches the peer while it
+	// waits (a separate slot because c.op is then used by the stream's writes)
+	async:    Async_State,
+	async_op: ^nbio.Operation,
+
 	closing: bool,
 	closed:  bool,
 }
@@ -111,6 +147,37 @@ released when the request is done, together with the rest of the scratch).
 */
 conn_allocator :: proc(c: ^Conn) -> mem.Allocator {
 	return conn_scratch(c)
+}
+
+/*
+conn_set_body_sink installs a consumer for the request body. It must be called
+before the body is read - in practice from `Server.on_head` - and it replaces
+the buffering behaviour for this request: `Request.body` stays empty and the
+sink sees the bytes instead. `upload.odin` is the only user today.
+
+Installing a second sink (or one after the body was read) is refused.
+*/
+conn_set_body_sink :: proc(c: ^Conn, sink: Body_Sink) -> bool {
+	if c == nil || c.closed || c.body_sink.write != nil || sink.write == nil {
+		return false
+	}
+	switch c.state {
+	case .Read_Head, .Read_Body:
+	case .Process, .Proxy, .Async, .Write, .Closed:
+		return false
+	}
+	c.body_sink = sink
+	return true
+}
+
+// conn_body_sink_teardown releases whatever the sink created. Called once per
+// request, from the keep-alive reset or from conn_close.
+conn_body_sink_teardown :: proc(c: ^Conn) {
+	sink := c.body_sink
+	c.body_sink = {}
+	if sink.teardown != nil {
+		sink.teardown(sink.ud)
+	}
 }
 
 conn_new :: proc(s: ^Server, socket: net.TCP_Socket, remote: net.Endpoint) -> ^Conn {
@@ -181,6 +248,12 @@ conn_close :: proc(c: ^Conn) {
 		nbio.remove(c.op)
 		c.op = nil
 	}
+	// the continuation must be told before the connection memory is reused:
+	// a stream subscriber removes itself from its hub here
+	conn_async_detach(c)
+	// likewise for a streaming body: temp files outlive the socket unless the
+	// request got the chance to release them
+	conn_body_sink_teardown(c)
 	// cancel any in-flight upstream operation before its socket goes away
 	if c.proxy_op != nil {
 		nbio.remove(c.proxy_op)
@@ -229,6 +302,9 @@ conn_drive :: proc(c: ^Conn) {
 		case .Proxy:
 			// parked: an upstream request is in flight; its callbacks
 			// drive the machine onwards
+			return
+		case .Async:
+			// parked: a deferred handler will resume this connection
 			return
 		case .Write:
 			conn_begin_write(c)
@@ -329,14 +405,35 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		conn_error(c, .Bad_Request, framing_error_message(ferr))
 		return true
 	}
+
+	// last chance to see the request before its body is consumed: this is
+	// where a body sink is installed (Server.on_head), and the length is
+	// already known here so a hook can decide based on it
+	if c.server.on_head != nil && !c.server.on_head(c.server, c, c.server.on_head_ud) {
+		// the hook answered the request itself; whatever state it left is
+		// the one the drive loop must continue from
+		return c.state == .Write
+	}
+
 	switch kind {
 	case .Chunked:
 		c.chunked = true
 		c.state = .Read_Body
 		return true
 	case .Length:
-		if blen > c.server.max_body_size {
+		// With a body sink installed the size limit belongs to the sink: the
+		// whole point of streaming is that the body is never held, so
+		// `max_body_size` (a memory bound) would be the wrong ceiling. The sink
+		// enforces its own per-part limit and answers 413 itself.
+		if c.body_sink.write == nil && blen > c.server.max_body_size {
 			conn_error(c, .Payload_Too_Large, "413 payload too large\n")
+			return true
+		}
+		if c.body_sink.write != nil {
+			// a sink streams: never take the "whole body is already
+			// buffered" shortcut, or it would never see a byte
+			c.body_remaining = blen
+			c.state = .Read_Body
 			return true
 		}
 		if blen == 0 {
@@ -463,6 +560,35 @@ framing_error_message :: proc(e: Framing_Error) -> string {
 // advanced; false when more data is needed and a recv was armed.
 conn_try_body :: proc(c: ^Conn) -> bool {
 	if c.chunked {
+		if c.body_sink.write != nil {
+			// streaming: release each complete chunk instead of accumulating,
+			// and drop the bytes the decoder already released
+			status, consumed := chunked_try_decode(buf_slice(&c.inbuf), &c.body_buf, conn_chunk_emit, c)
+			if consumed > 0 {
+				buf_consume(&c.inbuf, consumed)
+			}
+			switch status {
+			case 1:
+				c.chunked = false
+				if !conn_body_sink_finish(c) {
+					return true
+				}
+				c.state = .Process
+				return true
+			case 0:
+				if buf_len(&c.inbuf) >= c.server.max_body_size {
+					conn_error(c, .Payload_Too_Large, "413 payload too large\n")
+					return true
+				}
+				conn_recv_arm(c, c.server.header_timeout)
+				return false
+			case:
+				c.body_sink = {}
+				conn_body_sink_error(c)
+				return true
+			}
+		}
+
 		mark := buf_len(&c.body_buf)
 		status, consumed := chunked_try_decode(buf_slice(&c.inbuf), &c.body_buf)
 		if status < 0 {
@@ -486,6 +612,36 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 		return true
 	}
 
+	if c.body_sink.write != nil {
+		// Stream what has arrived and let it go: the point of a sink is that
+		// the body never has to fit in `inbuf`. A pipelined request behind
+		// this one stays in `inbuf` untouched, because `body_remaining` is
+		// what bounds the slice taken.
+		avail := buf_len(&c.inbuf)
+		if avail > 0 {
+			n := avail
+			if n > c.body_remaining {
+				n = c.body_remaining
+			}
+			if !c.body_sink.write(c.body_sink.ud, buf_slice(&c.inbuf)[:n]) {
+				c.body_sink = {}
+				conn_body_sink_error(c)
+				return true
+			}
+			buf_consume(&c.inbuf, n)
+			c.body_remaining -= n
+		}
+		if c.body_remaining > 0 {
+			conn_recv_arm(c, c.server.header_timeout)
+			return false
+		}
+		if !conn_body_sink_finish(c) {
+			return true
+		}
+		c.state = .Process
+		return true
+	}
+
 	if buf_len(&c.inbuf) < c.body_remaining {
 		if buf_len(&c.inbuf) > c.server.max_body_size {
 			conn_error(c, .Payload_Too_Large, "413 payload too large\n")
@@ -501,6 +657,48 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 	return true
 }
 
+// conn_chunk_emit is the Chunk_Emit adapter for a chunked body delivered to a
+// body sink: the decoder calls it once per complete chunk.
+@(private)
+conn_chunk_emit :: proc(ud: rawptr, chunk: []byte) -> bool {
+	c := cast(^Conn) ud
+	if c.body_sink.write == nil {
+		return true
+	}
+	return c.body_sink.write(c.body_sink.ud, chunk)
+}
+
+// conn_body_sink_finish closes out the streamed body; false means the reply
+// is already queued as an error.
+@(private)
+conn_body_sink_finish :: proc(c: ^Conn) -> bool {
+	if c.body_sink.write == nil {
+		return true
+	}
+	sink := c.body_sink
+	if sink.finish != nil && !sink.finish(sink.ud) {
+		c.body_sink = {}
+		conn_body_sink_error(c)
+		return false
+	}
+	return true
+}
+
+/*
+conn_body_sink_error answers a request whose body the sink refused. The status
+comes from `Request.form_state`, which the sink sets: a limit it enforced is a
+413 (the client should send less), anything else is a body the framing claimed
+and did not deliver, so 400.
+*/
+@(private)
+conn_body_sink_error :: proc(c: ^Conn) {
+	if c.req.form_state == .Too_Large {
+		conn_error(c, .Payload_Too_Large, "413 payload too large\n")
+		return
+	}
+	conn_error(c, .Bad_Request, "400 malformed request body\n")
+}
+
 conn_process :: proc(c: ^Conn) {
 	w := &c.res
 	if c.server.handler != nil {
@@ -509,12 +707,25 @@ conn_process :: proc(c: ^Conn) {
 		w.status = .Not_Found
 		response_write_string(w, "404 page not found\n")
 	}
+	conn_process_tail(c)
+}
 
-	if c.state == .Proxy || c.state == .Closed {
+/*
+conn_process_tail finishes a request: it is the half of conn_process that runs
+after the handler (or after an async continuation) has produced the response.
+
+Split out so a deferred response goes through *exactly* the same path as a
+synchronous one - header negotiation, filters, serialization - instead of a
+second implementation that would drift.
+*/
+conn_process_tail :: proc(c: ^Conn) {
+	w := &c.res
+	if c.state == .Proxy || c.state == .Closed || c.state == .Async {
 		// Proxy: the handler hijacked the connection into proxy mode; the
 		// upstream callbacks take it from here.
 		// Closed: the handler released the connection (response_hijack) and
 		// owns the socket now; nothing is serialized on this Conn.
+		// Async: a continuation owns the response and will call back in.
 		return
 	}
 
@@ -678,6 +889,7 @@ conn_after_write :: proc(c: ^Conn) {
 conn_request_reset :: proc(c: ^Conn) {
 	// NOTE: `in` is deliberately not reset here: it may already hold the
 	// head of a pipelined request. It is drained by the head/body parser.
+	conn_body_sink_teardown(c)
 	mem.dynamic_arena_reset(&c.scratch)
 	buf_reset(&c.out)
 	buf_reset(&c.body_buf)
@@ -701,6 +913,7 @@ conn_request_reset :: proc(c: ^Conn) {
 	c.proxy_upstream_close = false
 	c.proxy_body_done = false
 	c.proxy_cfg = nil
+	c.async = {}
 }
 
 // conn_error emits a minimal error response and closes the connection

@@ -10,12 +10,12 @@ adds the multipart half and a middleware that parses either encoding exactly
 once per request, so a handler can read fields and uploaded files without
 caring which one the client picked.
 
-Multipart parsing is deliberately in-memory: `MAX_FORM_FILE_SIZE` bounds a
-single part and `Server.max_body_size` bounds the whole body, so a request
-cannot make the parser allocate more than it already read. Streaming an
-upload to disk is a different product (a file service, not a web framework
-router); the in-memory form is what a contact form, a profile picture and a
-CSV import need.
+Multipart parsing has two implementations that share the part grammar and
+the metadata parser: `multipart_parse` here, which runs over a body already in
+memory, and `multipart_stream` (multipart_stream.odin), which runs over chunks
+as they arrive and backs the on-disk upload path (upload.odin). This one is
+what a contact form, a profile picture and a CSV import need; the streaming
+one is what a large upload needs.
 
 Parsing rule that matters: a part is a *file* when its Content-Disposition
 carries a `filename` parameter - even an empty one. Browsers omit
@@ -26,15 +26,28 @@ keying off Content-Type would turn every empty file input into a field.
 // MAX_FORM_FIELDS caps the number of non-file parts decoded per request.
 MAX_FORM_FIELDS :: 256
 
-// MAX_FORM_FILE_SIZE caps a single uploaded part (8 MiB). The whole body is
-// already bounded by `Server.max_body_size`.
+// MAX_FORM_FILE_SIZE caps a single uploaded part (8 MiB) on the in-memory
+// path. The whole body is already bounded by `Server.max_body_size`. The
+// streaming path raises this: see MULTIPART_DEFAULT_MAX_PART.
 MAX_FORM_FILE_SIZE :: 8 << 20
 
+/*
+Form_File is one uploaded part. It holds its bytes in exactly one of two
+places, decided by which parser produced it:
+
+  - `data`, a view into the request body, for the in-memory parser; or
+  - `path`, a temporary file, for the streaming parser (upload.odin).
+
+`request_file` and `request_files` do not care which: read `path` first and
+`data` second, or use `form_file_bytes` for the small-file case.
+*/
 Form_File :: struct {
 	field:        string, // the `name="..."` of the part
 	filename:     string, // client-supplied base name, path components stripped
 	content_type: string, // part Content-Type, empty when the client sent none
 	data:         []byte, // a view into the request body: valid until it is done
+	path:         string, // temp file holding the part; "" on the in-memory path
+	size:         int,    // total part size (len(data) when `path` is empty)
 }
 
 Form_State :: enum u8 {
@@ -51,7 +64,8 @@ Form_Error :: enum {
 	Malformed,
 	Too_Many_Fields,
 	File_Too_Large,
-	Too_Large, // a cached parse hit a limit; the specific one is gone
+	Too_Large,   // a cached parse hit a limit; the specific one is gone
+	Sink_Error,  // a streaming consumer refused a chunk (see upload.odin)
 }
 
 // Form_Config configures middleware_form. Zero fields mean the defaults:
@@ -137,7 +151,7 @@ form_ensure_parsed :: proc(r: ^Request, cfg: ^Form_Config) -> Form_Error {
 		case .Too_Many_Fields, .File_Too_Large:
 			r.form_state = .Too_Large
 			return err
-		case .Not_A_Form, .Bad_Boundary, .Too_Large, .Malformed:
+		case .Not_A_Form, .Bad_Boundary, .Too_Large, .Malformed, .Sink_Error:
 			r.form_state = .Malformed
 			return .Malformed
 		}
@@ -154,28 +168,6 @@ form_ensure_parsed :: proc(r: ^Request, cfg: ^Form_Config) -> Form_Error {
 		return .None
 	}
 	return .Not_A_Form
-}
-
-// middleware_form parses the body before the route handler runs and answers
-// the encoding errors itself: 415 for a body that is not a form when
-// `require_form` is set, 400 for a broken multipart body, 413 for a limit.
-middleware_form :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	cfg := cast(^Form_Config) m.ud
-	switch form_ensure_parsed(req, cfg) {
-	case .None:
-	case .Not_A_Form:
-		if cfg != nil && cfg.require_form {
-			response_error(res, .Unsupported_Media, "")
-			return
-		}
-	case .Bad_Boundary, .Malformed:
-		response_error(res, .Bad_Request, "")
-		return
-	case .Too_Many_Fields, .File_Too_Large, .Too_Large:
-		response_error(res, .Payload_Too_Large, "")
-		return
-	}
-	router_next(r, idx + 1, final, req, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +248,7 @@ multipart_parse :: proc(
 				filename     = filename,
 				content_type = ctype,
 				data         = content, // view into the request body
+				size         = len(content),
 			})
 			continue
 		}

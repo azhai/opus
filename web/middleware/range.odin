@@ -1,6 +1,8 @@
-package web
+package middleware
 
+import ".."
 import "core:mem"
+
 
 /*
 `middleware_range` gives ordinary handlers the two conditional-response
@@ -44,8 +46,8 @@ Range_Config :: struct {
 	etag: bool,
 }
 
-middleware_range :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	router_next(r, idx + 1, final, req, res)
+middleware_range :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
+	web.router_next(r, idx + 1, final, req, res)
 
 	cfg := cast(^Range_Config) m.ud
 	want_etag := cfg != nil && cfg.etag
@@ -56,31 +58,31 @@ middleware_range :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, r
 	if req.method != .Get && req.method != .Head {
 		return
 	}
-	if _, already := response_header(res, "Content-Range"); already {
+	if _, already := web.response_header(res, "Content-Range"); already {
 		return // a handler answered the range itself
 	}
 	if len(res.body.data) == 0 {
 		return
 	}
 
-	rng, has_range := request_header(req, "Range")
-	alloc := response_allocator(res)
+	rng, has_range := web.request_header(req, "Range")
+	alloc := web.response_allocator(res)
 
 	// ---- ETag / If-None-Match ----
 	etag := ""
 	if want_etag {
-		if existing, ok := response_header(res, "ETag"); ok {
+		if existing, ok := web.response_header(res, "ETag"); ok {
 			etag = existing
 		} else {
-			etag = content_etag(buf_slice(&res.body), alloc)
-			response_set_header(res, "ETag", etag)
+			etag = content_etag(web.buf_slice(&res.body), alloc)
+			web.response_set_header(res, "ETag", etag)
 		}
-		if inm, ok := request_header(req, "If-None-Match"); ok && etag_list_matches(inm, etag) {
+		if inm, ok := web.request_header(req, "If-None-Match"); ok && etag_list_matches(inm, etag) {
 			// 304 must not carry a body or a Content-Type (RFC 7232 4.1);
 			// the validators stay so the next request can revalidate.
-			response_remove_header(res, "Content-Length")
-			response_remove_header(res, "Content-Type")
-			buf_reset(&res.body)
+			web.response_remove_header(res, "Content-Length")
+			web.response_remove_header(res, "Content-Type")
+			web.buf_reset(&res.body)
 			res.status = .Not_Modified
 			return
 		}
@@ -88,7 +90,7 @@ middleware_range :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, r
 
 	if !has_range {
 		if want_etag {
-			response_set_header(res, "Accept-Ranges", "bytes")
+			web.response_set_header(res, "Accept-Ranges", "bytes")
 		}
 		return
 	}
@@ -96,38 +98,38 @@ middleware_range :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, r
 	// If-Range: honour the range only when the client's validator still
 	// describes this representation (entity tag form; this server has no
 	// date validator).
-	if ir, ok := request_header(req, "If-Range"); ok {
+	if ir, ok := web.request_header(req, "If-Range"); ok {
 		if len(etag) == 0 || !etag_matches(ir, etag) {
-			response_set_header(res, "Accept-Ranges", "bytes")
+			web.response_set_header(res, "Accept-Ranges", "bytes")
 			return // stale validator: send the full representation (200)
 		}
 	}
 
 	size := i64(len(res.body.data))
-	ranges, count, decision := parse_byte_ranges(rng, size)
+	ranges, count, decision := web.parse_byte_ranges(rng, size)
 	switch decision {
 	case .Single:
 		r := ranges[0]
 		slice := res.body.data[int(r.start):int(r.start + r.length)]
 		// Copy before resetting: the slice points into the buffer being
 		// replaced, and `reset` may reallocate on the next append.
-		copied := clone_bytes(slice, alloc)
-		buf_reset(&res.body)
-		buf_append(&res.body, copied)
-		response_remove_header(res, "Content-Length")
-		response_set_header(res, "Accept-Ranges", "bytes")
-		response_set_header(res, "Content-Range", content_range_value(r.start, r.start + r.length - 1, size, alloc))
+		copied := web.clone_bytes(slice, alloc)
+		web.buf_reset(&res.body)
+		web.buf_append(&res.body, copied)
+		web.response_remove_header(res, "Content-Length")
+		web.response_set_header(res, "Accept-Ranges", "bytes")
+		web.response_set_header(res, "Content-Range", web.content_range_value(r.start, r.start + r.length - 1, size, alloc))
 		res.status = .Partial_Content
 	case .Unsatisfiable:
-		buf_reset(&res.body)
-		response_remove_header(res, "Content-Length")
-		response_set_header(res, "Accept-Ranges", "bytes")
-		response_set_header(res, "Content-Range", unsatisfiable_content_range(size, alloc))
-		response_error(res, .Range_Not_Satisfiable, "")
+		web.buf_reset(&res.body)
+		web.response_remove_header(res, "Content-Length")
+		web.response_set_header(res, "Accept-Ranges", "bytes")
+		web.response_set_header(res, "Content-Range", web.unsatisfiable_content_range(size, alloc))
+		web.response_error(res, .Range_Not_Satisfiable, "")
 	case .Multi, .Ignore:
 		// The representation is small enough to send whole: RFC 7233 3.1
 		// allows a server to ignore Range. Answer 200 with the full body.
-		response_set_header(res, "Accept-Ranges", "bytes")
+		web.response_set_header(res, "Accept-Ranges", "bytes")
 	}
 }
 
@@ -155,7 +157,7 @@ content_etag :: proc(body: []byte, allocator: mem.Allocator) -> string {
 etag_list_matches :: proc(header, etag: string) -> bool {
 	rest := header
 	for len(rest) > 0 {
-		comma := string_index_byte(rest, ',')
+		comma := web.string_index_byte(rest, ',')
 		item := rest
 		if comma >= 0 {
 			item = rest[:comma]
@@ -163,7 +165,7 @@ etag_list_matches :: proc(header, etag: string) -> bool {
 		} else {
 			rest = ""
 		}
-		item = trim_ows(item)
+		item = web.trim_ows(item)
 		if item == "*" {
 			return true
 		}

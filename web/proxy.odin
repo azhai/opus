@@ -61,11 +61,9 @@ thread its own Proxy when running several.
 */
 
 Proxy :: struct {
-	upstreams:    [dynamic]net.Endpoint,
-	hosts:        [dynamic]string, // "host:port" per upstream, for the Host header
-	next:         int,             // round-robin cursor
-	strip_prefix: string,          // "/api" is stripped from the client path
-	timeout:      time.Duration,   // per upstream operation (dial/send/recv)
+	upstreams:    [dynamic]Upstream, // endpoints, weights and health
+	strip_prefix: string,            // "/api" is stripped from the client path
+	timeout:      time.Duration,     // per upstream operation (dial/send/recv)
 	allocator:    mem.Allocator,
 
 	// upstream connection reuse
@@ -74,9 +72,15 @@ Proxy :: struct {
 	idle_timeout:      time.Duration,
 	pool:              [dynamic]Pool_Conn,
 
+	// health (see proxy_health.odin): failures eject, successes restore
+	health: Health_Config,
+
 	// counters, useful in /stats style handlers
-	pool_hits:   u64,
-	pool_misses: u64,
+	pool_hits:          u64,
+	pool_misses:        u64,
+	upstreams_ejected:  int, // currently ejected
+	probes:             u64,
+	probe_failures:     u64,
 }
 
 // Pool_Conn is one idle upstream connection waiting to be reused.
@@ -86,25 +90,33 @@ Pool_Conn :: struct {
 	idle_since: time.Time,
 }
 
-// proxy_init parses the upstream addresses ("127.0.0.1:9000", "[::1]:9000").
+// proxy_init parses the upstream addresses ("127.0.0.1:9000", "[::]:9000").
 // It returns false (and logs) if any address is invalid.
+//
+// Every upstream starts healthy with weight 1, with the default health
+// policy (PROXY_HEALTH_DEFAULT). Tune it by assigning `p.health` and calling
+// `proxy_set_weight` before the server starts.
 proxy_init :: proc(p: ^Proxy, upstreams: []string, allocator := context.allocator) -> bool {
 	p.allocator = allocator
 	p.timeout = 10 * time.Second
 	p.keep_alive = true
 	p.max_idle_per_host = 16
 	p.idle_timeout = 30 * time.Second
+	p.health = PROXY_HEALTH_DEFAULT
 	p.pool = make([dynamic]Pool_Conn, allocator)
-	p.upstreams = make([dynamic]net.Endpoint, allocator)
-	p.hosts = make([dynamic]string, allocator)
+	p.upstreams = make([dynamic]Upstream, allocator)
 	for u in upstreams {
 		ep, ok := net.parse_endpoint(u)
 		if !ok {
 			log_error("web: invalid upstream address: %q", u)
 			return false
 		}
-		append(&p.upstreams, ep)
-		append(&p.hosts, clone_string(u, allocator))
+		append(&p.upstreams, Upstream {
+			endpoint = ep,
+			host     = clone_string(u, allocator),
+			weight   = 1,
+			state    = .Healthy,
+		})
 	}
 	return true
 }
@@ -140,15 +152,11 @@ proxy_destroy :: proc(p: ^Proxy) {
 		p.pool = nil
 	}
 	if p.upstreams != nil {
+		for u in p.upstreams {
+			delete(u.host, p.allocator)
+		}
 		delete(p.upstreams)
 		p.upstreams = nil
-	}
-	if p.hosts != nil {
-		for h in p.hosts {
-			delete(h, p.allocator)
-		}
-		delete(p.hosts)
-		p.hosts = nil
 	}
 }
 
@@ -205,11 +213,21 @@ proxy_pool_close_all :: proc(p: ^Proxy) {
 	clear(&p.pool)
 }
 
-// proxy_next_upstream picks the next upstream round-robin.
-proxy_next_upstream :: proc(p: ^Proxy) -> (net.Endpoint, string, int) {
-	i := p.next % len(p.upstreams)
-	p.next = (p.next + 1) % len(p.upstreams)
-	return p.upstreams[i], p.hosts[i], i
+// proxy_pool_close_upstream drops the idle connections of one upstream: an
+// ejected backend's sockets are not worth keeping, and handing one out would
+// charge the failure to a connection that may already be dead.
+proxy_pool_close_upstream :: proc(p: ^Proxy, upstream: int) {
+	if p.pool == nil {
+		return
+	}
+	for i := 0; i < len(p.pool); i += 1 {
+		if p.pool[i].upstream != upstream {
+			continue
+		}
+		nbio.close(p.pool[i].sock)
+		unordered_remove(&p.pool, i)
+		i -= 1
+	}
 }
 
 // proxy_serve is a `Handler` for `server.user_ptr = ^Proxy`.
@@ -240,13 +258,15 @@ proxy_method_retryable :: proc(m: Method) -> bool {
 // returns; the upstream callbacks then relay the response.
 proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 	c := req.conn
-	if len(p.upstreams) == 0 {
+	index := proxy_next_upstream(p)
+	if index < 0 {
 		res.status = .Bad_Gateway
 		response_write_string(res, "502 no upstream configured\n")
 		return
 	}
+	up := p.upstreams[index].endpoint
+	host := p.upstreams[index].host
 	c.proxy_cfg = p
-	up, host, index := proxy_next_upstream(p)
 	c.proxy_upstream = index
 
 	// target path: strip the configured prefix (on a segment boundary)
@@ -378,6 +398,9 @@ on_proxy_dial :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 	if op.dial.err != nil {
 		log_debug("web: proxy dial failed: %v", op.dial.err)
+		if c.proxy_cfg != nil {
+			proxy_note_failure(c.proxy_cfg, c.proxy_upstream)
+		}
 		if is_dial_timeout(op.dial.err) {
 			proxy_fail(c, .Gateway_Timeout, "504 upstream connect timeout\n")
 		} else {
@@ -478,6 +501,12 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 // proxy_upstream_failed tears the upstream down and either retries on a
 // fresh connection (a pooled one that was already dead) or answers 502/504.
 proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
+	if c.proxy_cfg != nil {
+		// passive health: every failed attempt counts, including the one that
+		// triggers the retry below - a retry that succeeds clears the streak
+		// again, so a healthy upstream is never ejected by one stale socket
+		proxy_note_failure(c.proxy_cfg, c.proxy_upstream)
+	}
 	if c.proxy_open {
 		nbio.close(c.proxy_sock)
 		c.proxy_open = false
@@ -487,7 +516,7 @@ proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
 		// connection is the likely culprit, so dial once for real
 		c.proxy_retryable = false
 		log_debug("web: proxy retrying %v on a fresh connection", c.req.path)
-		proxy_start_dial(c, c.proxy_cfg.upstreams[c.proxy_upstream])
+		proxy_start_dial(c, c.proxy_cfg.upstreams[c.proxy_upstream].endpoint)
 		return
 	}
 	if c.proxy_client_started {
@@ -676,6 +705,9 @@ proxy_drain_body :: proc(c: ^Conn) {
 proxy_body_finish :: proc(c: ^Conn) {
 	if c.proxy_framing == .Reframe_Chunked {
 		buf_append_string(&c.out, "0\r\n\r\n")
+	}
+	if c.proxy_cfg != nil {
+		proxy_note_success(c.proxy_cfg, c.proxy_upstream)
 	}
 	proxy_release_upstream(c)
 	c.proxy_state = .Done

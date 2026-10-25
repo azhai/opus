@@ -37,6 +37,28 @@ Response :: struct {
 	chunked:   bool,
 	keep_alive: bool,
 	built:     bool,
+
+	// compress is the per-response override for the gzip/deflate filter.
+	// Handlers and middleware set it: .Force compresses even a small or
+	// untyped body, .Deny keeps a body identity (a stream, a pre-coded
+	// asset). .Default leaves the decision to the filter's own rules.
+	compress: Compress_Mode,
+	// compress_min overrides the filter's min_size for this response; 0
+	// means "use the filter default".
+	compress_min: int,
+}
+
+/*
+Compress_Mode is a per-response override for content coding.
+
+	Default - let the filter decide (size threshold + content type)
+	Force   - code it regardless of size and type (a route knows best)
+	Deny    - never code it (streams, pre-compressed assets,Range bodies)
+*/
+Compress_Mode :: enum u8 {
+	Default,
+	Force,
+	Deny,
 }
 
 response_init :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
@@ -62,6 +84,8 @@ response_reset :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 	w.chunked = false
 	w.keep_alive = false
 	w.built = false
+	w.compress = .Default
+	w.compress_min = 0
 	w.headers = make([dynamic]Header, allocator)
 	buf_init(&w.body, allocator)
 }
@@ -227,6 +251,18 @@ response_error :: proc(w: ^Response, status: Status, message := "") {
 		response_write_string(w, status_text(status))
 	}
 	response_write_string(w, "\n")
+}
+
+// response_error_for_conn answers an error before a Request exists in a
+// handler's hands - specifically from `Server.on_head`, where a hook may
+// reject the request (a bad upload body) without ever reaching a handler.
+// It is the same body response_error would have written.
+response_error_for_conn :: proc(c: ^Conn, status: Status, message := "") {
+	msg := message
+	if len(msg) == 0 {
+		msg = status_text(status)
+	}
+	conn_error(c, status, msg)
 }
 
 // response_body_size reports what the response will actually carry: the

@@ -82,19 +82,45 @@ decoded bytes to `out` and reporting how many bytes of `in` were consumed.
 
 Returns:
    1  the body is complete
-   0  more data is needed (partial output is rolled back by the caller
-      via the buffer mark taken before the call)
+   0  more data is needed (without a consumer, partial output is rolled back
+      by the caller via the buffer mark taken before the call)
   -1  the framing is malformed
+  -2  `emit` refused a chunk (a streaming consumer said no)
 
-The `consumed` output is only meaningful when the status is 1; it lets the
-connection layer preserve any pipelined bytes that follow the body.
+The `consumed` output is only meaningful when the status is 1, unless `emit`
+is given: a streaming consumer releases each complete chunk as it is decoded,
+so on status 0 `consumed` reports how much of `src` was already released and
+the caller *must* drop those bytes - otherwise the next call would decode and
+emit them a second time.
 */
-chunked_try_decode :: proc(src: []byte, out: ^Buf) -> (status: int, consumed: int) {
+Chunk_Emit :: #type proc(ud: rawptr, chunk: []byte) -> bool
+
+chunked_try_decode :: proc(
+	src: []byte,
+	out: ^Buf,
+	emit: Chunk_Emit = nil,
+	ud: rawptr = nil,
+) -> (status: int, consumed: int) {
+	// stall is the "need more data" exit. It reports the processed prefix as
+	// consumed when chunks have already been handed out.
+	stall :: proc(pos: int, emit: Chunk_Emit) -> (int, int) {
+		if emit != nil {
+			return 0, pos
+		}
+		return 0, 0
+	}
+
 	pos := 0
 	for {
+		// line_start is where this chunk's size line begins. A stall while the
+		// chunk *data* is still incomplete must report this position, not the
+		// data start: the caller drops what was reported, and re-entering at
+		// the data start would read the first CRLF inside the payload as the
+		// next size line.
+		line_start := pos
 		nl := bytes_index(src[pos:], "\r\n")
 		if nl < 0 {
-			return 0, 0
+			return stall(pos, emit)
 		}
 		size_line := string(src[pos : pos + nl])
 		semi := string_index_byte(size_line, ';')
@@ -123,25 +149,31 @@ chunked_try_decode :: proc(src: []byte, out: ^Buf) -> (status: int, consumed: in
 			for {
 				nl2 := bytes_index(src[pos:], "\r\n")
 				if nl2 < 0 {
-					return 0, 0
+					return stall(line_start, emit)
 				}
 				if nl2 == 0 {
 					return 1, pos + 2
 				}
 				pos += nl2 + 2
 				if pos > len(src) {
-					return 0, 0
+					return stall(line_start, emit)
 				}
 			}
 		}
 
 		if pos + size + 2 > len(src) {
-			return 0, 0
+			return stall(line_start, emit)
 		}
 		if src[pos + size] != '\r' || src[pos + size + 1] != '\n' {
 			return -1, 0
 		}
-		buf_append(out, src[pos : pos + size])
+		if emit != nil {
+			if !emit(ud, src[pos : pos + size]) {
+				return -2, pos
+			}
+		} else {
+			buf_append(out, src[pos : pos + size])
+		}
 		pos += size + 2
 	}
 }

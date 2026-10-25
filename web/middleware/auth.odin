@@ -1,7 +1,9 @@
-package web
+package middleware
 
+import ".."
 import "core:encoding/base64"
 import "core:mem"
+
 
 /*
 Authentication middleware, and the principal it installs on the request.
@@ -41,7 +43,7 @@ Auth_Token :: struct {
 // request_principal returns the identity installed by the auth middleware
 // (basic auth user name, bearer/API-key token name); empty when the request
 // is unauthenticated or no auth middleware runs on this route.
-request_principal :: proc(r: ^Request) -> string {
+request_principal :: proc(r: ^web.Request) -> string {
 	return r.principal
 }
 
@@ -80,28 +82,28 @@ secure_eq :: proc(a, b: string) -> bool {
 // auth_quote wraps a value as an RFC 7230 quoted-string: '"' and '\' are
 // escaped, everything else is left alone (the header is ASCII by contract).
 auth_quote :: proc(value: string, allocator: mem.Allocator) -> string {
-	b: Buf
-	buf_init(&b, allocator)
-	defer buf_destroy(&b)
-	buf_append_byte(&b, '"')
+	b: web.Buf
+	web.buf_init(&b, allocator)
+	defer web.buf_destroy(&b)
+	web.buf_append_byte(&b, '"')
 	for i in 0..<len(value) {
 		c := value[i]
 		if c == '"' || c == '\\' {
-			buf_append_byte(&b, '\\')
+			web.buf_append_byte(&b, '\\')
 		}
-		buf_append_byte(&b, c)
+		web.buf_append_byte(&b, c)
 	}
-	buf_append_byte(&b, '"')
-	return clone_string(string(buf_slice(&b)), allocator)
+	web.buf_append_byte(&b, '"')
+	return web.clone_string(string(web.buf_slice(&b)), allocator)
 }
 
 // auth_bearer_value extracts the credentials of "Authorization: Bearer x".
 auth_bearer_value :: proc(header: string) -> (token: string, ok: bool) {
-	v := trim_ows(header)
-	if len(v) < 7 || !eq_ignore_case(v[:7], "Bearer ") {
+	v := web.trim_ows(header)
+	if len(v) < 7 || !web.eq_ignore_case(v[:7], "Bearer ") {
 		return "", false
 	}
-	token = trim_ows(v[7:])
+	token = web.trim_ows(v[7:])
 	return token, len(token) > 0
 }
 
@@ -119,16 +121,16 @@ Basic_Auth_Config :: struct {
 	realm:    string, // default "restricted"
 }
 
-middleware_basic_auth :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_basic_auth :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^Basic_Auth_Config) m.ud
 	if cfg == nil || len(cfg.username) == 0 {
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
-	if v, ok := request_header(req, "Authorization"); ok {
+	if v, ok := web.request_header(req, "Authorization"); ok {
 		if basic_auth_ok(v, cfg.username, cfg.password) {
 			req.principal = cfg.username
-			router_next(r, idx + 1, final, req, res)
+			web.router_next(r, idx + 1, final, req, res)
 			return
 		}
 	}
@@ -137,13 +139,13 @@ middleware_basic_auth :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handl
 	if len(cfg.realm) > 0 {
 		realm = cfg.realm
 	}
-	alloc := response_allocator(res)
-	response_set_header(res, "WWW-Authenticate", concat_strings({"Basic realm=", auth_quote(realm, alloc)}, alloc))
-	response_error(res, .Unauthorized, "")
+	alloc := web.response_allocator(res)
+	web.response_set_header(res, "WWW-Authenticate", web.concat_strings({"Basic realm=", auth_quote(realm, alloc)}, alloc))
+	web.response_error(res, .Unauthorized, "")
 }
 
 basic_auth_ok :: proc(header, username, password: string) -> bool {
-	if len(header) < 7 || !eq_ignore_case(header[:6], "Basic ") {
+	if len(header) < 7 || !web.eq_ignore_case(header[:6], "Basic ") {
 		return false
 	}
 	raw, err := base64.decode(header[6:], allocator = context.allocator)
@@ -153,7 +155,7 @@ basic_auth_ok :: proc(header, username, password: string) -> bool {
 	defer delete(raw)
 
 	creds := string(raw)
-	colon := string_index_byte(creds, ':')
+	colon := web.string_index_byte(creds, ':')
 	if colon < 0 {
 		return false
 	}
@@ -175,20 +177,20 @@ Bearer_Auth_Config :: struct {
 	realm:  string, // default "api"
 }
 
-middleware_bearer_auth :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_bearer_auth :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^Bearer_Auth_Config) m.ud
 	if cfg == nil || len(cfg.tokens) == 0 {
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 
 	presented := ""
 	have_credentials := false
-	if v, ok := request_header(req, "Authorization"); ok {
+	if v, ok := web.request_header(req, "Authorization"); ok {
 		if tok, tok_ok := auth_bearer_value(v); tok_ok {
 			presented = tok
 			have_credentials = true
-		} else if len(trim_ows(v)) > 0 {
+		} else if len(web.trim_ows(v)) > 0 {
 			// some other scheme was offered: answer with a Bearer challenge
 			have_credentials = true
 		}
@@ -196,7 +198,7 @@ middleware_bearer_auth :: proc(m: ^Middleware, r: ^Router, idx: int, final: Hand
 
 	if name, ok := auth_token_match(cfg.tokens, presented); ok {
 		req.principal = name
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 
@@ -204,16 +206,16 @@ middleware_bearer_auth :: proc(m: ^Middleware, r: ^Router, idx: int, final: Hand
 	if len(cfg.realm) > 0 {
 		realm = cfg.realm
 	}
-	alloc := response_allocator(res)
+	alloc := web.response_allocator(res)
 	// RFC 6750 section 3: the challenge names the scheme and the realm; an
 	// absent Authorization header gets no `error` code, a rejected one gets
 	// invalid_token.
-	challenge := concat_strings({"Bearer realm=", auth_quote(realm, alloc)}, alloc)
+	challenge := web.concat_strings({"Bearer realm=", auth_quote(realm, alloc)}, alloc)
 	if have_credentials {
-		challenge = concat_strings({challenge, ", error=\"invalid_token\""}, alloc)
+		challenge = web.concat_strings({challenge, ", error=\"invalid_token\""}, alloc)
 	}
-	response_set_header(res, "WWW-Authenticate", challenge)
-	response_error(res, .Unauthorized, "")
+	web.response_set_header(res, "WWW-Authenticate", challenge)
+	web.response_error(res, .Unauthorized, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -239,10 +241,10 @@ API_Key_Config :: struct {
 	realm:  string,
 }
 
-middleware_api_key :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_api_key :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^API_Key_Config) m.ud
 	if cfg == nil || len(cfg.tokens) == 0 {
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 
@@ -251,18 +253,18 @@ middleware_api_key :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler,
 		header = cfg.header
 	}
 	presented := ""
-	if v, ok := request_header(req, header); ok {
-		presented = trim_ows(v)
+	if v, ok := web.request_header(req, header); ok {
+		presented = web.trim_ows(v)
 	}
 	if len(presented) == 0 && len(cfg.query) > 0 {
-		if v, ok := request_query(req, cfg.query); ok {
+		if v, ok := web.request_query(req, cfg.query); ok {
 			presented = v
 		}
 	}
 
 	if name, ok := auth_token_match(cfg.tokens, presented); ok {
 		req.principal = name
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 
@@ -270,7 +272,7 @@ middleware_api_key :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler,
 	if len(cfg.realm) > 0 {
 		realm = cfg.realm
 	}
-	alloc := response_allocator(res)
-	response_set_header(res, "WWW-Authenticate", concat_strings({"ApiKey realm=", auth_quote(realm, alloc)}, alloc))
-	response_error(res, .Unauthorized, "")
+	alloc := web.response_allocator(res)
+	web.response_set_header(res, "WWW-Authenticate", web.concat_strings({"ApiKey realm=", auth_quote(realm, alloc)}, alloc))
+	web.response_error(res, .Unauthorized, "")
 }

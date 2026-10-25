@@ -27,6 +27,12 @@ Stats :: struct {
 	requests:     u64,
 	bytes_in:     u64,
 	bytes_out:    u64,
+	// TLS accounting. tls_handshakes counts completed handshakes and
+	// tls_resumed the subset that skipped the key exchange, so
+	// `tls_resumed / tls_handshakes` is the resumption rate - 0 means the
+	// cache or the tickets are not working.
+	tls_handshakes: u64,
+	tls_resumed:    u64,
 }
 
 /*
@@ -70,6 +76,23 @@ Server :: struct {
 
 	on_conn_open:  Conn_Event,
 	on_conn_close: Conn_Event,
+
+	// on_head runs on the event loop thread after a request head is parsed
+	// and before its body is read. It is the last point at which the body
+	// can be diverted - `upload_sink_attach` installs a streaming sink here
+	// (see upload.odin) - and the framing is already known, so a hook can
+	// decide based on Content-Length or Content-Type.
+	//
+	// Returning false aborts the request: the hook must have queued a
+	// response itself (conn_error does), and the body is never read.
+	on_head:    proc(s: ^Server, c: ^Conn, ud: rawptr) -> bool,
+	on_head_ud: rawptr,
+
+	// on_tick runs on the event loop thread every SWEEP_INTERVAL, before the
+	// idle sweep. It is the hook for maintenance that needs the loop: proxy
+	// health probes, cache expiry, metrics that must be sampled from the
+	// thread that owns the state.
+	on_tick: proc(s: ^Server),
 
 	// on_stop runs on the event loop thread once the loop has stopped,
 	// while the loop is still usable. It is the place to release resources
@@ -229,6 +252,10 @@ on_sweep :: proc(op: ^nbio.Operation, s: ^Server) {
 	s.sweep_op = nil
 	if server_should_stop(s) {
 		return
+	}
+
+	if s.on_tick != nil {
+		s.on_tick(s)
 	}
 
 	now := nbio.now()

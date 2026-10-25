@@ -1,6 +1,7 @@
 package web
 
 import "core:mem"
+import "core:strings"
 
 /*
 Router is lighttpd2's "action stack + condition evaluation" idea, expressed
@@ -10,10 +11,25 @@ handler. No closures are needed - middleware continues via `router_next`
 with an explicit index.
 */
 Router :: struct {
-	routes:      [dynamic]Route,
+	// routes holds pointers, not values: appending to the table must not
+	// move the routes themselves, because `router_add` hands a `^Route` to
+	// the caller and `router_use_route` keeps writing to it long after.
+	routes:      [dynamic]^Route,
 	middlewares: [dynamic]Middleware,
 	allocator:   mem.Allocator,
 	not_found:   Handler,
+	// rewrites are applied to the request path before the route table is
+	// consulted (see router_rewrite).
+	rewrites:    [dynamic]Rewrite,
+}
+
+// Rewrite is one internal rewrite rule: a request path that starts with
+// `from` (at a segment boundary) is served as if it had started with `to`.
+// `exact` makes it a whole-path match instead of a prefix one.
+Rewrite :: struct {
+	from:  string,
+	to:    string,
+	exact: bool,
 }
 
 Route :: struct {
@@ -38,17 +54,23 @@ Middleware_Proc :: #type proc(m: ^Middleware, r: ^Router, idx: int, final: Handl
 
 router_init :: proc(r: ^Router, allocator := context.allocator) {
 	r.allocator = allocator
-	r.routes = make([dynamic]Route, allocator)
+	r.routes = make([dynamic]^Route, allocator)
 	r.middlewares = make([dynamic]Middleware, allocator)
+	r.rewrites = make([dynamic]Rewrite, allocator)
 }
 
 router_destroy :: proc(r: ^Router) {
 	if r.routes != nil {
 		for i in 0..<len(r.routes) {
-			if r.routes[i].middlewares != nil {
-				delete(r.routes[i].middlewares)
-				r.routes[i].middlewares = nil
+			route := r.routes[i]
+			if route == nil {
+				continue
 			}
+			if route.middlewares != nil {
+				delete(route.middlewares)
+				route.middlewares = nil
+			}
+			free(route, r.allocator)
 		}
 		delete(r.routes)
 		r.routes = nil
@@ -57,16 +79,85 @@ router_destroy :: proc(r: ^Router) {
 		delete(r.middlewares)
 		r.middlewares = nil
 	}
+	if r.rewrites != nil {
+		delete(r.rewrites)
+		r.rewrites = nil
+	}
+}
+
+/*
+router_rewrite registers an internal rewrite: the request path is changed
+before the route table sees it, and nothing is sent to the client. That is
+what makes it different from middleware_redirect - no second request, no
+address-bar change, the client cannot tell.
+
+	router_rewrite(&r, "/old", "/new")         // /old/x/y -> /new/x/y
+	router_rewrite(&r, "/favicon.ico", "/static/favicon.ico", true)
+
+Rules are tried in registration order and the first match wins, so register
+the specific ones first. Matching is segment-aware: "/old" does not rewrite
+"/older". The query string is untouched - it is parsed out of the target
+before this runs.
+*/
+router_rewrite :: proc(r: ^Router, from, to: string, exact := false) {
+	append(&r.rewrites, Rewrite{from = from, to = to, exact = exact})
+}
+
+// router_apply_rewrites rewrites `req.path` in place. The new path is
+// allocated on the connection arena, so it dies with the request.
+router_apply_rewrites :: proc(r: ^Router, req: ^Request) {
+	if len(r.rewrites) == 0 {
+		return
+	}
+	path := req.path
+	for rule in r.rewrites {
+		if len(rule.from) == 0 {
+			continue
+		}
+		if rule.exact {
+			if path == rule.from {
+				req.path = concat_strings({rule.to}, request_allocator(req))
+				return
+			}
+			continue
+		}
+		if !rewrite_prefix_matches(path, rule.from) {
+			continue
+		}
+		rest := path[len(rule.from):]
+		req.path = concat_strings({rule.to, rest}, request_allocator(req))
+		return
+	}
+}
+
+// rewrite_prefix_matches reports whether `path` starts with `from` at a
+// segment boundary: "/old" matches "/old" and "/old/x", not "/older".
+rewrite_prefix_matches :: proc(path, from: string) -> bool {
+	if len(path) < len(from) {
+		return false
+	}
+	if !strings.has_prefix(path, from) {
+		return false
+	}
+	if len(path) == len(from) {
+		return true
+	}
+	if from[len(from) - 1] == '/' {
+		return true
+	}
+	return path[len(from)] == '/'
 }
 
 router_add :: proc(r: ^Router, method: Method, pattern: string, handler: Handler) -> ^Route {
-	append(&r.routes, Route {
-		method      = method,
-		pattern     = pattern,
-		handler     = handler,
-		middlewares = make([dynamic]Middleware, r.allocator),
-	})
-	return &r.routes[len(r.routes) - 1]
+	// The route is heap-allocated and only its pointer goes in the table, so
+	// the pointer stays valid however many routes are added afterwards.
+	route := new(Route, r.allocator)
+	route.method = method
+	route.pattern = pattern
+	route.handler = handler
+	route.middlewares = make([dynamic]Middleware, r.allocator)
+	append(&r.routes, route)
+	return route
 }
 
 router_get :: proc(r: ^Router, pattern: string, handler: Handler) -> ^Route {
@@ -119,9 +210,11 @@ handler. This is what makes a purpose-built middleware usable on a single
 endpoint - auth in front of /admin, a form parser on /upload - without
 guarding inside the handler.
 
-`route` is the pointer a `router_*` registration call returned. Register the
-route, attach its middlewares right away, and only then add more routes:
-appending to the route table can move it, which would invalidate the pointer.
+`route` is the pointer a `router_*` registration call returned. Routes live on
+the heap and the table only stores pointers, so that pointer stays valid no
+matter how many routes are added afterwards: register the whole table first
+and attach its middleware in a second pass, or attach as you go - both are
+fine.
 */
 router_use_route :: proc(route: ^Route, m: Middleware_Proc, ud: rawptr = nil) {
 	append(&route.middlewares, Middleware{proc_ = m, ud = ud})
@@ -143,6 +236,8 @@ router_handle :: proc(req: ^Request, res: ^Response) {
 		response_write_string(res, "500 router not configured\n")
 		return
 	}
+
+	router_apply_rewrites(r, req)
 
 	route, method_ok := router_match(r, req, conn_scratch(req.conn))
 	switch {
@@ -232,7 +327,7 @@ router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (ro
 
 	// first pass: method + path (.All routes accept any request method)
 	for i in 0..<len(r.routes) {
-		candidate := &r.routes[i]
+		candidate := r.routes[i]
 		if candidate.method != req.method && candidate.method != .All {
 			continue
 		}
@@ -250,7 +345,7 @@ router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (ro
 	// body (it keeps the length the GET would have had).
 	if req.method == .Head {
 		for i in 0..<len(r.routes) {
-			candidate := &r.routes[i]
+			candidate := r.routes[i]
 			if candidate.method != .Get {
 				continue
 			}
@@ -266,7 +361,7 @@ router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (ro
 
 	// second pass: path only, for the 405 answer
 	for i in 0..<len(r.routes) {
-		candidate := &r.routes[i]
+		candidate := r.routes[i]
 		clear(&params)
 		clear(&captures)
 		if path_match(candidate.pattern, req.path, &params, &captures) {

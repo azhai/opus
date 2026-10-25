@@ -1,8 +1,10 @@
-package web
+package middleware
 
+import ".."
 import "core:mem"
 import "core:sync"
 import "core:time"
+
 
 /*
 Common middleware, in the shape the router already supports: a
@@ -42,14 +44,14 @@ REQUEST_ID_HEADER :: "X-Request-Id"
 // middleware_request_id installs a request id: reuse the inbound
 // X-Request-Id when present, else generate one, store it on the request and
 // echo it back in the response.
-middleware_request_id :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	id, ok := request_header(req, REQUEST_ID_HEADER)
+middleware_request_id :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
+	id, ok := web.request_header(req, REQUEST_ID_HEADER)
 	if !ok || len(id) == 0 {
-		id = new_request_id(request_allocator(req))
+		id = new_request_id(web.request_allocator(req))
 	}
 	req.id = id
-	response_set_header(res, REQUEST_ID_HEADER, id)
-	router_next(r, idx + 1, final, req, res)
+	web.response_set_header(res, REQUEST_ID_HEADER, id)
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 @(private = "file")
@@ -88,19 +90,19 @@ write_hex_padded :: proc(dst: []byte, value: u64) {
 // so registering middleware_request_id first makes the log lines
 // correlatable and an auth middleware further down the chain labels who
 // made the request.
-middleware_logger :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_logger :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	start := time.now()
-	router_next(r, idx + 1, final, req, res)
+	web.router_next(r, idx + 1, final, req, res)
 	elapsed := time.duration_microseconds(time.since(start)) / 1000
-	log_info(
+	web.log_info(
 		"[web] %d %s %s %dB %.3fms id=%s ip=%s user=%s",
 		int(res.status),
-		method_string(req.method),
+		web.method_string(req.method),
 		req.path,
-		response_body_size(res),
+		web.response_body_size(res),
 		elapsed,
 		req.id,
-		request_client_ip(req),
+		web.request_client_ip(req),
 		req.principal,
 	)
 }
@@ -128,40 +130,40 @@ Secure_Headers_Config :: struct {
 	strict_transport_security: string, // e.g. "max-age=31536000"
 }
 
-middleware_secure_headers :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_secure_headers :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^Secure_Headers_Config) m.ud
 	if cfg == nil {
-		response_set_header(res, "X-Content-Type-Options", "nosniff")
-		response_set_header(res, "X-Frame-Options", "SAMEORIGIN")
-		response_set_header(res, "Referrer-Policy", "no-referrer")
+		web.response_set_header(res, "X-Content-Type-Options", "nosniff")
+		web.response_set_header(res, "X-Frame-Options", "SAMEORIGIN")
+		web.response_set_header(res, "Referrer-Policy", "no-referrer")
 	} else {
 		if len(cfg.content_type_options) > 0 {
-			response_set_header(res, "X-Content-Type-Options", cfg.content_type_options)
+			web.response_set_header(res, "X-Content-Type-Options", cfg.content_type_options)
 		}
 		if len(cfg.frame_options) > 0 {
-			response_set_header(res, "X-Frame-Options", cfg.frame_options)
+			web.response_set_header(res, "X-Frame-Options", cfg.frame_options)
 		}
 		if len(cfg.referrer_policy) > 0 {
-			response_set_header(res, "Referrer-Policy", cfg.referrer_policy)
+			web.response_set_header(res, "Referrer-Policy", cfg.referrer_policy)
 		}
 		if len(cfg.content_security_policy) > 0 {
-			response_set_header(res, "Content-Security-Policy", cfg.content_security_policy)
+			web.response_set_header(res, "Content-Security-Policy", cfg.content_security_policy)
 		}
 		if len(cfg.strict_transport_security) > 0 {
-			response_set_header(res, "Strict-Transport-Security", cfg.strict_transport_security)
+			web.response_set_header(res, "Strict-Transport-Security", cfg.strict_transport_security)
 		}
 	}
-	router_next(r, idx + 1, final, req, res)
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 // middleware_no_cache marks the response as non-storable. Register it on the
 // routes that must never be cached (authenticated pages, JSON APIs feeding a
 // UI); static assets should not carry it.
-middleware_no_cache :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	response_set_header(res, "Cache-Control", "no-store, no-cache, must-revalidate")
-	response_set_header(res, "Pragma", "no-cache")
-	response_set_header(res, "Expires", "0")
-	router_next(r, idx + 1, final, req, res)
+middleware_no_cache :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
+	web.response_set_header(res, "Cache-Control", "no-store, no-cache, must-revalidate")
+	web.response_set_header(res, "Pragma", "no-cache")
+	web.response_set_header(res, "Expires", "0")
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -186,18 +188,18 @@ CORS_Config :: struct {
 	allow_credentials: bool,
 }
 
-middleware_cors :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_cors :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^CORS_Config) m.ud
-	origin, _ := request_header(req, "Origin")
+	origin, _ := web.request_header(req, "Origin")
 	if len(origin) == 0 {
 		// not a cross-origin request: nothing to negotiate
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 	if !cors_origin_allowed(cfg, origin) {
 		// A disallowed origin gets no CORS headers at all; the request is
 		// still served, the browser is what refuses to hand it to script.
-		router_next(r, idx + 1, final, req, res)
+		web.router_next(r, idx + 1, final, req, res)
 		return
 	}
 
@@ -213,49 +215,49 @@ middleware_cors :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, re
 	cred := cfg != nil && cfg.allow_credentials
 	if any_origin && !cred {
 		// The wildcard form is only legal without credentials.
-		response_set_header(res, "Access-Control-Allow-Origin", "*")
+		web.response_set_header(res, "Access-Control-Allow-Origin", "*")
 	} else {
-		response_set_header(res, "Access-Control-Allow-Origin", origin)
-		response_add_header(res, "Vary", "Origin")
+		web.response_set_header(res, "Access-Control-Allow-Origin", origin)
+		web.response_add_header(res, "Vary", "Origin")
 	}
 	if cred {
-		response_set_header(res, "Access-Control-Allow-Credentials", "true")
+		web.response_set_header(res, "Access-Control-Allow-Credentials", "true")
 	}
 
-	requested_method, preflight := request_header(req, "Access-Control-Request-Method")
+	requested_method, preflight := web.request_header(req, "Access-Control-Request-Method")
 	if req.method == .Options && preflight && len(requested_method) > 0 {
 		methods := "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 		if cfg != nil && len(cfg.allow_methods) > 0 {
 			methods = cfg.allow_methods
 		}
-		response_set_header(res, "Access-Control-Allow-Methods", methods)
+		web.response_set_header(res, "Access-Control-Allow-Methods", methods)
 
 		headers := ""
 		if cfg != nil {
 			headers = cfg.allow_headers
 		}
 		if len(headers) == 0 {
-			headers, _ = request_header(req, "Access-Control-Request-Headers")
+			headers, _ = web.request_header(req, "Access-Control-Request-Headers")
 		}
 		if len(headers) > 0 {
-			response_set_header(res, "Access-Control-Allow-Headers", headers)
+			web.response_set_header(res, "Access-Control-Allow-Headers", headers)
 		}
 		if cfg != nil && cfg.max_age_secs > 0 {
-			response_set_header(
+			web.response_set_header(
 				res,
 				"Access-Control-Max-Age",
-				int_to_string(i64(cfg.max_age_secs), response_allocator(res)),
+				web.int_to_string(i64(cfg.max_age_secs), web.response_allocator(res)),
 			)
 		}
 		// The preflight answer is complete: do not run the route.
-		response_no_content(res, .No_Content)
+		web.response_no_content(res, .No_Content)
 		return
 	}
 
 	if cfg != nil && len(cfg.expose_headers) > 0 {
-		response_set_header(res, "Access-Control-Expose-Headers", cfg.expose_headers)
+		web.response_set_header(res, "Access-Control-Expose-Headers", cfg.expose_headers)
 	}
-	router_next(r, idx + 1, final, req, res)
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 cors_origin_allowed :: proc(cfg: ^CORS_Config, origin: string) -> bool {
@@ -263,7 +265,7 @@ cors_origin_allowed :: proc(cfg: ^CORS_Config, origin: string) -> bool {
 		return true
 	}
 	for o in cfg.origins {
-		if o == "*" || eq_ignore_case(o, origin) {
+		if o == "*" || web.eq_ignore_case(o, origin) {
 			return true
 		}
 	}
@@ -286,10 +288,10 @@ body. The SSE helpers in `sse.odin` write their own head, so they set the
 same fields themselves; this middleware is for the responses that go
 through the normal write path.
 */
-middleware_no_buffer :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
-	response_set_header(res, "Cache-Control", "no-cache, no-transform")
-	response_set_header(res, "X-Accel-Buffering", "no")
-	router_next(r, idx + 1, final, req, res)
+middleware_no_buffer :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
+	web.response_set_header(res, "Cache-Control", "no-cache, no-transform")
+	web.response_set_header(res, "X-Accel-Buffering", "no")
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,19 +308,19 @@ Body_Limit_Config :: struct {
 // by checking Content-Length. A chunked body carries no length up front and
 // is only bounded by Server.max_body_size, so this is a fast rejection for
 // the common case, not the last line of defence.
-middleware_body_limit :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
+middleware_body_limit :: proc(m: ^web.Middleware, r: ^web.Router, idx: int, final: web.Handler, req: ^web.Request, res: ^web.Response) {
 	cfg := cast(^Body_Limit_Config) m.ud
 	limit := DEFAULT_BODY_LIMIT
 	if cfg != nil && cfg.max_bytes > 0 {
 		limit = cfg.max_bytes
 	}
-	if v, ok := request_header(req, "Content-Length"); ok {
-		if n, parsed := parse_i64(trim_ows(v)); parsed && n > i64(limit) {
-			response_error(res, .Payload_Too_Large, "")
+	if v, ok := web.request_header(req, "Content-Length"); ok {
+		if n, parsed := parse_i64(web.trim_ows(v)); parsed && n > i64(limit) {
+			web.response_error(res, .Payload_Too_Large, "")
 			return
 		}
 	}
-	router_next(r, idx + 1, final, req, res)
+	web.router_next(r, idx + 1, final, req, res)
 }
 
 // parse_i64 parses a non-negative decimal integer; HTTP Content-Length never

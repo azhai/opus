@@ -345,19 +345,36 @@ compress_apply :: proc(f: ^Filter, c: ^Conn) {
 	if w.status == .No_Content || w.status == .Not_Modified {
 		return
 	}
-	if len(w.body.data) < cf.min_size {
+	// .Deny is the route-level "never code this" (streams, pre-coded assets)
+	if w.compress == .Deny {
+		return
+	}
+	force := w.compress == .Force
+	min_size := cf.min_size
+	if w.compress_min > 0 {
+		min_size = w.compress_min
+	}
+	if !force && len(w.body.data) < min_size {
 		return
 	}
 	if _, ok := response_header(w, "Content-Encoding"); ok {
 		return // already coded: never double-code
 	}
 	ct, has_ct := response_header(w, "Content-Type")
-	if !has_ct || !content_type_compressible(ct) {
+	if !force && (!has_ct || !content_type_compressible(ct)) {
 		return
 	}
 	ae, ok := request_header(&c.req, "Accept-Encoding")
 	if !ok {
 		return
+	}
+
+	// The body of this response now depends on Accept-Encoding, so a shared
+	// cache has to key on it - whether or not this particular request ends
+	// up coded. Adding it before the decision is what keeps an identity
+	// response from being served to a client that would have got gzip.
+	if !response_has_vary(w, "Accept-Encoding") {
+		response_add_header(w, "Vary", "Accept-Encoding")
 	}
 
 	encoding := ""
@@ -381,7 +398,32 @@ compress_apply :: proc(f: ^Filter, c: ^Conn) {
 	// the body changed length: any handler-set Content-Length is stale
 	response_remove_header(w, "Content-Length")
 	response_set_header(w, "Content-Encoding", encoding)
-	response_add_header(w, "Vary", "Accept-Encoding")
+}
+
+// response_has_vary reports whether `token` is already one of the values of
+// the response's Vary header(s). Vary may be sent as several field lines, so
+// every one is checked.
+response_has_vary :: proc(w: ^Response, token: string) -> bool {
+	for h in w.headers {
+		if !eq_ignore_case(h.key, "Vary") {
+			continue
+		}
+		v := h.value
+		for len(v) > 0 {
+			end := string_index_byte(v, ',')
+			item := v
+			if end >= 0 {
+				item = v[:end]
+				v = v[end + 1:]
+			} else {
+				v = ""
+			}
+			if eq_ignore_case(trim_ows(item), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // response_remove_header drops every header with the given key.

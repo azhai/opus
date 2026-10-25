@@ -89,6 +89,7 @@ Status :: enum u16 {
 	See_Other           = 303,
 	Not_Modified        = 304,
 	Temporary_Redirect  = 307,
+	Permanent_Redirect  = 308,
 	Bad_Request         = 400,
 	Unauthorized        = 401,
 	Forbidden           = 403,
@@ -132,6 +133,8 @@ status_text :: proc(s: Status) -> string {
 		return "Not Modified"
 	case .Temporary_Redirect:
 		return "Temporary Redirect"
+	case .Permanent_Redirect:
+		return "Permanent Redirect"
 	case .Bad_Request:
 		return "Bad Request"
 	case .Unauthorized:
