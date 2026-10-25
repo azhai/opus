@@ -103,6 +103,16 @@ conn_scratch :: proc(c: ^Conn) -> mem.Allocator {
 	return mem.dynamic_arena_allocator(&c.scratch)
 }
 
+/*
+conn_allocator exposes the connection's scratch allocator. The response is
+serialized *after* the handler returns, so header strings a handler hands
+over must outlive the handler call; clone them with this allocator (it is
+released when the request is done, together with the rest of the scratch).
+*/
+conn_allocator :: proc(c: ^Conn) -> mem.Allocator {
+	return conn_scratch(c)
+}
+
 conn_new :: proc(s: ^Server, socket: net.TCP_Socket, remote: net.Endpoint) -> ^Conn {
 	c := new(Conn, s.allocator)
 	c.server = s
@@ -208,6 +218,14 @@ conn_drive :: proc(c: ^Conn) {
 			}
 		case .Process:
 			conn_process(c)
+			if c.state == .Closed {
+				// the handler released the connection (response_hijack):
+				// the socket is no longer ours and nothing is left to
+				// drive, so free the Conn here — the loop must not touch
+				// it again
+				conn_destroy(c)
+				return
+			}
 		case .Proxy:
 			// parked: an upstream request is in flight; its callbacks
 			// drive the machine onwards
@@ -278,7 +296,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 
 	decoded, _ := url_decode_path(req.path, conn_scratch(c))
 	req.path = decoded
-	if !path_is_safe(req.path) {
+	if !path_prefix_ok(req.path) {
 		conn_error(c, .Bad_Request, "400 bad request\n")
 		return true
 	}
@@ -492,9 +510,11 @@ conn_process :: proc(c: ^Conn) {
 		response_write_string(w, "404 page not found\n")
 	}
 
-	if c.state == .Proxy {
-		// the handler hijacked the connection into proxy mode; the
-		// upstream callbacks take it from here
+	if c.state == .Proxy || c.state == .Closed {
+		// Proxy: the handler hijacked the connection into proxy mode; the
+		// upstream callbacks take it from here.
+		// Closed: the handler released the connection (response_hijack) and
+		// owns the socket now; nothing is serialized on this Conn.
 		return
 	}
 
@@ -709,10 +729,23 @@ parse_error_status :: proc(e: Parse_Error) -> Status {
 }
 
 path_is_safe :: proc(p: string) -> bool {
-	if len(p) == 0 || p[0] != '/' {
+	if !path_prefix_ok(p) {
 		return false
 	}
 	if string_index(p, "..") >= 0 {
+		return false
+	}
+	return true
+}
+
+// path_prefix_ok rejects what every request must satisfy regardless of how it
+// will be routed: a leading slash and no control characters (a decoded NUL
+// would truncate filesystem paths). Traversal ("..") is a *filesystem* policy
+// and is enforced where paths are actually mapped onto files
+// (static_resolve_path) — application handlers see the decoded path and can
+// reject it with their own status, which is what molly's URI layer does.
+path_prefix_ok :: proc(p: string) -> bool {
+	if len(p) == 0 || p[0] != '/' {
 		return false
 	}
 	for i in 0..<len(p) {

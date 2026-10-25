@@ -2,6 +2,7 @@ package web
 
 import "core:mem"
 import "core:nbio"
+import "core:net"
 import "core:os"
 import "core:time"
 
@@ -166,6 +167,44 @@ response_redirect :: proc(w: ^Response, location: string, code: Status = .Found)
 
 file_pending :: proc(w: ^Response) -> bool {
 	return w.file_open
+}
+
+/*
+response_hijack hands the connection's socket to the handler and detaches
+the connection from the server: no response is built, no further bytes are
+read, and the server will not close it. `false` means the connection is
+already gone (or was never owned by a server, e.g. in unit tests).
+
+The escape hatch exists for long-lived streaming responses (SSE) that
+cannot be produced inside a single handler call. Ownership of the socket
+moves to the caller, which must close it; the request/response buffers are
+freed when the handler returns, so anything that must outlive the call has
+to be copied first.
+*/
+response_hijack :: proc(w: ^Response) -> (socket: net.TCP_Socket, ok: bool) {
+	c := w.conn
+	if c == nil || c.closed || c.server == nil {
+		return {}, false
+	}
+	s := c.server
+	if c.op != nil {
+		nbio.remove(c.op)
+		c.op = nil
+	}
+	for i in 0..<len(s.conns) {
+		if s.conns[i] == c {
+			unordered_remove(&s.conns, i)
+			break
+		}
+	}
+	s.stats.conns_active = len(s.conns)
+
+	socket = c.socket
+	c.socket = {}
+	c.closing = true
+	c.closed = true
+	c.state = .Closed
+	return socket, true
 }
 
 // response_build serializes status line + headers (and the body, unless a
