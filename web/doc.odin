@@ -119,9 +119,13 @@ What you get:
     (SSL_CTX session cache plus TLS 1.3 tickets) is on by default;
     `Stats.tls_handshakes` / `Stats.tls_resumed` report the ratio.
   - Multi-acceptor mode: `server_run_multi` starts one `Server` per
-    thread, each with its own event loop and its own SO_REUSEPORT
-    listener on the same address, so accept/read/write parallelize
-    across cores without any locking in the library.
+    thread, each with its own event loop, all serving one address, so
+    accept/read/write parallelize across cores without any locking in
+    the library. How the address is shared is platform specific:
+    Linux gives each acceptor its own SO_REUSEPORT socket (the kernel
+    hashes the 4-tuple), macOS/BSD share one listening fd because
+    SO_REUSEPORT there sends every connection to a single listener.
+    Either way the connection is the unit of distribution.
   - Per-connection arena allocation: all per-request scratch memory is
     freed in one shot between keep-alive requests.
 

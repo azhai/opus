@@ -728,13 +728,17 @@ test_integration_multi_acceptor :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, total == 30, "servers handled %d requests, expected 30", total)
-	// Linux hashes the 4-tuple over the SO_REUSEPORT group, so a run of
-	// distinct client ports lands on more than one acceptor. macOS accepts
-	// the option but hands every connection to the most recently bound
-	// listener, so there is nothing to assert there.
-	when ODIN_OS == .Linux {
-		testing.expectf(t, spread > 1, "all requests went to %d server(s): reuse_port not in effect", spread)
-	}
+	// Either mechanism has to spread: Linux hashes the 4-tuple over the
+	// SO_REUSEPORT group, macOS wakes whichever loop is waiting on the shared
+	// fd. The macOS split is a race rather than a hash, but with 30
+	// connections one acceptor winning all of them would mean the other loops
+	// are not in accept at all.
+	testing.expectf(
+		t,
+		spread > 1,
+		"all requests went to %d server(s): the acceptors are not sharing the listener",
+		spread,
+	)
 
 	for i in 0..<COUNT {
 		server_destroy(servers[i])
@@ -742,4 +746,71 @@ test_integration_multi_acceptor :: proc(t: ^testing.T) {
 	}
 	free(args, context.allocator)
 	free(done, context.allocator)
+}
+/*
+test_integration_listener_released pins down a bug found while benchmarking:
+stopping a server left the listening socket open, so the port stayed bound and
+the next server in the same process could not take it. It is easy to miss in
+normal use (the process usually exits) but fatal for restart-in-place and for
+any test that starts two servers on one port.
+*/
+@(test)
+test_integration_listener_released :: proc(t: ^testing.T) {
+	Rel_Args :: struct {
+		srv:  ^Server,
+		addr: string,
+		done: bool,
+	}
+	serve :: proc(th: ^thread.Thread) {
+		a := cast(^Rel_Args) th.data
+		server_run_until(a.srv, &a.done)
+	}
+	start :: proc(port: int) -> (srv: ^Server, args: ^Rel_Args) {
+		args = new(Rel_Args, context.allocator)
+		args.addr = fmt.aprintf("127.0.0.1:%v", port, allocator = context.allocator)
+		args.srv = new(Server, context.allocator)
+		server_init(args.srv, args.addr)
+		args.srv.handler = integration_handler
+		return args.srv, args
+	}
+	wait_listening :: proc(s: ^Server) -> bool {
+		for _ in 0 ..< 400 {
+			if intrinsics.volatile_load(&s.listening) {
+				return true
+			}
+			time.sleep(time.Millisecond)
+		}
+		return false
+	}
+
+	first, a1 := start(0)
+	th := thread.create(serve)
+	th.data = a1
+	thread.start(th)
+	testing.expect(t, wait_listening(first))
+	port := first.bound_port
+	testing.expect(t, port != 0)
+
+	a1.done = true
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect(t, !intrinsics.volatile_load(&first.listening))
+
+	// binding the same port only works if the listener was really closed: the
+	// second server does not set SO_REUSEPORT
+	second, a2 := start(port)
+	th2 := thread.create(serve)
+	th2.data = a2
+	thread.start(th2)
+	testing.expectf(t, wait_listening(second), "port %v was still bound after the server stopped", port)
+	a2.done = true
+	thread.join(th2)
+	thread.destroy(th2)
+
+	for a in ([2]^Rel_Args{a1, a2}) {
+		server_destroy(a.srv)
+		free(a.srv, context.allocator)
+		delete(a.addr, context.allocator)
+		free(a, context.allocator)
+	}
 }

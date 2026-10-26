@@ -191,28 +191,37 @@ odin run examples/threads -- 8 127.0.0.1:8099 10
 
 ## 性能
 
-`bench/` 是随仓库维护的测量工具，不参与库构建：一半是微基准（直接调库函数，  
-逐项报告 ns/op、分配次数与字节数），一半是起真实服务 + 客户端打真实请求（报  
-req/s 与每请求耗时）。两者都必须用 `-o:speed` 编译——默认的调试构建慢一个数量  
-级，量出来的数字没有意义：
+`bench/` 是随仓库维护的测量工具，不参与库构建。五个模式：
 
 ```bash
-odin run bench -o:speed
+odin run bench -o:speed -- 18099 micro       # 微基准：直接调库函数，报 ns/op
+odin run bench -o:speed -- 18099 load        # 单 loop 线程 + 内置流水线客户端
+odin run bench -o:speed -- 18099 multi       # 多 acceptor + 多连接客户端（同进程）
+odin run bench -o:speed -- 18099 serve 6 15  # 只当服务端，等外部客户端打
+odin run bench -o:speed -- 18099 client 2 32 8  # 只当客户端：2 线程 × 32 连接
 ```
 
-### 一次实测（Apple Silicon，单核，环回 TCP）
+必须 `-o:speed`：默认的调试构建慢一个数量级，量出来的数字没有意义。
+
+微基准每项跑 5 轮取最快。这台机器是 4 个性能核 + 6 个能效核，同一项基准连着
+跑两次能差 20%（210 ns 与 253 ns 都出现过），单次读数不是测量结果；最小值才是
+「代码自己的成本」。
+
+### 微基准（Apple M4，环回）
 
 | 微基准 | 耗时 | 分配 |
 | --- | --- | --- |
-| `parse_request`（9 个头 / 240 B） | 262 ns | 1.3 /op |
-| `router_match` 静态路由（120 条表的第 1 / 第 120 条） | 6.1 / 8.0 ns | 0 |
-| `router_match` `:param` 路由 | 157 ns | 1.3 /op |
-| `router_match` 未命中（404 两趟） | 160 ns | 0 |
-| `response_build`（4 KiB JSON + Date） | 254 ns | 6.0 /op |
-| `gzip_compress` 64 KiB JSON | 378 µs（115 MiB/s，压缩比 14.4%） | 2.2 /op |
-| multipart 增量解析（1 MiB part） | 404 µs（2474 MiB/s） | 7.9 /op |
+| `parse_request`（9 个头 / 240 B） | 211 ns | 1.3 /op |
+| `router_match` 静态路由（120 条表的第 1 / 第 120 条） | 6.8 / 7.3 ns | 0 |
+| `router_match` `:param` 路由 | 151 ns | 1.3 /op |
+| `router_match` 未命中（404 两趟） | 149 ns | 0 |
+| `response_build`（4 KiB JSON + Date） | 231 ns | 5.2 /op |
+| `gzip_compress` 64 KiB JSON | 359 µs（122 MiB/s，压缩比 14.4%） | 2.4 /op |
+| multipart 增量解析（1 MiB part） | 404 µs（2476 MiB/s） | 8.6 /op |
 
-| 负载（单 loop 线程） | 吞吐 | 每请求 |
+### 单核（一个 loop 线程）
+
+| 负载 | 吞吐 | 每请求 |
 | --- | --- | --- |
 | pipelined 静态路由（512 深度） | 1.3 M req/s | 0.78 µs |
 | pipelined 4 KiB JSON | 261 k req/s | 3.8 µs |
@@ -221,9 +230,59 @@ odin run bench -o:speed
 | 串行 keep-alive（一次一个请求） | 60 k req/s | 17 µs / RTT |
 | sendfile 4 KiB 文件 | 25 k req/s | 40 µs |
 
-pipelined 与串行的差距全部来自系统调用：单个请求的库内 CPU 只有几百纳秒（上面  
-几个微基准之和），而一次 send/recv 在环回上就要一两微秒。结论很直接——优化的  
+pipelined 与串行的差距全部来自系统调用：单个请求的库内 CPU 只有几百纳秒（上面
+几个微基准之和），而一次 send/recv 在环回上就要一两微秒。结论很直接——优化的
 着力点不是「算得更快」，而是「少进出内核、少重复算」。
+
+### 多核（N 个 acceptor 线程）
+
+测法：`serve` 起服务端进程、`client` 另起一个进程打，两侧分别用
+`/usr/bin/time -l` 拿 CPU 时间；热点用 `sample <pid> 6 -file prof.txt` 采（macOS
+自带，符号直接可见，不需要额外装工具）。
+
+客户端 2 线程 × 32 连接 × 每连接 64 个在途请求，服务端 1…6 个 acceptor，总请求数
+取服务端自己的 `stats.requests`（每 server 一份，无跨线程竞争）：
+
+| acceptor | 吞吐 | 伸缩 | 请求分布（max/min） |
+| --- | --- | --- | --- |
+| 1 | 3.18 M req/s | 1.00× | — |
+| 2 | 4.43 M req/s | 1.39× | 94% |
+| 4 | 6.92 M req/s | 2.18× | 82% |
+| 6 | 8.38 M req/s | 2.64× | 53% |
+
+#### 三个坑，都踩过
+
+**1. macOS 的 `SO_REUSEPORT` 不分发。** 4 个 acceptor、100 条并发连接，实测每个
+acceptor 处理 0 / 0 / 0 / 621162 个请求——内核把**所有**连接交给同一个 listener，
+另外三个线程白占着核。所以非 Linux 平台改成**共享一个监听 fd**：首个 server
+bind，其余 attach 上去各自 `accept`，内核唤醒谁谁拿（`MULTI_SHARE_LISTENER`）。
+同一组配置现在是 282k / 297k / 297k / 271k，min/max 91%。代价是每次**建立连接**
+唤醒所有 loop（thundering herd），keep-alive 下按连接而非按请求摊，可以忽略。
+Linux 保留 `SO_REUSEPORT`：它按流哈希分发，且只唤醒一个。
+
+**2. 连接是分发单位，压测客户端必须每线程多连接。** 一条连接落在某个 acceptor 上
+就一直在那里。用「一个线程一条连接」的客户端测多核，12 条连接只会用到 3 个
+acceptor，结论是假的。客户端还必须用 poll 同时驱动所有连接——串行轮转时一个线程
+阻塞在一条连接上，其余三十条全闲着，测出来 server 只用了 2 个核。
+
+**3. 每 CPU 秒的处理量随 acceptor 增加下降约 40%**（2.55 M → 1.56 M req/CPU·s）。
+M4 是 4 性能核 + 6 能效核，一部分 acceptor 落在能效核上（同一份代码在能效核上
+IPC 明显低，分布里 8.6 M 与 1.4 M 并存的那些格子就是）。用
+`pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` 提优先级没有测出差别，
+acceptor 数控制在性能核数以内更实际。这一点是硬件特性，不是库能修的。
+
+#### 火焰图给出的两个热点
+
+`sample` 采出来的自身时间，改之前 `bytes_index` 排第一（5250 个样本，是
+`response_build` 的 2.7 倍），因为每个请求头都要找 `\r\n` 和 `\r\n\r\n`，而
+27 字节的头上逐字节比较的循环开销比比较本身还大。改成按机器字比较
+（`index_word`：一次 8 字节 load + 掩码 + 比较）后降到 2082（−60%），
+`parse_request` 262 → 211 ns。
+
+第二是 `runtime::_append_elems`（响应头是十几次小 append 写出去的）。`buf_append`
+改成 `non_zero_resize_dynamic_array` + 一次 `mem_copy` 后，`response_build`
+254 → 231 ns。注意**不能用 `resize`**：它会给新元素补零，4 KiB body 就是一次
+4 KiB memset 紧接着被拷贝覆盖，实测让 `response_build` 从 276 退到 330 ns。
 
 ### 已经做掉的优化（按收益排序）
 
@@ -232,19 +291,22 @@ pipelined 与串行的差距全部来自系统调用：单个请求的库内 CPU
 | 路由逐条线性扫描，代价随路由表长度增长 | literal 路径建哈希索引：`map[string]^Route_Entry`，entry 内按 HTTP 方法分槽，模式路由另存列表只在未命中时走 | 120 条表的末位 3.18 µs → 8 ns；404 3.51 µs → 160 ns |
 | 每响应清空 128 KiB 匹配表 | 匹配表改用「滚动位置 + 基址」，上一条响应的遗留项靠 `cand >= limit` 自然失效（zlib 的 `strstart` 同法），只做一次重归一 | 64 KiB JSON 890 → 378 µs（2.3×），pipelined gzip 场景 +100% |
 | 每请求一次 send，流水线里就是每响应一次系统调用 | 已排队且无 body 的请求把响应攒进 `c.out` 合并写（上限 16 KiB）；有 body / 有文件体 / TLS / `Connection: close` / 下一个头未到齐都不合并 | pipelined 63 k → 1.3 M req/s（20×）；串行路径 0 变化 |
+| macOS 上多个 acceptor 只有一个真正工作 | 非 Linux 平台共享监听 fd（`server_adopt_listener`），Linux 仍用 `SO_REUSEPORT` | 4 个 acceptor：1.4 M → 6.9 M req/s |
+| 头部扫描逐字节比较 | `index_word`：短缓冲 + 短 needle（≤ 8 字节）按 64 位字比较；大缓冲仍走 Horspool（滑窗会让读取量放大 8 倍） | `parse_request` 262 → 211 ns |
+| 响应头十几次小 append 走变参 append | `buf_append` 改 `non_zero_resize_dynamic_array` + `mem_copy` | `response_build` 254 → 231 ns，单核负载 +43% |
 | `Date` 头每个响应都格式化一次 | 每秒缓存一次（`Date_Cache`），`http_date_buf` 写栈缓冲再 copy | `response_build` 302 → 254 ns |
-| 子串搜索逐字节比较 | Boyer-Moore-Horspool（needle ≥ 3 且 haystack ≥ 64 才启用，短串仍走朴素扫描），配 256 项位移表 | 大正文的 multipart / chunked 边界搜索 |
+| 子串搜索逐字节比较 | Boyer-Moore-Horspool（needle ≥ 3 且 haystack ≥ 64 才启用） | 大正文的 multipart / chunked 边界搜索 |
 | 头部逐块到达时每次 recv 都从 0 重扫 | 扫描游标 `head_scanned`，只在跨界处回退 3 字节 | 8 KiB 头分 16 段到达：16 次全扫 → 一次 |
 | stat 缓存无上限，404 洪水能撑爆内存 | `max_cache_entries`（默认 8192）+ 批量淘汰：先放过期项，再收敛到 `limit/2` | 内存有界，命中率不变 |
 | Hub 广播每个订阅者两次拷贝；注销要线性扫 | 空闲订阅者直写 `c.out` 少一次拷贝；`index` 字段 + 末位换位删除 O(1)；背压按「队列 + 在途」合并计 | 大扇出时每事件少一次 memcpy，注销 O(n) → O(1) |
 | 响应头动态数组反复扩容 | `response_init`/`response_reset` 后 `reserve(8)` | 4 KiB JSON 少 2~3 次扩容 |
 
-一条反向经验也记在这里：给**请求**头数组预留同样 12 个槽位，让 `Request` 变大、  
-L1 压力上升，`parse_request` 从 253 ns 退到 272 ns，已回退。不是延迟加载的分配  
-器上，「预留」不是免费的。  
+一条反向经验也记在这里：给**请求**头数组预留同样 12 个槽位，让 `Request` 变大、
+L1 压力上升，`parse_request` 从 253 ns 退到 272 ns，已回退。不是延迟加载的分配
+器上，「预留」不是免费的。
 
-复现与关掉：`WRITE_BATCH_BYTES = 0` 可关闭响应合并，用来做 A/B；  
-`bench/load.odin` 里每个场景就是一个 handler + 一行 `run_scenario`，加场景比改库  
+复现与关掉：`WRITE_BATCH_BYTES = 0` 可关闭响应合并，用来做 A/B；
+`bench/load.odin` 里每个场景就是一个 handler + 一行 `run_scenario`，加场景比改库
 便宜。
 
 ## 目录结构
@@ -290,6 +352,7 @@ web/
 bench/
   main.odin      微基准（parse/router/response/compress/multipart）+ fixtures
   load.odin      起真实服务 + pipelined / 串行客户端，报 req/s 与每请求耗时
+  multi.odin     多 acceptor：serve / client 两进程模式 + 同进程多连接压测
 examples/
   hello/         最小服务
   api/           router + 内置中间件 + 模式捕获 + Cookie + JSON（错误也是 JSON）
@@ -859,7 +922,7 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 ## 测试覆盖
 
 ```bash
-odin test web/               # 146 个
+odin test web/               # 147 个
 odin test web/middlewares     # 48 个
 ```
 

@@ -1,5 +1,6 @@
 package web
 
+import "base:intrinsics"
 import "core:mem"
 
 /*
@@ -39,11 +40,24 @@ buf_reset :: proc(b: ^Buf) {
 	}
 }
 
+/*
+buf_append appends `data`, growing the buffer by one resize.
+
+`append(&b.data, ..data)` goes through the variadic element appender, which
+re-checks capacity per element. Every response writes its head as a dozen
+small appends, so that path showed up as the largest single user-space cost in
+the profile; a resize plus one copy does the same work with one capacity check
+and one memmove.
+*/
 buf_append :: proc(b: ^Buf, data: []byte) {
 	if len(data) == 0 {
 		return
 	}
-	append(&b.data, ..data)
+	n := len(b.data)
+	// non-zero resize: plain `resize` zeroes the new elements first, which for
+	// a 4 KiB body is a 4 KiB memset immediately overwritten by the copy.
+	non_zero_resize_dynamic_array(&b.data, n + len(data))
+	mem.copy_non_overlapping(raw_data(b.data[n:]), raw_data(data), len(data))
 }
 
 buf_append_byte :: proc(b: ^Buf, c: byte) {
@@ -94,6 +108,18 @@ bytes_index :: proc(haystack: []byte, needle: string) -> int {
 	if m == 0 || n < m {
 		return -1
 	}
+	// Short buffers with short needles go through the word path: the header
+	// parser looks for "\r\n" and "\r\n\r\n" in a few dozen bytes, once
+	// per line, and at that size the loop overhead - not the comparison - is
+	// the cost.
+	//
+	// Large buffers keep Horspool even for short needles. index_word reads a
+	// window at every offset, so over a megabyte it touches eight times the
+	// data; Horspool skips by the last byte instead, which for a CRLF search
+	// means it only stops at line boundaries.
+	if n <= 64 && m <= 8 {
+		return index_word(haystack, needle)
+	}
 	if n < 64 || m < 3 {
 		return bytes_index_naive(haystack, needle)
 	}
@@ -123,6 +149,49 @@ bytes_index :: proc(haystack: []byte, needle: string) -> int {
 			}
 		}
 		i += skip[window]
+	}
+	return -1
+}
+
+/*
+index_word searches for a needle of at most eight bytes by comparing one
+machine word per offset instead of one byte per offset: one unaligned load,
+one mask, one branch. For a 12-byte header line that is a few iterations
+instead of a few dozen, and every request runs this path several times.
+*/
+@(private)
+index_word :: proc(haystack: []byte, needle: string) -> int {
+	n, m := len(haystack), len(needle)
+	want: u64
+	for k in 0 ..< m {
+		want |= u64(needle[k]) << (8 * u64(k))
+	}
+	mask := ~u64(0)
+	if m < 8 {
+		mask = (u64(1) << (8 * u64(m))) - 1
+	}
+	last := n - m
+	i := 0
+	// whole words first: a load at `i` reads eight bytes, so it must start at
+	// or before n-8. The remaining `m-1` offsets at the very end are checked
+	// byte by byte instead of reading past the buffer.
+	word_end := n - 8
+	for ; i <= word_end; i += 1 {
+		if intrinsics.unaligned_load((^u64)(&haystack[i])) & mask == want {
+			return i
+		}
+	}
+	for ; i <= last; i += 1 {
+		matched := true
+		for k in 0 ..< m {
+			if haystack[i + k] != needle[k] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return i
+		}
 	}
 	return -1
 }

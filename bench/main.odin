@@ -5,16 +5,22 @@ Benchmarks and stress probes for the web package.
 
 	odin run bench -- 18099
 
-Two halves:
+Three parts, chosen by the second argument:
 
   micro  - the per-request functions, called directly with no socket, so the
            numbers describe the algorithm rather than the syscalls. The
            request-side benchmarks allocate from a bump allocator that is
            rewound per iteration, which is how the connection arena behaves
            between keep-alive requests: real malloc traffic, but no free.
+           Each benchmark runs five rounds and keeps the fastest: one round on
+           a machine with two core types and other work on it is a coin flip.
   load   - one real server on one loop thread driven by a pipelining client.
            Pipelining removes the effect of RTT, so what is left is the cost
            of the request path itself: RPS = one core's request budget.
+  multi  - N acceptors plus a poll-driven client, to see how throughput scales
+           with cores and how the connections split. `serve` and `client` run
+           those halves as separate processes so each side's CPU time is
+           attributable; see multi.odin.
 */
 
 import "core:fmt"
@@ -34,13 +40,31 @@ Bench :: struct {
 	name: string,
 	ops:  int,
 	ns:   i64,
+	// rounds is how many timed rounds were run; the allocator counters in the
+	// benchmark context accumulate over all of them, so per-op figures are
+	// divided by this and by ops.
+	rounds: int,
 }
 
-// bench_run times `body` until at least `min_ns` have elapsed, growing the
-// iteration count so short operations are measured over a long window.
-bench_run :: proc(b: ^Bench, body: proc(ctx: rawptr), ctx: rawptr, min_ns := 200 * time.Millisecond) {
+/*
+bench_run times `body` over several rounds and keeps the fastest.
+
+One round is not a measurement on a machine with two kinds of core and other
+work on it: the same parse benchmark read 211 ns and 253 ns in back-to-back
+runs, purely from where the thread happened to be scheduled. The minimum is
+the round that came closest to the code's own cost, which is the number worth
+optimising and the only one that reproduces.
+*/
+bench_run :: proc(
+	b: ^Bench,
+	body: proc(ctx: rawptr),
+	ctx: rawptr,
+	min_ns := 100 * time.Millisecond,
+	rounds := 5,
+) {
 	n := 1
 	body(ctx) // warm up: first-call table builds must not be amortised in
+	// grow the iteration count until one round fills the window
 	for {
 		start := time.tick_now()
 		for _ in 0 ..< n {
@@ -48,9 +72,7 @@ bench_run :: proc(b: ^Bench, body: proc(ctx: rawptr), ctx: rawptr, min_ns := 200
 		}
 		elapsed := time.tick_since(start)
 		if elapsed >= min_ns || n > 1 << 24 {
-			b.ops = n
-			b.ns = i64(elapsed)
-			return
+			break
 		}
 		if elapsed <= 0 {
 			n *= 8
@@ -59,6 +81,21 @@ bench_run :: proc(b: ^Bench, body: proc(ctx: rawptr), ctx: rawptr, min_ns := 200
 			n *= clamp(grow, 2, 64)
 		}
 	}
+
+	best := i64(max(i64))
+	for _ in 0 ..< rounds {
+		start := time.tick_now()
+		for _ in 0 ..< n {
+			body(ctx)
+		}
+		e := i64(time.tick_since(start))
+		if e < best {
+			best = e
+		}
+	}
+	b.ops = n
+	b.ns = best
+	b.rounds = rounds
 }
 
 bench_report :: proc(b: Bench, allocs: u64 = 0, bytes: u64 = 0) {
@@ -66,9 +103,13 @@ bench_report :: proc(b: Bench, allocs: u64 = 0, bytes: u64 = 0) {
 		return
 	}
 	ns_per := f64(b.ns) / f64(b.ops)
+	rounds := max(b.rounds, 1)
 	if allocs > 0 {
 		fmt.printf("%-46s %8.1f ns/op  %5.1f alloc/op  %7.0f B/op\n",
-			b.name, ns_per, f64(allocs) / f64(b.ops), f64(bytes) / f64(b.ops))
+			b.name,
+			ns_per,
+			f64(allocs) / f64(b.ops * rounds),
+			f64(bytes) / f64(b.ops * rounds))
 	} else {
 		fmt.printf("%-46s %8.1f ns/op  %12.0f /s\n", b.name, ns_per, 1e9 / ns_per)
 	}
@@ -157,10 +198,61 @@ json_payload :: proc(n: int) -> []byte {
 
 main :: proc() {
 	port := 18099
+	mode := "all"
 	if len(os.args) > 1 {
 		if p, ok := strconv.parse_int(os.args[1]); ok {
 			port = p
 		}
+	}
+	if len(os.args) > 2 {
+		mode = os.args[2]
+	}
+	if mode == "multi" {
+		multi_scale(port)
+		return
+	}
+	if mode == "micro" {
+		micro()
+		return
+	}
+	if mode == "client" {
+		clients, conns, seconds := 3, 4, 10
+		if len(os.args) > 3 {
+			if v, ok := strconv.parse_int(os.args[3]); ok {
+				clients = v
+			}
+		}
+		if len(os.args) > 4 {
+			if v, ok := strconv.parse_int(os.args[4]); ok {
+				conns = v
+			}
+		}
+		if len(os.args) > 5 {
+			if v, ok := strconv.parse_int(os.args[5]); ok {
+				seconds = v
+			}
+		}
+		multi_load(port, clients, conns, seconds)
+		return
+	}
+	if mode == "serve" {
+		acceptors, seconds := 4, 10
+		if len(os.args) > 3 {
+			if v, ok := strconv.parse_int(os.args[3]); ok {
+				acceptors = v
+			}
+		}
+		if len(os.args) > 4 {
+			if v, ok := strconv.parse_int(os.args[4]); ok {
+				seconds = v
+			}
+		}
+		multi_serve(port, acceptors, seconds)
+		return
+	}
+	if mode == "load" {
+		load(port)
+		return
 	}
 	micro()
 	load(port)

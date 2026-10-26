@@ -530,6 +530,10 @@ string_index :: proc(s: string, needle: string) -> int {
 	if m == 0 || n < m {
 		return -1
 	}
+	// header framing needles are one to four bytes; compare them as a word
+	if m <= 8 {
+		return index_word(transmute([]byte)s, needle)
+	}
 	last := n - m
 	for i in 0..=last {
 		match := true

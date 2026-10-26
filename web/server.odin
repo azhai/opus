@@ -115,8 +115,13 @@ Server :: struct {
 
 	// reuse_port sets SO_REUSEPORT before bind, which is what lets several
 	// server instances (one per acceptor thread) share an address. Only the
-	// server_run_multi path sets it.
+	// Linux path of server_run_multi sets it (see MULTI_SHARE_LISTENER).
 	reuse_port: bool,
+	// owns_listener says whether this server closes `listen_socket` when it
+	// stops. False on the extra acceptors of a shared-listener group: the fd
+	// belongs to the server that bound it, and closing it from a thread that
+	// leaves first would break every other acceptor.
+	owns_listener: bool,
 	done_flag:     ^bool,
 
 	accept_op: ^nbio.Operation,
@@ -136,6 +141,7 @@ server_init :: proc(s: ^Server, address := "0.0.0.0:8080", allocator := context.
 	s.allocator = allocator
 	s.conns = make([dynamic]^Conn, allocator)
 
+	s.owns_listener = true
 	s.keep_alive = true
 	s.max_requests_per_conn = 1000
 	s.max_header_size = 16 << 10
@@ -174,15 +180,43 @@ server_listen :: proc(s: ^Server) -> bool {
 	if ep, ep_err := nbio.bound_endpoint(sock); ep_err == nil {
 		s.bound_port = ep.port
 	}
+	return server_arm_listener(s)
+}
+
+/*
+server_arm_listener installs the filters and the accept/sweep operations for a
+listener that is already created. It is the half of server_listen that is
+specific to the *event loop* rather than to the socket, which is what lets a
+second server on another thread share one listener (see
+server_adopt_listener).
+*/
+server_arm_listener :: proc(s: ^Server) -> bool {
 	intrinsics.volatile_store(&s.listening, true)
 	filter_compress_init(&s.compress_filter)
 	filter_add(s, &s.compress_filter.filter)
 	filter_chunked_init(&s.chunked_filter)
 	filter_add(s, &s.chunked_filter.filter)
-	s.accept_op = nbio.accept_poly(sock, s, on_accept)
+	s.accept_op = nbio.accept_poly(s.listen_socket, s, on_accept)
 	s.sweep_op = nbio.timeout_poly(SWEEP_INTERVAL, s, on_sweep)
 	log_info("web: listening on %v", s.address)
 	return true
+}
+
+/*
+server_adopt_listener points this server at a listener another server already
+bound, and arms it on the caller's event loop. Several loops can wait on the
+same listening socket: the kernel wakes them and whichever one runs first
+takes the connection, so accepts spread across threads with no shared state
+and no lock in the library.
+
+The fd stays owned by the server that created it (`owns_listener` is false
+here), because closing it from a thread that leaves first would break every
+other acceptor.
+*/
+server_adopt_listener :: proc(s: ^Server, sock: net.TCP_Socket) -> bool {
+	s.listen_socket = sock
+	s.owns_listener = false
+	return server_arm_listener(s)
 }
 
 /*

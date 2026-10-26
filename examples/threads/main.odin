@@ -26,23 +26,27 @@ Hit it from several shells at once:
 	for i in $(seq 20); do curl -s --noproxy '*' localhost:8099/ ; done
 
 Each response reports which acceptor handled it, and the summary on exit
-shows the per-acceptor request counts. macOS accepts SO_REUSEPORT but hands
-*every* connection to the most recently bound listener, so the distribution
-only spreads on Linux/BSD.
+shows the per-acceptor request counts. Both paths spread, by different
+mechanisms: Linux hashes the 4-tuple over a SO_REUSEPORT group, macOS/BSD
+share one listening fd and hand each connection to whichever loop wakes
+first (SO_REUSEPORT there would send everything to a single listener).
+
+A connection stays with the acceptor that accepted it, so open more than one
+connection when checking the split - a single curl only ever reaches one
+thread.
 */
 
 THREADS :: 4
 MAX_ACCEPTORS :: 256
 
-counters: [MAX_ACCEPTORS]u64
-
 handler :: proc(req: ^web.Request, res: ^web.Response) {
+	// No counter here on purpose: the per-acceptor split comes from
+	// `Server.stats.requests`, which is per-server state and therefore free of
+	// the data race a shared array incremented from every acceptor thread
+	// would have.
 	id := 0
 	if req.conn != nil && req.conn.server != nil {
 		id = int(uintptr(req.conn.server.user_ptr))
-	}
-	if id >= 0 && id < len(counters) {
-		counters[id] += 1
 	}
 
 	buf: [128]byte
@@ -114,8 +118,8 @@ main :: proc() {
 
 	total: u64
 	for i in 0..<count {
-		fmt.printf("acceptor %d: %v request(s)\n", i, counters[i])
-		total += counters[i]
+		fmt.printf("acceptor %d: %v request(s)\n", i, servers[i].stats.requests)
+		total += servers[i].stats.requests
 	}
 	fmt.printf("total: %v request(s)\n", total)
 
