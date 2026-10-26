@@ -107,14 +107,17 @@ odin build web -build-mode:static
 odin build web/middlewares -build-mode:static
 
 # 运行全部测试（单测 + 起真实服务的集成测试，含泄漏检测）
-odin test web/
-odin test web/middlewares
+# THREADS=1 不是可选项：集成测试各自在自己线程上跑一个 nbio 事件循环，而 nbio 的
+# 操作归创建它的线程所有，多线程并行会 panic「nbio.remove called on different
+# thread」，连带把 hub / async 的用例一起带崩
+odin test web/ -define:ODIN_TEST_THREADS=1
+odin test web/middlewares -define:ODIN_TEST_THREADS=1
 
 # 只跑某个测试
-odin test web/ -define:ODIN_TEST_NAMES=web.test_integration_head_request,
+odin test web/ -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=web.test_integration_head_request
 
 # 打开调试日志重新测试
-odin test web/ -define:WEB_DEBUG=true
+odin test web/ -define:ODIN_TEST_THREADS=1 -define:WEB_DEBUG=true
 ```
 
 ## 运行示例
@@ -186,6 +189,64 @@ odin run examples/threads -- 8 127.0.0.1:8099 10
 > listener，多 acceptor 的负载分散只在 Linux/BSD 上成立（`tests` 也只在 Linux  
 > 断言分发）。
 
+## 性能
+
+`bench/` 是随仓库维护的测量工具，不参与库构建：一半是微基准（直接调库函数，  
+逐项报告 ns/op、分配次数与字节数），一半是起真实服务 + 客户端打真实请求（报  
+req/s 与每请求耗时）。两者都必须用 `-o:speed` 编译——默认的调试构建慢一个数量  
+级，量出来的数字没有意义：
+
+```bash
+odin run bench -o:speed
+```
+
+### 一次实测（Apple Silicon，单核，环回 TCP）
+
+| 微基准 | 耗时 | 分配 |
+| --- | --- | --- |
+| `parse_request`（9 个头 / 240 B） | 262 ns | 1.3 /op |
+| `router_match` 静态路由（120 条表的第 1 / 第 120 条） | 6.1 / 8.0 ns | 0 |
+| `router_match` `:param` 路由 | 157 ns | 1.3 /op |
+| `router_match` 未命中（404 两趟） | 160 ns | 0 |
+| `response_build`（4 KiB JSON + Date） | 254 ns | 6.0 /op |
+| `gzip_compress` 64 KiB JSON | 378 µs（115 MiB/s，压缩比 14.4%） | 2.2 /op |
+| multipart 增量解析（1 MiB part） | 404 µs（2474 MiB/s） | 7.9 /op |
+
+| 负载（单 loop 线程） | 吞吐 | 每请求 |
+| --- | --- | --- |
+| pipelined 静态路由（512 深度） | 1.3 M req/s | 0.78 µs |
+| pipelined 4 KiB JSON | 261 k req/s | 3.8 µs |
+| pipelined 4 KiB JSON + gzip | 66 k req/s | 15.2 µs |
+| pipelined 404（stat 缓存负命中） | 1.2 M req/s | 0.84 µs |
+| 串行 keep-alive（一次一个请求） | 60 k req/s | 17 µs / RTT |
+| sendfile 4 KiB 文件 | 25 k req/s | 40 µs |
+
+pipelined 与串行的差距全部来自系统调用：单个请求的库内 CPU 只有几百纳秒（上面  
+几个微基准之和），而一次 send/recv 在环回上就要一两微秒。结论很直接——优化的  
+着力点不是「算得更快」，而是「少进出内核、少重复算」。
+
+### 已经做掉的优化（按收益排序）
+
+| 问题 | 做法（数据结构 / 算法） | 前后 |
+| --- | --- | --- |
+| 路由逐条线性扫描，代价随路由表长度增长 | literal 路径建哈希索引：`map[string]^Route_Entry`，entry 内按 HTTP 方法分槽，模式路由另存列表只在未命中时走 | 120 条表的末位 3.18 µs → 8 ns；404 3.51 µs → 160 ns |
+| 每响应清空 128 KiB 匹配表 | 匹配表改用「滚动位置 + 基址」，上一条响应的遗留项靠 `cand >= limit` 自然失效（zlib 的 `strstart` 同法），只做一次重归一 | 64 KiB JSON 890 → 378 µs（2.3×），pipelined gzip 场景 +100% |
+| 每请求一次 send，流水线里就是每响应一次系统调用 | 已排队且无 body 的请求把响应攒进 `c.out` 合并写（上限 16 KiB）；有 body / 有文件体 / TLS / `Connection: close` / 下一个头未到齐都不合并 | pipelined 63 k → 1.3 M req/s（20×）；串行路径 0 变化 |
+| `Date` 头每个响应都格式化一次 | 每秒缓存一次（`Date_Cache`），`http_date_buf` 写栈缓冲再 copy | `response_build` 302 → 254 ns |
+| 子串搜索逐字节比较 | Boyer-Moore-Horspool（needle ≥ 3 且 haystack ≥ 64 才启用，短串仍走朴素扫描），配 256 项位移表 | 大正文的 multipart / chunked 边界搜索 |
+| 头部逐块到达时每次 recv 都从 0 重扫 | 扫描游标 `head_scanned`，只在跨界处回退 3 字节 | 8 KiB 头分 16 段到达：16 次全扫 → 一次 |
+| stat 缓存无上限，404 洪水能撑爆内存 | `max_cache_entries`（默认 8192）+ 批量淘汰：先放过期项，再收敛到 `limit/2` | 内存有界，命中率不变 |
+| Hub 广播每个订阅者两次拷贝；注销要线性扫 | 空闲订阅者直写 `c.out` 少一次拷贝；`index` 字段 + 末位换位删除 O(1)；背压按「队列 + 在途」合并计 | 大扇出时每事件少一次 memcpy，注销 O(n) → O(1) |
+| 响应头动态数组反复扩容 | `response_init`/`response_reset` 后 `reserve(8)` | 4 KiB JSON 少 2~3 次扩容 |
+
+一条反向经验也记在这里：给**请求**头数组预留同样 12 个槽位，让 `Request` 变大、  
+L1 压力上升，`parse_request` 从 253 ns 退到 272 ns，已回退。不是延迟加载的分配  
+器上，「预留」不是免费的。  
+
+复现与关掉：`WRITE_BATCH_BYTES = 0` 可关闭响应合并，用来做 A/B；  
+`bench/load.odin` 里每个场景就是一个 handler + 一行 `run_scenario`，加场景比改库  
+便宜。
+
 ## 目录结构
 
 ```
@@ -224,7 +285,11 @@ web/
   middlewares/   中间件子包（import ".."）：见下
   *_test.odin    按主题拆分的测试：parser / router / response / proxy / cookie /
                  json / pattern / range / framing / compress / tls / http /
-                 sse / multipart_stream / upload / hub / integration / support
+                 sse / multipart_stream / upload / hub / buffer / static /
+                 conn / integration / support
+bench/
+  main.odin      微基准（parse/router/response/compress/multipart）+ fixtures
+  load.odin      起真实服务 + pipelined / 串行客户端，报 req/s 与每请求耗时
 examples/
   hello/         最小服务
   api/           router + 内置中间件 + 模式捕获 + Cookie + JSON（错误也是 JSON）
@@ -794,8 +859,8 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 ## 测试覆盖
 
 ```bash
-odin test web/               # 118 个
-odin test web/middlewares     # 42 个
+odin test web/               # 146 个
+odin test web/middlewares     # 48 个
 ```
 
 `web` 侧是 parser / chunked / router（含重写）/ response 序列化 /  
@@ -807,6 +872,8 @@ proxy 解析与分帧决策 / cookie 序列化与解析 / JSON / Lua 模式匹�
 无尾 CRLF、多 part 顺序与 index/size、前导与后置垃圾、分隔行尾判定与 transport  
 padding）/ 流式解析内存上界 / 文件名消毒 单测，加 30 多个真实起服务的集成测试  
 （请求响应闭环 + body 回显、畸形请求 400、chunked 请求体、pipelined 双请求、  
+24 深度流水线合并写且响应顺序不乱、流水线中间夹带 body 的请求、流水中途出现  
+坏请求时前面已合并的响应不丢、  
 HEAD、空文件 sendfile、代理 GET/POST、chunked 上游中继、close-delimited 上游  
 重分帧、上游拒连 502、Cookie、JSON、模式路由、静态 Range 全路径：单 range 206  
 / 多 range multipart / 416 / 304 / If-Range、gzip 内容协商与 chunked 组合、  

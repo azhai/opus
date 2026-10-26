@@ -76,6 +76,11 @@ Hub_Sink :: struct {
 	hub:       ^Hub,
 	conn:      ^Conn,
 	queue:     Buf,
+	// index is this sink's slot in `hub.subs`. Removal is then a swap with the
+	// last element instead of a scan, which matters when a client churns: a
+	// scan costs O(subscribers) per disconnect, i.e. O(n^2) to turn the whole
+	// feed over once.
+	index:     int,
 	sending:   bool,
 	closing:   bool, // terminating chunk queued; close when the queue drains
 	closed:    bool, // removed from the hub; the struct is about to be freed
@@ -162,6 +167,7 @@ hub_subscribe :: proc(h: ^Hub, req: ^Request, res: ^Response) -> (sink: ^Hub_Sin
 		return nil, false
 	}
 	s.last_send = nbio.now()
+	s.index = len(h.subs)
 	append(&h.subs, s)
 	hub_flush(s)
 	return s, true
@@ -190,18 +196,46 @@ hub_on_close :: proc(ud: rawptr) {
 	}
 	h := s.hub
 	if h != nil {
-		for i := 0; i < len(h.subs); i += 1 {
-			if h.subs[i] == s {
-				unordered_remove(&h.subs, i)
-				break
-			}
-		}
+		hub_remove(h, s)
 		// `h.skipped` is incremented at publish time so a live /stats handler
 		// sees it; adding `s.skipped` here would count every drop twice
 	}
 	s.closed = true
 	buf_destroy(&s.queue)
 	free(s, s.hub.allocator)
+}
+
+/*
+hub_remove drops a sink from the subscriber list in O(1).
+
+The last element is moved into the vacated slot, which is why `hub_publish`
+iterates backwards: by the time it reaches slot `i`, every slot above it has
+already been visited, so a sink that jumps down into `i` cannot be skipped or
+visited twice.
+*/
+@(private)
+hub_remove :: proc(h: ^Hub, s: ^Hub_Sink) {
+	i := s.index
+	last := len(h.subs) - 1
+	if i < 0 || i > last || h.subs[i] != s {
+		// index out of date (defensive: a duplicate close): fall back to a scan
+		i = -1
+		for j := 0; j < len(h.subs); j += 1 {
+			if h.subs[j] == s {
+				i = j
+				break
+			}
+		}
+		if i < 0 {
+			return
+		}
+	}
+	if i != last {
+		moved := h.subs[last]
+		h.subs[i] = moved
+		moved.index = i
+	}
+	pop(&h.subs)
 }
 
 // hub_flush pushes whatever is queued at the socket, one send at a time. The
@@ -318,9 +352,9 @@ hub_comment :: proc(h: ^Hub, text: string) {
 hub_publish frames `payload` as one chunk and queues it for every subscriber.
 
 Iterating backwards is deliberate: a flush can close a connection (TLS
-encryption failure does it synchronously), and `unordered_remove` moving the
-last element into the freed slot is only safe when that element has already
-been visited.
+encryption failure does it synchronously), and `hub_remove` moving the last
+element into the freed slot is only safe when that element has already been
+visited.
 */
 hub_publish :: proc(h: ^Hub, payload: []byte) {
 	if h.closed || len(payload) == 0 {
@@ -335,23 +369,60 @@ hub_publish :: proc(h: ^Hub, payload: []byte) {
 
 	h.published += 1
 	now := nbio.now()
+	frame := buf_slice(f)
 	for i := len(h.subs) - 1; i >= 0; i -= 1 {
 		s := h.subs[i]
 		if s.closed {
 			continue
 		}
-		if buf_len(&s.queue) + buf_len(f) > h.max_queue {
+		if hub_backlog(s) + len(frame) > h.max_queue {
 			// over the limit: skip this event for this subscriber instead of
 			// growing without bound. SSE clients resync from `id:`.
 			s.skipped += 1
 			h.skipped += 1
 			continue
 		}
-		buf_append(&s.queue, buf_slice(f))
+		hub_enqueue(s, frame)
 		s.last_send = now
 		h.delivered += 1
-		hub_flush(s)
 	}
+}
+
+/*
+hub_enqueue puts one framed chunk on its way to a subscriber.
+
+The common case is an idle sink, and for that the frame goes straight into the
+connection buffer. Routing it through `queue` instead would copy it twice -
+into the queue, then out of the queue into `c.out` - for a feed where every
+event is broadcast to every subscriber, that is the dominant cost.
+*/
+@(private)
+hub_enqueue :: proc(s: ^Hub_Sink, chunk: []byte) {
+	c := s.conn
+	if !s.sending && c != nil && !c.closed && c.op == nil && buf_len(&c.out) == 0 && buf_len(&s.queue) == 0 {
+		buf_append(&c.out, chunk)
+	} else {
+		buf_append(&s.queue, chunk)
+	}
+	hub_flush(s)
+}
+
+/*
+hub_backlog is how many bytes this subscriber still owes the network: its own
+queue plus whatever the last send left in the connection buffer.
+
+Counting both is what makes `max_queue` a real bound. A send in flight drains
+`c.out` progressively, so ignoring it would let a slow client refill its queue
+while the connection buffer was still holding a previous event, and the actual
+backlog would be twice the configured limit.
+*/
+@(private)
+hub_backlog :: proc(s: ^Hub_Sink) -> int {
+	n := buf_len(&s.queue)
+	if c := s.conn; c != nil && !c.closed {
+		n += buf_len(&c.out)
+	}
+	return n
 }
 
 /*

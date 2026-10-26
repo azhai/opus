@@ -102,6 +102,11 @@ Server :: struct {
 
 	stats: Stats,
 
+	// date is the cached Date header value, refreshed once per second (see
+	// Date_Cache). Reading it is free; recomputing it once per response was
+	// one allocation and one formatting pass per request.
+	date: Date_Cache,
+
 	listen_socket: net.TCP_Socket,
 	listening:     bool,
 	// bound_port is the port actually in use, which matters when the
@@ -145,6 +150,11 @@ server_init :: proc(s: ^Server, address := "0.0.0.0:8080", allocator := context.
 server_destroy :: proc(s: ^Server) {
 	if len(s.conns) > 0 {
 		log_error("web: server_destroy with %v live connection(s)", len(s.conns))
+	}
+	if s.compress_filter.scratch != nil {
+		// the match-finder tables are owned by the server, not by a request
+		deflate_state_destroy(s.compress_filter.scratch)
+		s.compress_filter.scratch = nil
 	}
 	if s.conns != nil {
 		delete(s.conns)

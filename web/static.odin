@@ -24,10 +24,25 @@ Static :: struct {
 	allocator: mem.Allocator,
 }
 
+// STATIC_CACHE_MAX is the default bound on cached paths. At ~48 bytes per
+// entry plus the key this is a few hundred kilobytes, which is more than a
+// real site has files and far less than an attacker can invent.
+STATIC_CACHE_MAX :: 8192
+
+// STATIC_EVICT_BATCH is how many entries one eviction pass removes. Evicting
+// one per insert would need a full map walk per insert once the table is full;
+// evicting a batch amortises that walk over the batch.
+STATIC_EVICT_BATCH :: 128
+
 Static_Config :: struct {
 	root:      string,
-	index:     string,      // default "index.html"
+	index:     string,        // default "index.html"
 	cache_ttl: time.Duration, // default 1s
+	// max_cache_entries bounds the stat cache (default STATIC_CACHE_MAX).
+	// Negative results are cached too, so without a bound every distinct
+	// path a client asks for - a 404 flood is the cheap version - would stay
+	// in the map for the life of the process.
+	max_cache_entries: int,
 }
 
 Stat_Cache_Entry :: struct {
@@ -43,6 +58,7 @@ static_init :: proc(st: ^Static, root: string, allocator := context.allocator) {
 	st.cfg.root = root
 	st.cfg.index = "index.html"
 	st.cfg.cache_ttl = time.Second
+	st.cfg.max_cache_entries = STATIC_CACHE_MAX
 	st.cache = make(map[string]Stat_Cache_Entry, allocator)
 }
 
@@ -240,10 +256,75 @@ static_lookup :: proc(st: ^Static, fs_path: string) -> (Stat_Cache_Entry, bool) 
 
 static_cache_put :: proc(st: ^Static, fs_path: string, entry: Stat_Cache_Entry) {
 	if _, ok := st.cache[fs_path]; !ok {
+		limit := st.cfg.max_cache_entries
+		if limit > 0 && len(st.cache) >= limit {
+			static_cache_evict(st)
+		}
 		st.cache[clone_string(fs_path, st.allocator)] = entry
 		return
 	}
 	st.cache[fs_path] = entry
+}
+
+/*
+static_cache_evict makes room in a full cache, preferring entries that are
+already stale (they would cost a syscall to revalidate anyway) and falling back
+to an arbitrary slice when everything is fresh.
+
+The fallback is what bounds the *memory*: a client walking a path space creates
+entries that all expire at the same moment, so waiting for expiry would never
+evict anything. Nothing is LRU here on purpose - a path that keeps being
+requested is refreshed on every hit, so it survives, and that is the property
+that matters for a file server.
+
+Keys are collected before any is deleted: removing from a map while iterating
+it is not allowed.
+*/
+static_cache_evict :: proc(st: ^Static) {
+	now := time.now()
+	victims: [STATIC_EVICT_BATCH]string
+
+	// a small configured limit must not be cleared wholesale by one pass
+	batch := STATIC_EVICT_BATCH
+	if limit := st.cfg.max_cache_entries; limit > 0 && batch > limit / 2 {
+		batch = limit / 2
+	}
+	if batch < 1 {
+		batch = 1
+	}
+
+	n := 0
+	for k, e in st.cache {
+		if n >= batch {
+			break
+		}
+		if time.diff(e.checked, now) >= st.cfg.cache_ttl {
+			victims[n] = k
+			n += 1
+		}
+	}
+	if n < batch {
+		for k in st.cache {
+			if n >= batch {
+				break
+			}
+			dup := false
+			for i in 0 ..< n {
+				if victims[i] == k {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				victims[n] = k
+				n += 1
+			}
+		}
+	}
+	for i in 0 ..< n {
+		delete_key(&st.cache, victims[i])
+		delete(victims[i], st.allocator)
+	}
 }
 
 // response_send_file_handle streams an already-opened file handle.

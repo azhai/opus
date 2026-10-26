@@ -250,3 +250,107 @@ test_router_fallthrough :: proc(t: ^testing.T) {
 	testing.expect_value(t, res_custom.status, Status.Not_Found)
 	testing.expect_value(t, string(buf_slice(&res_custom.body)), "custom 404")
 }
+
+/*
+test_router_static_index: literal paths are answered by a hash lookup, so the
+cost of a match no longer depends on how many routes were registered before it.
+That changes one observable thing - a literal route now wins over a parameter
+route registered earlier, because an exact path can only mean that route. Every
+framework that indexes routes (chi, httprouter, Echo) resolves the same way;
+the alternative is O(routes) per request, which is what this replaced.
+*/
+@(test)
+test_router_static_index :: proc(t: ^testing.T) {
+	arena_buf: [64 << 10]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf[:])
+	alloc := mem.arena_allocator(&arena)
+
+	r: Router
+	router_init(&r, alloc)
+	defer router_destroy(&r)
+
+	router_get(&r, "/users/:id", dummy_handler)
+	router_get(&r, "/users/me", dummy_handler)
+	for i in 0 ..< 50 {
+		path := fmt.aprintf("/filler/%v", i, allocator = alloc)
+		router_get(&r, path, dummy_handler)
+	}
+
+	// the literal path wins over the earlier ':id' route
+	req := Request{method = .Get, path = "/users/me"}
+	route, ok := router_match(&r, &req, alloc)
+	testing.expect(t, route != nil && ok)
+	if route != nil {
+		testing.expect_value(t, route.pattern, "/users/me")
+	}
+	testing.expectf(t, len(req.params) == 0, "a literal route produced params")
+
+	// the parameter route still answers everything else
+	req2 := Request{method = .Get, path = "/users/42"}
+	route2, ok2 := router_match(&r, &req2, alloc)
+	testing.expect(t, route2 != nil && ok2)
+	if route2 != nil {
+		testing.expect_value(t, route2.pattern, "/users/:id")
+	}
+	id, has := request_param(&req2, "id")
+	testing.expect(t, has && id == "42")
+
+	// registering after a match rebuilds the index; the new route is found
+	router_get(&r, "/late", dummy_handler)
+	req3 := Request{method = .Get, path = "/late"}
+	route3, ok3 := router_match(&r, &req3, alloc)
+	testing.expect(t, route3 != nil && ok3)
+
+	// a known literal path under the wrong method is a function of the hash,
+	// not of the table size
+	req4 := Request{method = .Post, path = "/users/me"}
+	route4, ok4 := router_match(&r, &req4, alloc)
+	testing.expect(t, route4 != nil)
+	testing.expect(t, !ok4)
+	if route4 != nil {
+		testing.expect_value(t, route4.pattern, "/users/me")
+	}
+
+	// ... and an unknown path is one hash miss
+	req5 := Request{method = .Get, path = "/nope"}
+	route5, _ := router_match(&r, &req5, alloc)
+	testing.expect(t, route5 == nil)
+}
+
+/*
+test_router_all_and_head: `.All` answers every verb, and HEAD falls back to the
+GET route of the same path. Both are resolved out of the path entry now, so
+both are worth pinning down.
+*/
+@(test)
+test_router_all_and_head :: proc(t: ^testing.T) {
+	arena_buf: [16 << 10]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf[:])
+	alloc := mem.arena_allocator(&arena)
+
+	r: Router
+	router_init(&r, alloc)
+	defer router_destroy(&r)
+	router_get(&r, "/report", dummy_handler)
+	router_all(&r, "/health", dummy_handler)
+
+	for method in ([]Method{.Get, .Post, .Delete, .Patch}) {
+		req := Request{method = method, path = "/health"}
+		route, ok := router_match(&r, &req, alloc)
+		testing.expectf(t, route != nil && ok, "%v /health did not match the .All route", method)
+	}
+
+	req := Request{method = .Head, path = "/report"}
+	route, ok := router_match(&r, &req, alloc)
+	testing.expect(t, route != nil && ok)
+	if route != nil {
+		testing.expect_value(t, route.method, Method.Get)
+	}
+
+	// a HEAD with no GET route anywhere is a 404, not a 405
+	req2 := Request{method = .Head, path = "/missing"}
+	route2, _ := router_match(&r, &req2, alloc)
+	testing.expect(t, route2 == nil)
+}

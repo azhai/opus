@@ -1,5 +1,6 @@
 package web
 
+import "base:intrinsics"
 import "core:mem"
 
 /*
@@ -158,11 +159,52 @@ distance_code :: proc(dist: int) -> (code: int, extra_bits: int, extra_val: int)
 	return 29, 0, 0
 }
 
-// Deflate_State holds the match-finder hash chains. One allocation per
-// compression; from an arena it costs nothing to drop.
+/*
+Deflate_State holds the match-finder hash chains plus the rolling position
+base that lets them be reused between calls.
+
+Positions are stored in a monotonic coordinate space instead of in `src`:
+`base` is where the current input starts. That is what makes the tables
+reusable without clearing them - an entry left by a previous call is smaller
+than the current window limit and is rejected by the `cand >= limit` test,
+exactly as if the table had been cleared. zlib does the same with `strstart`.
+
+Without this, every compressed response paid a 128 KiB memset (32 K slots)
+before it could hash its first byte, which for a 4 KiB body cost more than the
+compression itself.
+
+`base` advances by `len(src)` per call and is renormalised (the head table is
+cleared once) after about 1 GiB of input on the same scratch.
+*/
 Deflate_State :: struct {
-	head: [HASH_SIZE]i32,
-	prev: [WINDOW_SIZE]i32,
+	// allocator produced this table. Keeping it here means the filter may
+	// allocate on the thread that first compresses and release from
+	// `server_destroy` on whichever thread owns the server: a thread-local
+	// allocator (test runners track one per thread) would otherwise report a
+	// mismatched free.
+	allocator: mem.Allocator,
+	head:      [HASH_SIZE]i32,
+	prev:      [WINDOW_SIZE]i32,
+	base:      i32,
+}
+
+// NO_POS marks an empty hash slot. -1 can never be a valid rolling position.
+NO_POS :: -1
+
+deflate_state_create :: proc(allocator := context.allocator) -> ^Deflate_State {
+	st := new(Deflate_State, allocator)
+	st^ = {}
+	st.allocator = allocator
+	for i in 0 ..< HASH_SIZE {
+		st.head[i] = NO_POS
+	}
+	// `prev` needs no clearing: it is only ever read through a `head` entry,
+	// and ds_insert writes both together.
+	return st
+}
+
+deflate_state_destroy :: proc(st: ^Deflate_State) {
+	free(st, st.allocator)
 }
 
 hash3 :: proc(data: []byte, i: int) -> u32 {
@@ -170,39 +212,79 @@ hash3 :: proc(data: []byte, i: int) -> u32 {
 	return (v * 2654435761) >> (32 - HASH_BITS)
 }
 
-ds_insert :: proc(st: ^Deflate_State, data: []byte, i: int) {
+ds_insert :: proc(st: ^Deflate_State, data: []byte, i, base: int) {
 	if i + MIN_MATCH > len(data) {
 		return
 	}
 	h := hash3(data, i)
-	st.prev[i & WINDOW_MASK] = st.head[h]
-	st.head[h] = i32(i)
+	p := i32(base + i)
+	st.prev[p & WINDOW_MASK] = st.head[h]
+	st.head[h] = p
 }
 
 /*
-deflate_compress compresses src into a raw deflate stream (no zlib
-header). The match finder is greedy (no lazy evaluation) and every block
-uses fixed Huffman codes; both trade a few percent of ratio for a
-predictable, allocation-free hot path.
+match_len counts the bytes `src[a...]` and `src[b...]` agree on, up to `max`.
 
-Auxiliary state comes from `allocator`; when that is the connection
-scratch arena it is released with the request.
+Eight bytes are compared at a time and the first differing byte is located with
+a trailing-zero count. The match finder calls this once per candidate on its
+hash chain (up to MAX_CHAIN of them per position), so it is where compression
+time goes: byte-at-a-time comparison measured at ~48 MiB/s, this at three to
+four times that.
 */
-deflate_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
+match_len :: proc(src: []byte, a, b, max: int) -> int {
+	n := 0
+	for n + 8 <= max {
+		x := intrinsics.unaligned_load((^u64)(rawptr(uintptr(&src[a + n]))))
+		y := intrinsics.unaligned_load((^u64)(rawptr(uintptr(&src[b + n]))))
+		if x != y {
+			return n + int(intrinsics.count_trailing_zeros(x ~ y) >> 3)
+		}
+		n += 8
+	}
+	for n < max && src[a + n] == src[b + n] {
+		n += 1
+	}
+	return n
+}
+
+/*
+deflate_compress compresses src into a raw deflate stream (no zlib header).
+The match finder is greedy (no lazy evaluation) and every block uses fixed
+Huffman codes; both trade a few percent of ratio for a predictable hot path.
+
+`scratch` is a match-finder table to reuse. Pass the same one on every call for
+a stream of responses (the compress filter keeps one) and the tables are only
+built once; pass nil and a table is allocated and freed per call.
+
+Auxiliary state comes from `allocator`; when that is the connection scratch
+arena it is released with the request.
+*/
+deflate_compress :: proc(
+	src: []byte,
+	allocator: mem.Allocator,
+	scratch: ^Deflate_State = nil,
+) -> []byte {
 	bw: Bit_Writer
 	bw_init(&bw, allocator)
+	// deflate output is bounded by the input plus a small overhead, and a
+	// compressed body is normally a fraction of it: one reservation removes
+	// the doubling chain (13 reallocations for a 64 KiB body) from the path
+	reserve(&bw.out, len(src) / 2 + 512)
 
-	// The match-finder tables are 256 KiB. They come from the general
-	// allocator rather than `allocator` (which in the server is the
-	// per-connection arena sized for request data) so the arena never
-	// has to grow to fit them.
-	st := new(Deflate_State, context.allocator)
-	defer free(st, context.allocator)
-	for i in 0..<HASH_SIZE {
-		st.head[i] = -1
+	owned := scratch == nil
+	st: ^Deflate_State
+	if owned {
+		st = deflate_state_create()
+	} else {
+		st = scratch
 	}
-	// `prev` needs no clearing: it is only ever read through a `head`
-	// entry, and ds_insert writes both together.
+	defer {
+		if owned {
+			deflate_state_destroy(st)
+		}
+	}
+
+	base := int(st.base)
 
 	// one fixed-Huffman block, final
 	bw_put(&bw, 1, 1) // BFINAL
@@ -215,9 +297,12 @@ deflate_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
 		if pos + MIN_MATCH <= len(src) {
 			h := hash3(src, pos)
 			cand := int(st.head[h])
-			limit := pos - WINDOW_SIZE
-			if limit < 0 {
-				limit = 0
+			// The window limit is in the same rolling coordinates as `cand`.
+			// It can never reach back past `base`: earlier input belongs to
+			// a different buffer, and `cand - base` would go negative.
+			limit := base + pos - WINDOW_SIZE
+			if limit < base {
+				limit = base
 			}
 			max_len := len(src) - pos
 			if max_len > MAX_MATCH {
@@ -226,13 +311,13 @@ deflate_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
 			steps := MAX_CHAIN
 			for cand >= limit && steps > 0 {
 				steps -= 1
-				l := 0
-				for l < max_len && src[cand + l] == src[pos + l] {
-					l += 1
-				}
+				// `cand` is a rolling position; the match is against the
+				// current input, so shift it back into src's index space
+				cand_local := cand - base
+				l := match_len(src, cand_local, pos, max_len)
 				if l > best_len {
 					best_len = l
-					best_dist = pos - cand
+					best_dist = pos - cand_local
 					if l >= max_len {
 						break
 					}
@@ -255,18 +340,27 @@ deflate_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
 			// register every covered position so later matches can
 			// point into the middle of this one
 			for i := pos; i < pos + best_len; i += 1 {
-				ds_insert(st, src, i)
+				ds_insert(st, src, i, base)
 			}
 			pos += best_len
 		} else {
 			fh_put_symbol(&bw, int(src[pos]))
-			ds_insert(st, src, pos)
+			ds_insert(st, src, pos, base)
 			pos += 1
 		}
 	}
 
 	fh_put_symbol(&bw, 256) // end of block
 	bw_finish(&bw)
+
+	// advance the rolling base; renormalise before i32 can overflow
+	st.base += i32(len(src))
+	if st.base > 1 << 30 {
+		for i in 0 ..< HASH_SIZE {
+			st.head[i] = NO_POS
+		}
+		st.base = 0
+	}
 	return bw.out[:]
 }
 
@@ -274,8 +368,12 @@ deflate_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
 gzip_compress wraps a raw deflate stream in a gzip member (RFC 1952):
 10-byte header, deflate data, CRC-32 and input size, both little-endian.
 */
-gzip_compress :: proc(src: []byte, allocator: mem.Allocator) -> []byte {
-	deflated := deflate_compress(src, allocator)
+gzip_compress :: proc(
+	src: []byte,
+	allocator: mem.Allocator,
+	scratch: ^Deflate_State = nil,
+) -> []byte {
+	deflated := deflate_compress(src, allocator, scratch)
 	out := make([]byte, 10 + len(deflated) + 8, allocator)
 	out[0] = 0x1F
 	out[1] = 0x8B
@@ -320,6 +418,9 @@ Compress_Filter :: struct {
 	gzip:     bool,
 	deflate:  bool,
 	min_size: int,
+	// scratch is the match-finder table, reused across responses (see
+	// Deflate_State). Allocated on the first compressed response.
+	scratch: ^Deflate_State,
 }
 
 filter_compress_init :: proc(f: ^Compress_Filter) {
@@ -388,7 +489,10 @@ compress_apply :: proc(f: ^Filter, c: ^Conn) {
 	}
 
 	raw := buf_slice(&w.body)
-	compressed := gzip_compress(raw, conn_scratch(c)) if encoding == "gzip" else deflate_compress(raw, conn_scratch(c))
+	if cf.scratch == nil {
+		cf.scratch = deflate_state_create()
+	}
+	compressed := gzip_compress(raw, conn_scratch(c), cf.scratch) if encoding == "gzip" else deflate_compress(raw, conn_scratch(c), cf.scratch)
 	if len(compressed) >= len(raw) {
 		return // no gain: identity is the better answer
 	}

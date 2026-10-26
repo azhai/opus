@@ -196,3 +196,35 @@ test_http_date :: proc(t: ^testing.T) {
 	defer delete(second, context.allocator)
 	testing.expect_value(t, second, "Mon, 05 Jan 2026 00:00:00 GMT")
 }
+
+/*
+test_server_date_cache: the Date header is formatted once per second per
+server and shared by every response in that second. Two things have to hold -
+the cached text must equal what the uncached formatter produces, and it must
+roll over when the second changes.
+*/
+@(test)
+test_server_date_cache :: proc(t: ^testing.T) {
+	srv: Server
+	testing.expect(t, server_init(&srv, "127.0.0.1:0"))
+	defer server_destroy(&srv)
+
+	base := time.unix(1_700_000_000, 0)
+	first := server_date(&srv, base)
+	testing.expect_value(t, len(first), HTTP_DATE_LEN)
+	testing.expect_value(t, first, http_date(base, context.temp_allocator))
+
+	// a later instant inside the same second is the same string; the value is
+	// copied because `first` is a view into the cache the next call rewrites
+	snapshot := strings.clone(first, context.temp_allocator)
+	same := server_date(&srv, time.time_add(base, 900 * time.Millisecond))
+	testing.expect_value(t, same, snapshot)
+
+	// the next second is a different string
+	next := server_date(&srv, time.time_add(base, 1000 * time.Millisecond))
+	testing.expectf(t, next != snapshot, "the date did not roll over: %q", next)
+	testing.expect_value(t, next, http_date(time.time_add(base, time.Second), context.temp_allocator))
+
+	// an invalid time yields nothing rather than a garbage header
+	testing.expect_value(t, http_date_buf(time.Time{}, make([]byte, 8, context.temp_allocator)), 0)
+}

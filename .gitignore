@@ -11,6 +11,7 @@
 # Odin build artifacts (odin build/test emit .o; keep .odin sources tracked)
 *.a
 *.o
+*.bin
 
 # Output of the go coverage tool
 bin/

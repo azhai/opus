@@ -303,41 +303,148 @@ mime_type_for :: proc(path: string, charset := true) -> string {
 WEEKDAY_NAMES := [?]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
 MONTH_NAMES := [?]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
-// http_date renders an RFC 7231 IMF-fixdate timestamp, e.g.
-// "Sun, 06 Nov 1994 08:49:37 GMT".
-http_date :: proc(t: time.Time, allocator := context.allocator) -> string {
+// HTTP_DATE_LEN is the length of an RFC 7231 IMF-fixdate timestamp
+// ("Sun, 06 Nov 1994 08:49:37 GMT").
+HTTP_DATE_LEN :: 29
+
+/*
+http_date_buf renders `t` into `dst` and returns the number of bytes written,
+or 0 when the time is not representable.
+
+It writes into a caller-supplied buffer instead of appending to a Buf: the
+format is fixed-width, so the growth chain (and the clone that followed it)
+was pure overhead on a path every single response takes.
+*/
+http_date_buf :: proc(t: time.Time, dst: []byte) -> int {
+	if len(dst) < HTTP_DATE_LEN {
+		return 0
+	}
 	dt, ok := time.time_to_datetime(t)
 	if !ok {
-		return ""
+		return 0
 	}
 	ordinal, err := datetime.date_to_ordinal({dt.year, dt.month, dt.day})
 	if err != .None {
-		return ""
+		return 0
 	}
 	wd := datetime.day_of_week(ordinal)
-	b: Buf
-	buf_init(&b, allocator)
-	defer buf_destroy(&b)
-	buf_append_string(&b, WEEKDAY_NAMES[int(wd)])
-	buf_append_string(&b, ", ")
-	write_padded_u64(&b, u64(dt.day), 2)
-	buf_append_byte(&b, ' ')
+
+	n := 0
+	dst[0] = WEEKDAY_NAMES[int(wd)][0]
+	dst[1] = WEEKDAY_NAMES[int(wd)][1]
+	dst[2] = WEEKDAY_NAMES[int(wd)][2]
+	dst[3] = ','
+	dst[4] = ' '
+	n = 5
+	n += put_padded(dst[n:], u64(dt.day), 2)
+	dst[n] = ' '
+	n += 1
 	month_idx := int(dt.month)
+	name := MONTH_NAMES[0]
 	if month_idx >= 1 && month_idx <= 12 {
-		buf_append_string(&b, MONTH_NAMES[month_idx - 1])
-	} else {
-		buf_append_string(&b, "Jan")
+		name = MONTH_NAMES[month_idx - 1]
 	}
-	buf_append_byte(&b, ' ')
-	write_padded_i64(&b, dt.year, 4)
-	buf_append_string(&b, " ")
-	write_padded_i64(&b, i64(dt.hour), 2)
-	buf_append_byte(&b, ':')
-	write_padded_i64(&b, i64(dt.minute), 2)
-	buf_append_byte(&b, ':')
-	write_padded_i64(&b, i64(dt.second), 2)
-	buf_append_string(&b, " GMT")
-	return clone_string(string(buf_slice(&b)), allocator)
+	dst[n] = name[0]
+	dst[n + 1] = name[1]
+	dst[n + 2] = name[2]
+	n += 3
+	dst[n] = ' '
+	n += 1
+	n += put_padded(dst[n:], u64(dt.year), 4)
+	dst[n] = ' '
+	n += 1
+	n += put_padded(dst[n:], u64(dt.hour), 2)
+	dst[n] = ':'
+	n += 1
+	n += put_padded(dst[n:], u64(dt.minute), 2)
+	dst[n] = ':'
+	n += 1
+	n += put_padded(dst[n:], u64(dt.second), 2)
+	dst[n] = ' '
+	dst[n + 1] = 'G'
+	dst[n + 2] = 'M'
+	dst[n + 3] = 'T'
+	n += 4
+	return n
+}
+
+// http_date renders an RFC 7231 IMF-fixdate timestamp, e.g.
+// "Sun, 06 Nov 1994 08:49:37 GMT".
+http_date :: proc(t: time.Time, allocator := context.allocator) -> string {
+	tmp: [HTTP_DATE_LEN]byte
+	n := http_date_buf(t, tmp[:])
+	if n == 0 {
+		return ""
+	}
+	out := make([]byte, n, allocator)
+	copy(out, tmp[:n])
+	return string(out)
+}
+
+/*
+Date_Cache holds the current Date header value for one server.
+
+`response_build` runs once per response, and an IMF-fixdate timestamp changes
+at most once a second: formatting it per response (and allocating the string)
+was measurable work spent re-deriving the same 29 bytes. The cache is filled
+on the first response of each second and then shared by every connection
+served by that event loop, which is safe because a Server belongs to exactly
+one thread (see threads.odin).
+*/
+Date_Cache :: struct {
+	text:   string, // a view into `buf`, valid while `sec` is current
+	sec:    i64,    // unix second the cached text was formatted for
+	length: int,
+	buf:    [HTTP_DATE_LEN]byte,
+}
+
+// server_date returns the Date header value for `now`, reformatting it when
+// the second has changed.
+//
+// The returned string is a view into the cache, so it is only valid until the
+// next call on the same server. That is enough here: the only caller stores it
+// in a response header and serializes that header in the same event-loop turn
+// (response_build), never across a suspension point.
+server_date :: proc(s: ^Server, now: time.Time) -> string {
+	sec := time.time_to_unix(now)
+	if s.date.text == "" || s.date.sec != sec {
+		n := http_date_buf(now, s.date.buf[:])
+		if n == 0 {
+			return ""
+		}
+		s.date.length = n
+		s.date.text = string(s.date.buf[:n])
+		s.date.sec = sec
+	}
+	return s.date.text
+}
+
+// put_padded writes v zero-padded to `width` digits into dst and returns the
+// count. The buffer is assumed large enough (width <= 20).
+put_padded :: proc(dst: []byte, v: u64, width: int) -> int {
+	tmp: [20]byte
+	n := 0
+	x := v
+	for x > 0 {
+		tmp[n] = byte('0' + x % 10)
+		x /= 10
+		n += 1
+	}
+	if n == 0 {
+		tmp[0] = '0'
+		n = 1
+	}
+	total := n
+	if width > n {
+		total = width
+	}
+	for i := 0; i < total - n; i += 1 {
+		dst[i] = '0'
+	}
+	for i := 0; i < n; i += 1 {
+		dst[total - n + i] = tmp[n - 1 - i]
+	}
+	return total
 }
 
 write_padded_u64 :: proc(b: ^Buf, v: u64, width: int) {

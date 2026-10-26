@@ -287,6 +287,147 @@ test_integration_pipelined_requests :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(resp, "Connection: keep-alive\r\n"))
 }
 
+/*
+test_integration_pipeline_batch: a deep pipeline is answered in as few writes
+as the batch cap allows (see conn_batch_next). What must not change is the
+framing: every response follows the previous one exactly, a request that
+carries a body still has that body consumed before the next request is parsed,
+and the last response still closes the connection.
+
+The body-carrying request sits in the middle of the burst on purpose. It is the
+one hop where batching must be refused, because the input buffer then starts at
+the body rather than at the next head.
+*/
+@(test)
+test_integration_pipeline_batch :: proc(t: ^testing.T) {
+	ep, th, args := integration_spin(t, integration_handler)
+	defer integration_stop(t, args, th)
+
+	client, derr := net.dial_tcp_from_endpoint(ep)
+	testing.expect(t, derr == nil)
+	defer net.close(client)
+
+	DEPTH :: 24
+	PIPE_ECHO_BODY :: "abcde"
+
+	req := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&req)
+	for i in 0 ..< DEPTH {
+		fmt.sbprintf(&req, "GET /n%v HTTP/1.1\r\nHost: localhost\r\n\r\n", i)
+	}
+	fmt.sbprintf(
+		&req,
+		"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n%v",
+		PIPE_ECHO_BODY,
+	)
+	fmt.sbprintf(&req, "GET /after HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	payload := strings.to_string(req)
+
+	sent := 0
+	for sent < len(payload) {
+		n, serr := net.send_tcp(client, transmute([]byte)payload[sent:])
+		testing.expect(t, serr == nil && n > 0)
+		if serr != nil || n <= 0 {
+			return
+		}
+		sent += n
+	}
+
+	data := make([]byte, 64 << 10, context.allocator)
+	defer delete(data, context.allocator)
+	total := 0
+	for total < len(data) {
+		n, rerr := net.recv_tcp(client, data[total:])
+		if rerr != nil || n <= 0 {
+			break // the server closed after the Connection: close request
+		}
+		total += n
+	}
+
+	// walk the stream response by response: head, then Content-Length bytes
+	pos, count, echo_at := 0, 0, -1
+	for pos < total {
+		rel := bytes_index(data[pos:total], "\r\n\r\n")
+		testing.expectf(t, rel >= 0, "response %v has no head terminator", count)
+		if rel < 0 {
+			break
+		}
+		head := transmute(string)data[pos : pos + rel]
+		cl, has_len := content_length_of(head)
+		testing.expectf(t, has_len, "response %v has no Content-Length: %v", count, head)
+		body_start := pos + rel + 4
+		if body_start + cl > total {
+			testing.expectf(t, false, "response %v body is truncated", count)
+			break
+		}
+		body := data[body_start : body_start + cl]
+		if string(body) == PIPE_ECHO_BODY {
+			echo_at = count
+		}
+		pos = body_start + cl
+		count += 1
+	}
+	testing.expectf(t, count == DEPTH + 2, "got %v responses, want %v", count, DEPTH + 2)
+	testing.expectf(t, echo_at == DEPTH, "echo arrived as response %v, want %v", echo_at, DEPTH)
+	testing.expect(
+		t,
+		bytes_contains(data[:total], "Connection: close\r\n"),
+		"the last response does not close the connection",
+	)
+}
+
+/*
+test_integration_pipeline_bad_request: a malformed request in the middle of a
+pipeline must not cost the client the responses that came before it.
+
+The error path used to clear the output buffer, which was correct while every
+response was flushed on its own and wrong as soon as batching let earlier
+responses wait there (conn_error truncates to `out_mark` instead). The client
+sees the good responses, then the 400, then the close.
+*/
+@(test)
+test_integration_pipeline_bad_request :: proc(t: ^testing.T) {
+	ep, th, args := integration_spin(t, integration_handler)
+	defer integration_stop(t, args, th)
+
+	client, derr := net.dial_tcp_from_endpoint(ep)
+	testing.expect(t, derr == nil)
+	defer net.close(client)
+
+	request := "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+		"GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+		"GET /bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n"
+	sent := 0
+	for sent < len(request) {
+		n, serr := net.send_tcp(client, transmute([]byte)request[sent:])
+		testing.expect(t, serr == nil && n > 0)
+		if serr != nil || n <= 0 {
+			return
+		}
+		sent += n
+	}
+
+	data := make([]byte, 16 << 10, context.allocator)
+	defer delete(data, context.allocator)
+	total := 0
+	for total < len(data) {
+		n, rerr := net.recv_tcp(client, data[total:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		total += n
+	}
+
+	stream := data[:total]
+	testing.expect(t, bytes_contains(stream, "hello integration"))
+	// both good bodies are present, then the 400, in that order
+	first := bytes_index(stream, "hello integration")
+	second := bytes_index(stream[first + 1:], "hello integration")
+	bad := bytes_index(stream, "HTTP/1.1 400 Bad Request")
+	testing.expectf(t, first >= 0 && second >= 0, "the batched responses were lost: %v", total)
+	testing.expectf(t, bad > first + 1 + second, "the 400 came before the responses it followed: %v", total)
+}
+
 @(test)
 test_integration_head_request :: proc(t: ^testing.T) {
 	ep, th, args := integration_spin(t, integration_handler)

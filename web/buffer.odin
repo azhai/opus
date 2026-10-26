@@ -79,19 +79,67 @@ buf_truncate :: proc(b: ^Buf, n: int) {
 	}
 }
 
-// bytes_index finds needle in haystack; returns -1 when absent.
+/*
+bytes_index finds needle in haystack; returns -1 when absent.
+
+Short haystacks use a plain scan (a skip table would cost more than the scan
+it saves). Anything larger uses Boyer-Moore-Horspool: the two searches this
+library runs per request - the CRLFCRLF header terminator and the multipart
+delimiter - both look for a multi-byte needle in a buffer that can be tens of
+kilobytes, and Horspool advances by up to len(needle) bytes per probe instead
+of one.
+*/
 bytes_index :: proc(haystack: []byte, needle: string) -> int {
 	n, m := len(haystack), len(needle)
 	if m == 0 || n < m {
 		return -1
 	}
+	if n < 64 || m < 3 {
+		return bytes_index_naive(haystack, needle)
+	}
+
+	skip: [256]int
+	for i in 0 ..< 256 {
+		skip[i] = m
+	}
+	for i in 0 ..< m - 1 {
+		skip[needle[i]] = m - 1 - i
+	}
+
 	last := n - m
-	for i in 0..=last {
+	i := 0
+	for i <= last {
+		window := haystack[i + m - 1]
+		if window == needle[m - 1] {
+			j := 0
+			for j < m - 1 {
+				if haystack[i + j] != needle[j] {
+					break
+				}
+				j += 1
+			}
+			if j == m - 1 {
+				return i
+			}
+		}
+		i += skip[window]
+	}
+	return -1
+}
+
+// bytes_index_naive is the plain scan, kept for short buffers.
+bytes_index_naive :: proc(haystack: []byte, needle: string) -> int {
+	n, m := len(haystack), len(needle)
+	if m == 0 || n < m {
+		return -1
+	}
+	last := n - m
+	for i in 0 ..= last {
 		if haystack[i] != needle[0] {
 			continue
 		}
 		match := true
-		for j in 1..<m {
+		for j in 1 ..< m {
 			if haystack[i + j] != needle[j] {
 				match = false
 				break

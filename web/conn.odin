@@ -119,6 +119,26 @@ Conn :: struct {
 	chunked:        bool,
 	requests:       int,
 
+	// head_scanned is how far into `inbuf` the CRLFCRLF search has already
+	// looked. Without it, a head that arrives in pieces is rescanned from
+	// byte 0 after every recv: 8 KiB of headers delivered in 512-byte
+	// segments costs 16 scans of a growing buffer instead of one pass.
+	head_scanned: int,
+
+	// batch_ok says the request that just finished consumed its head and
+	// nothing else, so `inbuf` now starts exactly at the next pipelined
+	// request. Only then may the write path defer its flush (see
+	// conn_batch_next): with a body still buffered, scanning for the next
+	// head would find a terminator inside that body.
+	batch_ok: bool,
+
+	// out_mark is where the current request's output starts inside `c.out`.
+	// An error response truncates back to it instead of clearing the buffer,
+	// because in a pipeline batch `c.out` already holds the responses of the
+	// requests that came before - and a bad request in the middle must not
+	// erase them.
+	out_mark: int,
+
 	idle_since: time.Time,
 
 	file_handle: nbio.Handle,
@@ -275,6 +295,49 @@ on_socket_closed :: proc(op: ^nbio.Operation, c: ^Conn) {
 	conn_destroy(c)
 }
 
+/*
+WRITE_BATCH_BYTES caps how much pipelined response data may pile up in `c.out`
+before it is flushed.
+
+A pipelining client writes N requests in one go; without batching the server
+answers with N send operations - N syscalls, N packets, and N wakeups on the
+client. Coalescing up to 16 KiB of responses into a single write turns the
+per-request cost of a pipeline from a syscall into a memcpy, which is where the
+whole difference lives: the serialization itself is a few hundred nanoseconds
+(see bench/), while one send operation is measured in microseconds.
+*/
+WRITE_BATCH_BYTES :: 16 << 10
+
+/*
+conn_batch_next decides whether the response that was just serialized can wait
+in `c.out` while the next pipelined request is handled.
+
+It is conservative on purpose. Batching is refused when the connection is
+closing, when the response carries a file body (sendfile has its own send),
+when TLS is in play (`c.out` is not what reaches the socket), and - the one
+that matters - unless the *next* request head is already buffered. Deferring a
+flush while waiting for more input would deadlock a client that is itself
+waiting for the responses before it sends more.
+*/
+conn_batch_next :: proc(c: ^Conn) -> bool {
+	if !c.res.keep_alive || c.closing || c.closed || c.op != nil {
+		return false
+	}
+	if c.tls != nil || file_pending(&c.res) || !c.batch_ok {
+		return false
+	}
+	if buf_len(&c.out) >= WRITE_BATCH_BYTES {
+		return false
+	}
+	data := buf_slice(&c.inbuf)
+	if len(data) == 0 {
+		return false
+	}
+	// batch_ok means `data` starts at a request head, so the first terminator
+	// found belongs to that head and not to a body left in the buffer
+	return bytes_index(data, "\r\n\r\n") >= 0
+}
+
 // conn_drive advances the connection state machine as far as it can go
 // without blocking. Every state that needs more data arms a recv and stops;
 // the Write state is always asynchronous and returns.
@@ -308,6 +371,13 @@ conn_drive :: proc(c: ^Conn) {
 			// parked: a deferred handler will resume this connection
 			return
 		case .Write:
+			if conn_batch_next(c) {
+				// responses stay in c.out: reset the request half of the
+				// connection, keep the bytes, and parse the next request
+				conn_request_reset(c, keep_output = true)
+				c.state = .Read_Head
+				continue
+			}
 			conn_begin_write(c)
 			return
 		case .Closed:
@@ -349,9 +419,25 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 // Returns true when the machine advanced (head parsed, or an error response
 // was queued); false when more data is needed and a recv was armed.
 conn_try_head :: proc(c: ^Conn) -> bool {
+	// anything already in `out` belongs to an earlier request in this pipeline
+	// batch: an error from here on may only discard what this request writes
+	c.out_mark = buf_len(&c.out)
 	data := buf_slice(&c.inbuf)
-	idx := bytes_index(data, "\r\n\r\n")
+	// resume where the last scan stopped; a terminator can straddle the
+	// boundary, so back up by its length minus one
+	from := c.head_scanned - 3
+	if from < 0 {
+		from = 0
+	}
+	if from > len(data) {
+		from = len(data)
+	}
+	idx := -1
+	if rel := bytes_index(data[from:], "\r\n\r\n"); rel >= 0 {
+		idx = from + rel
+	}
 	if idx < 0 {
+		c.head_scanned = len(data)
 		if buf_len(&c.inbuf) >= c.server.max_header_size {
 			conn_error(c, .Header_Too_Large, "431 request header fields too large\n")
 			return true
@@ -378,6 +464,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		return true
 	}
 	buf_consume(&c.inbuf, head_len)
+	c.head_scanned = 0
 
 	// the previous response's storage lived on the scratch arena, which was
 	// reset after the last request: re-arm it for this one
@@ -401,6 +488,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 	}
 
 	// request body framing, strict per RFC 7230 section 3.3.3
+	c.batch_ok = false
 	kind, blen, ferr := request_framing(req)
 	if ferr != .None {
 		conn_error(c, .Bad_Request, framing_error_message(ferr))
@@ -438,6 +526,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 			return true
 		}
 		if blen == 0 {
+			c.batch_ok = true
 			c.state = .Process
 			return true
 		}
@@ -451,6 +540,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		c.state = .Read_Body
 		return true
 	case .None:
+		c.batch_ok = true
 	}
 
 	c.state = .Process
@@ -887,12 +977,17 @@ conn_after_write :: proc(c: ^Conn) {
 	conn_recv_arm(c, c.server.idle_timeout)
 }
 
-conn_request_reset :: proc(c: ^Conn) {
+conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 	// NOTE: `in` is deliberately not reset here: it may already hold the
 	// head of a pipelined request. It is drained by the head/body parser.
 	conn_body_sink_teardown(c)
-	mem.dynamic_arena_reset(&c.scratch)
-	buf_reset(&c.out)
+	if !keep_output {
+		// Both the arena and c.out are left alone while a pipeline batch is
+		// still accumulating: the buffered responses live in arena memory, and
+		// rewinding the arena would hand their bytes to the next request.
+		mem.dynamic_arena_reset(&c.scratch)
+		buf_reset(&c.out)
+	}
 	buf_reset(&c.body_buf)
 	buf_reset(&c.proxy_req)
 	buf_reset(&c.proxy_buf)
@@ -900,6 +995,7 @@ conn_request_reset :: proc(c: ^Conn) {
 	c.res = {}
 	c.body_remaining = 0
 	c.chunked = false
+	c.head_scanned = 0
 	c.send_phase = .None
 	c.idle_since = {}
 	c.proxy_state = .None
@@ -922,7 +1018,9 @@ conn_request_reset :: proc(c: ^Conn) {
 // once it has been written.
 conn_error :: proc(c: ^Conn, status: Status, msg: string) {
 	log_debug("web: conn %v error %v", c.remote, status)
-	buf_reset(&c.out)
+	// truncate, not reset: responses for earlier requests in the same pipeline
+	// batch are already sitting in `c.out` and their client is waiting for them
+	buf_truncate(&c.out, c.out_mark)
 	w := &c.res
 	response_reset(w, c, conn_scratch(c))
 	w.status = status

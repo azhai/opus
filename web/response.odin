@@ -8,6 +8,12 @@ import "core:time"
 
 SERVER_NAME :: "web-odin/0.1"
 
+// RESPONSE_HEADER_SLOTS is how many headers a response is reserved for.
+// Content-Type, Content-Length, Connection, Server and Date already make five;
+// growing a dynamic array three times to hold them was three allocations per
+// response.
+RESPONSE_HEADER_SLOTS :: 8
+
 /*
 Response is the write side of a request.
 
@@ -65,6 +71,7 @@ response_init :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 	w.conn = c
 	w.status = .OK
 	w.headers = make([dynamic]Header, allocator)
+	reserve(&w.headers, RESPONSE_HEADER_SLOTS)
 	buf_init(&w.body, allocator)
 }
 
@@ -87,6 +94,7 @@ response_reset :: proc(w: ^Response, c: ^Conn, allocator: mem.Allocator) {
 	w.compress = .Default
 	w.compress_min = 0
 	w.headers = make([dynamic]Header, allocator)
+	reserve(&w.headers, RESPONSE_HEADER_SLOTS)
 	buf_init(&w.body, allocator)
 }
 
@@ -357,6 +365,15 @@ response_hijack :: proc(w: ^Response) -> (socket: net.TCP_Socket, ok: bool) {
 	if c == nil || c.closed || c.server == nil {
 		return {}, false
 	}
+	if c.out_mark > 0 {
+		// Responses for earlier requests of this pipeline batch are still in
+		// `c.out` (they were coalesced by conn_batch_next). Handing over the
+		// socket would drop the bytes their clients are already waiting for,
+		// so refuse: the handler answers normally instead and the stream can
+		// start on a fresh connection.
+		log_debug("web: hijack refused, %v batched byte(s) pending", c.out_mark)
+		return {}, false
+	}
 	s := c.server
 	if c.op != nil {
 		nbio.remove(c.op)
@@ -421,7 +438,15 @@ response_build :: proc(w: ^Response, out: ^Buf, allocator: mem.Allocator) {
 		if now == {} {
 			now = time.now()
 		}
-		response_set_header(w, "Date", http_date(now, allocator))
+		date := ""
+		if w.conn != nil && w.conn.server != nil {
+			// one format per second per server, not per response
+			date = server_date(w.conn.server, now)
+		}
+		if len(date) == 0 {
+			date = http_date(now, allocator)
+		}
+		response_set_header(w, "Date", date)
 	}
 
 	// status line

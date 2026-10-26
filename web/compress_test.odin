@@ -133,6 +133,9 @@ test_gzip_distance_codes :: proc(t: ^testing.T) {
 
 		gz := gzip_compress(src, alloc)
 		out: bytes.Buffer
+		// the inflated buffer comes from context.allocator, not the arena, so
+		// it has to be released per iteration (defer binds to this block)
+		defer delete(out.buf)
 		err := gzip.load_from_bytes(gz, &out)
 		testing.expectf(t, err == nil, "distance code %d (dist %d): %v", code, dist, err)
 		if err == nil {
@@ -391,4 +394,179 @@ compress_skip_handler :: proc(req: ^Request, res: ^Response) {
 		response_set_header(res, "Content-Type", "image/png")
 		response_write_string(res, test_repeat("not compressible by policy, plenty long enough. ", 20, conn_scratch(req.conn)))
 	}
+}
+
+/*
+test_deflate_shared_scratch: the match-finder tables are reused across calls,
+with a rolling position base instead of a per-call clear. Reuse is what makes
+the tables worth having, and it is also where a bug would hide: an entry left
+by the previous input must be invisible to this one, or a match would point
+into a buffer that no longer exists (a silent corruption, not a crash).
+*/
+@(test)
+test_deflate_shared_scratch :: proc(t: ^testing.T) {
+	arena_buf := make([]byte, 1 << 20, context.allocator)
+	defer delete(arena_buf, context.allocator)
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf)
+	alloc := mem.arena_allocator(&arena)
+
+	scratch := deflate_state_create()
+	defer deflate_state_destroy(scratch)
+
+	make_text :: proc(n: int, seed: int, alloc: mem.Allocator) -> []byte {
+		b := make([]byte, n, alloc)
+		x := u32(seed)
+		for i in 0 ..< n {
+			// mostly repetitive, with periodic noise: matches *and* literals
+			if (i / 97) % 5 == 0 {
+				b[i] = byte('a' + (i * 7) % 26)
+			} else {
+				x = x * 1103515245 + 12345
+				b[i] = byte('a' + (x >> 16) % 26)
+			}
+		}
+		return b
+	}
+
+	// several inputs through one scratch: the first builds the tables, later
+	// ones must not see stale positions; the 64 KiB one is wider than the
+	// 32 KiB window, which is what the rolling base has to handle
+	sizes := [5]int{1024, 4096, 64 << 10, 300, 33 << 10}
+	for size, i in sizes {
+		src := make_text(size, 7 + i, alloc)
+		deflated := deflate_compress(src, alloc, scratch)
+		out: bytes.Buffer
+		defer delete(out.buf)
+		err := zlib.inflate_from_byte_array(deflated, &out, raw = true)
+		testing.expectf(t, err == nil, "size %v: inflate failed", size)
+		testing.expectf(t, len(out.buf) == len(src), "size %v: inflated %v bytes", size, len(out.buf))
+		if len(out.buf) == len(src) {
+			testing.expectf(t, mem.compare(out.buf[:], src) == 0, "size %v: round trip differs", size)
+		}
+	}
+
+	// the same input through a warmed scratch and a fresh one must agree:
+	// reuse may cost ratio, but it must never change what is encoded
+	src := make_text(8192, 99, alloc)
+	a := deflate_compress(src, alloc, scratch)
+	b := deflate_compress(src, alloc)
+	testing.expectf(t, mem.compare(a, b) == 0, "shared scratch changed the output")
+}
+
+// scratch_handler varies its payload by path so one connection can produce two
+// responses that compress to different lengths.
+scratch_handler :: proc(req: ^Request, res: ^Response) {
+	response_set_header(res, "Content-Type", "text/plain")
+	n := 200
+	if req.path == "/small" {
+		n = 20 // above MIN_COMPRESS_SIZE, but far shorter than /big
+	}
+	for i in 0 ..< n {
+		response_write_string(res, "lorem ipsum dolor sit amet consectetur ")
+	}
+}
+
+/*
+test_integration_gzip_scratch_reuse: the compress filter owns one match-finder
+table for its whole life, so responses on the same server share it. The table
+carries positions from earlier responses, and if those were not filtered out a
+match would be emitted against bytes that belong to a different body - the
+stream would still be well-formed and still inflate, just to the wrong data.
+
+Two responses on one connection is the smallest case that catches it.
+*/
+@(test)
+test_integration_gzip_scratch_reuse :: proc(t: ^testing.T) {
+	srv := new(Server, context.allocator)
+	testing.expect(t, server_init(srv, "127.0.0.1:0"))
+	defer server_destroy(srv)
+	srv.handler = scratch_handler
+	srv.idle_timeout = 2 * time.Second
+	ep, th, args := integration_spin_srv(t, srv)
+	defer integration_stop(t, args, th)
+
+	client, derr := net.dial_tcp_from_endpoint(ep)
+	testing.expect(t, derr == nil)
+	defer net.close(client)
+
+	// both requests on one keep-alive connection, pipelined
+	requests := "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n" +
+		"GET /small HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+	sn, serr := net.send_tcp(client, transmute([]byte)requests)
+	testing.expect(t, serr == nil && sn == len(requests))
+
+	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
+	buf := make([]byte, 64 << 10, context.allocator)
+	defer delete(buf, context.allocator)
+	total := 0
+	seen := 0
+	for total < len(buf) {
+		n, rerr := net.recv_tcp(client, buf[total:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		// count complete responses by counting status lines
+		for i := total; i + 9 <= total + n; i += 1 {
+			if string(buf[i:i + 9]) == "HTTP/1.1 " {
+				seen += 1
+			}
+		}
+		total += n
+		if seen >= 2 {
+			// keep reading until the peer closes (Connection: close)
+			continue
+		}
+	}
+	stream := buf[:total]
+
+	big := test_repeat("lorem ipsum dolor sit amet consectetur ", 200, context.allocator)
+	defer delete(big)
+	small := test_repeat("lorem ipsum dolor sit amet consectetur ", 20, context.allocator)
+	defer delete(small)
+
+	pos := 0
+	for want, idx in ([2]string{big, small}) {
+		head_end := bytes_index(stream[pos:], "\r\n\r\n")
+		testing.expectf(t, head_end >= 0, "response %v has no head", idx)
+		if head_end < 0 {
+			return
+		}
+		head := string(stream[pos:pos + head_end])
+		testing.expectf(t, strings.contains(head, "Content-Encoding: gzip"), "response %v is not coded: %v", idx, head)
+		cl, ok := content_length_of(head)
+		testing.expectf(t, ok, "response %v has no Content-Length", idx)
+		body_start := pos + head_end + 4
+		body := stream[body_start:body_start + cl]
+
+		out: bytes.Buffer
+		err := gzip.load_from_bytes(body, &out)
+		testing.expectf(t, err == nil, "response %v did not inflate: %v", idx, err)
+		testing.expectf(t, string(out.buf[:]) == string(want), "response %v inflated to the wrong bytes (%v vs %v)", idx, len(out.buf), len(want))
+		delete(out.buf)
+
+		pos = body_start + cl
+	}
+}
+
+// content_length_of digs Content-Length out of a response head.
+content_length_of :: proc(head: string) -> (int, bool) {
+	rest := head
+	for {
+		nl := string_index(rest, "\r\n")
+		if nl < 0 {
+			return 0, false
+		}
+		line := rest[:nl]
+		rest = rest[nl + 2:]
+		if !eq_ignore_case(line, "Content-Length") && strings_has_prefix_ci(line, "content-length:") {
+			if v, ok := parse_int(trim_ows(line[len("content-length:"):])); ok {
+				return v, true
+			}
+		}
+	}
+}
+
+strings_has_prefix_ci :: proc(s, prefix: string) -> bool {
+	return len(s) >= len(prefix) && eq_ignore_case(s[:len(prefix)], prefix)
 }
