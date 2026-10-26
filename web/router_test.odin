@@ -123,3 +123,130 @@ router_handle_with :: proc(r: ^Router, req: ^Request, res: ^Response) {
 	}
 	router_next(r, 0, route.handler, req, res)
 }
+
+@(test)
+test_router_rewrites :: proc(t: ^testing.T) {
+	arena_buf: [64 << 10]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf[:])
+	alloc := mem.arena_allocator(&arena)
+
+	r: Router
+	router_init(&r, alloc)
+	defer router_destroy(&r)
+	router_rewrite(&r, "/old", "/new")
+	router_rewrite(&r, "/favicon.ico", "/static/favicon.ico", true)
+	router_rewrite(&r, "/exact", "/only", true)
+
+	c: Conn
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+
+	// prefix rules keep the tail
+	req := Request{conn = &c, path = "/old/a/b"}
+	router_apply_rewrites(&r, &req)
+	testing.expect_value(t, req.path, "/new/a/b")
+
+	req_self := Request{conn = &c, path = "/old"}
+	router_apply_rewrites(&r, &req_self)
+	testing.expect_value(t, req_self.path, "/new")
+
+	// prefix matching stops at a segment boundary
+	req_older := Request{conn = &c, path = "/older"}
+	router_apply_rewrites(&r, &req_older)
+	testing.expect_value(t, req_older.path, "/older")
+
+	// exact rules match the whole path only
+	req_favicon := Request{conn = &c, path = "/favicon.ico"}
+	router_apply_rewrites(&r, &req_favicon)
+	testing.expect_value(t, req_favicon.path, "/static/favicon.ico")
+
+	req_child := Request{conn = &c, path = "/exact/sub"}
+	router_apply_rewrites(&r, &req_child)
+	testing.expect_value(t, req_child.path, "/exact/sub")
+
+	// the first registered rule wins
+	router_rewrite(&r, "/old", "/second")
+	req_first := Request{conn = &c, path = "/old"}
+	router_apply_rewrites(&r, &req_first)
+	testing.expect_value(t, req_first.path, "/new")
+}
+
+@(test)
+test_router_all_methods :: proc(t: ^testing.T) {
+	arena_buf: [64 << 10]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf[:])
+	alloc := mem.arena_allocator(&arena)
+
+	r: Router
+	router_init(&r, alloc)
+	defer router_destroy(&r)
+	router_all(&r, "/any", dummy_handler)
+
+	methods := []Method{Method.Get, Method.Post, Method.Put, Method.Patch, Method.Delete, Method.Options}
+	for method in methods {
+		req := Request{method = method, path = "/any"}
+		route, ok := router_match(&r, &req, alloc)
+		testing.expectf(t, route != nil, "%v: route not matched", method)
+		testing.expectf(t, ok, "%v: method rejected", method)
+	}
+
+	// .All is not a wildcard for the path
+	req_miss := Request{method = .Get, path = "/nope"}
+	route_miss, _ := router_match(&r, &req_miss, alloc)
+	testing.expect(t, route_miss == nil)
+}
+
+// custom_not_found is installed by test_router_fallthrough below.
+custom_not_found :: proc(req: ^Request, res: ^Response) {
+	res.status = .Not_Found
+	response_write_string(res, "custom 404")
+}
+
+@(test)
+test_router_fallthrough :: proc(t: ^testing.T) {
+	arena_buf: [64 << 10]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, arena_buf[:])
+	alloc := mem.arena_allocator(&arena)
+
+	r: Router
+	router_init(&r, alloc)
+	defer router_destroy(&r)
+	router_get(&r, "/only", dummy_handler)
+
+	c: Conn
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+	srv: Server
+	srv.user_ptr = &r
+	c.server = &srv
+
+	// an unmatched path still walks the chain and ends in the 404 terminal
+	res: Response
+	response_init(&res, &c, conn_scratch(&c))
+	req := Request{conn = &c, method = .Get, path = "/missing", target = "/missing"}
+	router_handle(&req, &res)
+	testing.expect_value(t, res.status, Status.Not_Found)
+	testing.expect_value(t, string(buf_slice(&res.body)), "404 page not found\n")
+
+	// a known path under the wrong method gets 405 + Allow
+	res_405: Response
+	response_init(&res_405, &c, conn_scratch(&c))
+	req_405 := Request{conn = &c, method = .Post, path = "/only", target = "/only"}
+	router_handle(&req_405, &res_405)
+	testing.expect_value(t, res_405.status, Status.Method_Not_Allowed)
+	allow, has_allow := response_header(&res_405, "Allow")
+	testing.expect(t, has_allow)
+	testing.expect(t, strings.contains(allow, "GET"))
+
+	// r.not_found replaces the default body without losing the status
+	r.not_found = custom_not_found
+	res_custom: Response
+	response_init(&res_custom, &c, conn_scratch(&c))
+	req_custom := Request{conn = &c, method = .Get, path = "/missing", target = "/missing"}
+	router_handle(&req_custom, &res_custom)
+	testing.expect_value(t, res_custom.status, Status.Not_Found)
+	testing.expect_value(t, string(buf_slice(&res_custom.body)), "custom 404")
+}

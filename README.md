@@ -48,7 +48,7 @@ main :: proc() {
   `request_scheme` / `request_client_ip` / `request_content_type` /  
   `request_is_ajax` / `request_accepts` / `request_json`、`response_json_status` /  
   `response_error` / `response_download` / `response_clear_cookie` 等
-- 内置中间件（`web/middleware` 子包）：request id、访问日志、CORS（含预检）、  
+- 内置中间件（`web/middlewares` 子包）：request id、访问日志、CORS（含预检）、  
   Basic/Bearer/API-Key 认证、正文限额、安全响应头、禁缓存、表单解析、  
   Range+ETag、流式反缓冲、**gzip 开关**、**签名 Cookie 会话**、**JWT(HS256) 校验**、  
   **静态目录挂载**、**重定向规则**、**multipart 落盘上传**；可全局注册，也可用  
@@ -104,11 +104,11 @@ main :: proc() {
 ```bash
 # 编译验证库本身（库包没有 main，用 build 而非 check）
 odin build web -build-mode:static
-odin build web/middleware -build-mode:static
+odin build web/middlewares -build-mode:static
 
 # 运行全部测试（单测 + 起真实服务的集成测试，含泄漏检测）
 odin test web/
-odin test web/middleware
+odin test web/middlewares
 
 # 只跑某个测试
 odin test web/ -define:ODIN_TEST_NAMES=web.test_integration_head_request,
@@ -124,11 +124,14 @@ odin test web/ -define:WEB_DEBUG=true
 odin run examples/hello
 curl --noproxy '*' localhost:8080/
 
-# REST 风格 API：router + :param + 模式捕获 + Cookie + JSON + 中间件
+# REST 风格 API：router + :param + 模式捕获 + Cookie + JSON 绑定/响应 +
+# 内置 request-id/access-log 中间件；错误与 404 也是 JSON
 odin run examples/api
 curl --noproxy '*' localhost:8080/users/42               # :param
 curl --noproxy '*' localhost:8080/orders/2024/42         # (%d+) 模式捕获
-curl --noproxy '*' -X POST localhost:8080/users -d '{"name":"ada"}'
+curl --noproxy '*' -X POST localhost:8080/users -H 'Content-Type: application/json' -d '{"name":"ada"}'   # request_json -> 201
+curl --noproxy '*' localhost:8080/users/abc              # {"error":"id must be an integer"} + 400
+curl --noproxy '*' -i localhost:8080/nope                # JSON 404
 curl --noproxy '*' -b 'token=xyz' localhost:8080/whoami  # 请求 Cookie
 curl --noproxy '*' -i localhost:8080/login               # Set-Cookie
 curl --noproxy '*' localhost:8080/stats                  # response_json
@@ -152,7 +155,7 @@ curl -k --noproxy '*' https://127.0.0.1:8443/
 curl -k --noproxy '*' https://127.0.0.1:8443/ https://127.0.0.1:8443/  # keep-alive
 
 # 专用中间件（按路由挂载：认证 / 表单上传 / Range+ETag / SSE / 流式上传）
-odin run examples/middleware -- 127.0.0.1:8091
+odin run examples/middlewares -- 127.0.0.1:8091
 curl --noproxy '*' -r 10-19 localhost:8091/report.csv          # 206
 curl --noproxy '*' -I localhost:8091/report.csv                # ETag / Accept-Ranges
 curl --noproxy '*' -u admin:secret localhost:8091/admin         # 401 -> 200
@@ -218,18 +221,18 @@ web/
   buffer.odin    Buf 与字节工具
   log.odin       分级日志（WEB_DEBUG 门控）
   testdata/      TLS 自签证书（cert.pem / key.pem）
-  middleware/    中间件子包（import ".."）：见下
+  middlewares/   中间件子包（import ".."）：见下
   *_test.odin    按主题拆分的测试：parser / router / response / proxy / cookie /
                  json / pattern / range / framing / compress / tls / http /
                  sse / multipart_stream / upload / hub / integration / support
 examples/
   hello/         最小服务
-  api/           router + 中间件 + 模式捕获 + Cookie + JSON
+  api/           router + 内置中间件 + 模式捕获 + Cookie + JSON（错误也是 JSON）
   static/        静态文件 + catch-all 动态路由
   proxy/         反向代理（/api 前缀剥离转发 + 本地 /health + 连接池清理）
   https/         TLS（自签证书 + keep-alive）
   threads/       多 acceptor 线程（每线程请求数统计）
-  middleware/    按路由挂载的专用中间件：认证 / 表单 / Range+ETag / gzip / SSE /
+  middlewares/   按路由挂载的专用中间件：认证 / 表单 / Range+ETag / gzip / SSE /
                  流式上传
   webapp/        一个小型应用：会话 / JWT / 静态挂载 / 重写 / 重定向 / 上传
   www/           静态测试资源
@@ -238,7 +241,7 @@ docs/
 ```
 
 ```
-web/middleware/              中间件子包（package middleware，import ".."）
+web/middlewares/              中间件子包（package middlewares，import ".."）
   middleware.odin  通用：request id、访问日志、CORS、限额、安全头、禁缓存、反缓冲
   auth.odin        Basic / Bearer / API-Key + principal
   range.odin       Range + ETag（handler 只写完整正文）
@@ -340,15 +343,15 @@ my_middleware :: proc(m: ^web.Middleware, r: ^web.Router, idx: int,
 注册的 `OPTIONS`）、404 的访问日志、统一的安全头都能生效。`router_all` 注册  
 的路由对所有方法生效。
 
-**内置中间件**都在 `web/middleware` 子包里（`router_use` 全局注册，或  
+**内置中间件**都在 `web/middlewares` 子包里（`router_use` 全局注册，或  
 `router_use_route` 挂到单条路由；需要配置的从 `ud` 传 `^Xxx_Config`，`nil`  
 即默认值）：
 
 ```odin
 import "web"
-import "web/middleware"     // 父包不能反向 import 子包，所以两边都要写
+import "web/middlewares"     // 父包不能反向 import 子包，所以两边都要写
 
-web.router_use(&router, middleware.middleware_request_id)
+web.router_use(&router, middlewares.middleware_request_id)
 ```
 
 | 过程                                       | 作用                                                                                                           | 配置                      |
@@ -377,15 +380,15 @@ web.router_use(&router, middleware.middleware_request_id)
 `middleware_logger` 的日志行里带 `user=`，401 与 200 都能追到同一个令牌。
 
 ```odin
-cors_cfg := middleware.CORS_Config {
+cors_cfg := middlewares.CORS_Config {
 	origins           = []string{"https://admin.example"},
 	allow_credentials = true,
 	expose_headers    = "X-Total-Count",
 }
-web.router_use(&router, middleware.middleware_request_id)     // 先：id 进日志
-web.router_use(&router, middleware.middleware_logger)
-web.router_use(&router, middleware.middleware_secure_headers)
-web.router_use(&router, middleware.middleware_cors, &cors_cfg) // 配置要活得比 server 长
+web.router_use(&router, middlewares.middleware_request_id)     // 先：id 进日志
+web.router_use(&router, middlewares.middleware_logger)
+web.router_use(&router, middlewares.middleware_secure_headers)
+web.router_use(&router, middlewares.middleware_cors, &cors_cfg) // 配置要活得比 server 长
 ```
 
 顺序即执行顺序（`router_use` 追加）；跨切面的放前面，鉴权/路由相关的放后面，  
@@ -399,9 +402,9 @@ web.router_use(&router, middleware.middleware_cors, &cors_cfg) // 配置要活�
 report := web.router_get(&router, "/report.csv", report_handler)
 admin  := web.router_get(&router, "/admin", admin_handler)
 submit := web.router_add(&router, web.Method.Post, "/submit", submit_handler)
-web.router_use_route(report, middleware.middleware_range, &range_cfg)     // Range + ETag
-web.router_use_route(admin,  middleware.middleware_basic_auth, &admin_cfg)
-web.router_use_route(submit, middleware.middleware_form, &form_cfg)
+web.router_use_route(report, middlewares.middleware_range, &range_cfg)     // Range + ETag
+web.router_use_route(admin,  middlewares.middleware_basic_auth, &admin_cfg)
+web.router_use_route(submit, middlewares.middleware_form, &form_cfg)
 ```
 
 路由级链在全局链之后、handler 之前执行；中间件实现不用改（`router_next` 对  
@@ -429,14 +432,14 @@ if f, ok := web.request_file(req, "avatar"); ok {
 **上传落盘**（文件不进内存：解析后直接写磁盘，handler 拿到路径）
 
 ```odin
-up_cfg := middleware.Upload_Config { dir = "./uploads", max_file_bytes = 4 << 20, max_files = 4 }
-web.router_use_route(upload_route, middleware.middleware_upload, &up_cfg)
+up_cfg := middlewares.Upload_Config { dir = "./uploads", max_file_bytes = 4 << 20, max_files = 4 }
+web.router_use_route(upload_route, middlewares.middleware_upload, &up_cfg)
 
 upload_handler :: proc(req: ^web.Request, res: ^web.Response) {
-	for u in middleware.request_uploads(req) {
+	for u in middlewares.request_uploads(req) {
 		// u.field / u.original / u.path / u.size / u.content_type
 	}
-	if u, ok := middleware.request_upload(req, "doc"); ok { ... }
+	if u, ok := middlewares.request_upload(req, "doc"); ok { ... }
 }
 ```
 
@@ -447,7 +450,7 @@ upload_handler :: proc(req: ^web.Request, res: ^web.Response) {
 
 ```odin
 range_cfg := web.Range_Config{etag = true}
-web.router_use_route(report, web.middleware_range, &range_cfg)
+web.router_use_route(report, middlewares.middleware_range, &range_cfg)
 
 report_handler :: proc(req: ^web.Request, res: ^web.Response) {
 	web.response_write_string(res, csv)   // 照常写完整正文
@@ -481,16 +484,16 @@ events :: proc(req: ^web.Request, res: ^web.Response) {
 **会话（签名 Cookie）**
 
 ```odin
-session_cfg := middleware.Session_Config { name = "sid", secret = SECRET, max_age_secs = 3600 }
-web.router_use_route(login_route, middleware.middleware_session, &session_cfg)
+session_cfg := middlewares.Session_Config { name = "sid", secret = SECRET, max_age_secs = 3600 }
+web.router_use_route(login_route, middlewares.middleware_session, &session_cfg)
 
 login :: proc(req: ^web.Request, res: ^web.Response) {
-	middleware.session_set(req, "user", "ada")        // 值会被复制进请求 arena
+	middlewares.session_set(req, "user", "ada")        // 值会被复制进请求 arena
 }
 me :: proc(req: ^web.Request, res: ^web.Response) {
-	user, ok := middleware.session_get(req, "user")   // 读不到 = 新访客
-	_ = middleware.session_id(req)                    // 日志/关联用
-	// middleware.session_destroy(req, res, &session_cfg)  // 登出：清值 + 过期 Cookie
+	user, ok := middlewares.session_get(req, "user")   // 读不到 = 新访客
+	_ = middlewares.session_id(req)                    // 日志/关联用
+	// middlewares.session_destroy(req, res, &session_cfg)  // 登出：清值 + 过期 Cookie
 }
 ```
 
@@ -507,12 +510,12 @@ acceptor 线程无需共享状态、重启不会把人踢下线、也没有东�
 **JWT（HS256）**
 
 ```odin
-jwt_cfg := middleware.Jwt_Config { secret = SECRET, issuer = "api", audience = "web" }
-web.router_use_route(profile_route, middleware.middleware_jwt, &jwt_cfg)
+jwt_cfg := middlewares.Jwt_Config { secret = SECRET, issuer = "api", audience = "web" }
+web.router_use_route(profile_route, middlewares.middleware_jwt, &jwt_cfg)
 
 // 签发（登录端点）：exp 由调用方负责，不带 exp 的令牌永久有效
-claims := middleware.Jwt_Claims{sub = "service-a", exp = time.time_to_unix(time.now()) + 3600}
-tok, ok := middleware.jwt_sign(claims, SECRET)
+claims := middlewares.Jwt_Claims{sub = "service-a", exp = time.time_to_unix(time.now()) + 3600}
+tok, ok := middlewares.jwt_sign(claims, SECRET)
 
 // 校验：middleware_jwt 已做过，handler 直接用 req.principal（= sub）
 ```
@@ -528,9 +531,9 @@ tok, ok := middleware.jwt_sign(claims, SECRET)
 ```odin
 files: web.Static
 web.static_init(&files, "./examples/webapp/www")
-mount := middleware.Static_Mount_Config{st = &files, prefix = "/assets"}
+mount := middlewares.Static_Mount_Config{st = &files, prefix = "/assets"}
 assets := web.router_all(&router, "/assets/*", web.router_fallthrough_not_found)
-web.router_use_route(assets, middleware.middleware_static, &mount)
+web.router_use_route(assets, middlewares.middleware_static, &mount)
 // spa = true 时未命中的路径渲染 index.html（单页应用的客户端路由）
 ```
 
@@ -544,13 +547,13 @@ Range、`Last-Modified`/304 全都一样；中间件只决定「要不要发」�
 
 ```odin
 // 真发 3xx：客户端要再请求一次，地址栏会变，搜索引擎/书签会跟着走
-redir_cfg := middleware.Redirect_Config {
-	rules = []middleware.Redirect_Rule{
+redir_cfg := middlewares.Redirect_Config {
+	rules = []middlewares.Redirect_Rule{
 		{from = "/old",  to = "/",          exact = true},
 		{from = "/docs", to = "/assets/"},              // 前缀，拼后缀且不留双斜杠
 	},                                                   // code 默认 308（方法保持）
 }
-web.router_use(&router, middleware.middleware_redirect, &redir_cfg)
+web.router_use(&router, middlewares.middleware_redirect, &redir_cfg)
 
 // 内部重写：路由表之前改写路径，不发响应，客户端看不出来
 web.router_rewrite(&router, "/intro", "/", true)
@@ -563,9 +566,9 @@ web.router_rewrite(&router, "/static", "/assets")     // 前缀版，按段边�
 **gzip 开关（按路由）**
 
 ```odin
-gz := middleware.Gzip_Config{min_size = 256}   // 只改这一条路由的阈值
-web.router_use_route(big_route, middleware.middleware_gzip, &gz)
-web.router_use_route(img_route, middleware.middleware_no_gzip, nil)
+gz := middlewares.Gzip_Config{min_size = 256}   // 只改这一条路由的阈值
+web.router_use_route(big_route, middlewares.middleware_gzip, &gz)
+web.router_use_route(img_route, middlewares.middleware_no_gzip, nil)
 ```
 
 压缩本身由父包内置且默认注册的 `Compress_Filter` 做（按 `Accept-Encoding`  
@@ -792,7 +795,7 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 
 ```bash
 odin test web/               # 118 个
-odin test web/middleware     # 42 个
+odin test web/middlewares     # 42 个
 ```
 
 `web` 侧是 parser / chunked / router（含重写）/ response 序列化 /  
@@ -815,7 +818,7 @@ session id context 稳定性、SSE 事件流、Hub 广播与优雅关闭 / 多�
 chunked 正文 / 超限 413（part 与字段）/ keep_temp / 非 multipart 不受影响 /  
 临时文件在请求结束（含 keep-alive）即清理）。
 
-`web/middleware` 侧是 Basic/Bearer/API-Key 认证（含 challenge 文案与  
+`web/middlewares` 侧是 Basic/Bearer/API-Key 认证（含 challenge 文案与  
 principal 传递）、表单 urlencoded/multipart/限额/415/400/413、Range 中间件的  
 206/416/ETag/304/If-Range/跳过文件响应、路由级中间件隔离、会话的往返与  
 伪造 Cookie 拒绝 / 过期 / 栈缓冲值被复制、JWT 的签发与验签（错误 alg、  

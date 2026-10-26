@@ -34,41 +34,41 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 import "../../web"
-import "../../web/middleware"
+import "../../web/middlewares"
 
 // Configs must outlive the server, so they live at file scope.
-session_cfg := middleware.Session_Config {
+session_cfg := middlewares.Session_Config {
 	name         = "sid",
 	secret       = "demo-session-secret-change-me",
 	max_age_secs = 3600,
 }
 
-jwt_cfg := middleware.Jwt_Config {
+jwt_cfg := middlewares.Jwt_Config {
 	secret   = "demo-jwt-secret-change-me",
 	issuer   = "webapp-demo",
 	audience = "webapp-clients",
 	realm    = "api",
 }
 
-static_cfg := middleware.Static_Mount_Config {
+static_cfg := middlewares.Static_Mount_Config {
 	prefix = "/assets",
 }
 
-upload_cfg := middleware.Upload_Config {
+upload_cfg := middlewares.Upload_Config {
 	dir            = "./uploads",
 	max_file_bytes = 4 << 20,
 	max_files      = 4,
 }
 
-gzip_cfg := middleware.Gzip_Config {
+gzip_cfg := middlewares.Gzip_Config {
 	min_size = 256,
 }
 
 // Legacy URLs. Registered router-wide because they are a property of the
 // site, not of one route; the same middleware works route-locally, which is
 // what you want when only one path moved.
-redirect_cfg := middleware.Redirect_Config {
-	rules = []middleware.Redirect_Rule{
+redirect_cfg := middlewares.Redirect_Config {
+	rules = []middlewares.Redirect_Rule{
 		{from = "/old", to = "/", exact = true},
 		{from = "/docs", to = "/assets/"},
 	},
@@ -104,31 +104,31 @@ login :: proc(req: ^web.Request, res: ^web.Response) {
 	if len(user) == 0 {
 		user = "anonymous"
 	}
-	middleware.session_set(req, "user", user)
-	middleware.session_set(req, "visits", "0")
+	middlewares.session_set(req, "user", user)
+	middlewares.session_set(req, "visits", "0")
 	buf: [128]byte
-	web.response_text(res, .OK, fmt.bprintf(buf[:], "welcome %v (session %v)\n", user, middleware.session_id(req)))
+	web.response_text(res, .OK, fmt.bprintf(buf[:], "welcome %v (session %v)\n", user, middlewares.session_id(req)))
 }
 
 me :: proc(req: ^web.Request, res: ^web.Response) {
-	user, _ := middleware.session_get(req, "user")
+	user, _ := middlewares.session_get(req, "user")
 	if len(user) == 0 {
 		web.response_error(res, .Unauthorized, "no session - POST /login first")
 		return
 	}
-	visits, _ := middleware.session_get(req, "visits")
+	visits, _ := middlewares.session_get(req, "visits")
 	n := 1
 	if v, ok := strconv.parse_int(visits); ok {
 		n = int(v) + 1
 	}
 	buf: [128]byte
-	middleware.session_set(req, "visits", fmt.bprintf(buf[:], "%d", n))
+	middlewares.session_set(req, "visits", fmt.bprintf(buf[:], "%d", n))
 	msg: [128]byte
 	web.response_text(res, .OK, fmt.bprintf(msg[:], "%v, visit %d\n", user, n))
 }
 
 logout :: proc(req: ^web.Request, res: ^web.Response) {
-	middleware.session_destroy(req, res, &session_cfg)
+	middlewares.session_destroy(req, res, &session_cfg)
 	web.response_text(res, .OK, "bye\n")
 }
 
@@ -143,14 +143,14 @@ token :: proc(req: ^web.Request, res: ^web.Response) {
 	if len(sub) == 0 {
 		sub = "service-a"
 	}
-	claims := middleware.Jwt_Claims {
+	claims := middlewares.Jwt_Claims {
 		sub = sub,
 		iss = jwt_cfg.issuer,
 		aud = jwt_cfg.audience,
 		iat = time.time_to_unix(time.now()),
 		exp = time.time_to_unix(time.now()) + 3600,
 	}
-	tok, ok := middleware.jwt_sign(claims, jwt_cfg.secret, web.request_allocator(req))
+	tok, ok := middlewares.jwt_sign(claims, jwt_cfg.secret, web.request_allocator(req))
 	if !ok {
 		web.response_error(res, .Internal_Error, "")
 		return
@@ -176,7 +176,7 @@ Profile :: struct {
 upload :: proc(req: ^web.Request, res: ^web.Response) {
 	sb: strings.Builder
 	strings.builder_init(&sb, context.temp_allocator)
-	stored := middleware.request_uploads(req)
+	stored := middlewares.request_uploads(req)
 	if len(stored) == 0 {
 		web.response_text(res, .OK, "no file parts\n")
 		return
@@ -221,10 +221,10 @@ main :: proc() {
 
 	// router-wide: identity, logging, security headers and the legacy URL
 	// table. These are properties of the site, not of a route.
-	web.router_use(&router, middleware.middleware_request_id)
-	web.router_use(&router, middleware.middleware_logger)
-	web.router_use(&router, middleware.middleware_secure_headers)
-	web.router_use(&router, middleware.middleware_redirect, &redirect_cfg)
+	web.router_use(&router, middlewares.middleware_request_id)
+	web.router_use(&router, middlewares.middleware_logger)
+	web.router_use(&router, middlewares.middleware_secure_headers)
+	web.router_use(&router, middlewares.middleware_redirect, &redirect_cfg)
 
 	// An internal rewrite: the URL the client asked for is replaced before
 	// routing, so /intro is served by the / route and no redirect is sent.
@@ -247,14 +247,14 @@ main :: proc() {
 	big_route := web.router_get(&router, "/big", big)
 
 	// route-local middleware: one purpose per route
-	web.router_use_route(login_route, middleware.middleware_session, &session_cfg)
-	web.router_use_route(me_route, middleware.middleware_session, &session_cfg)
-	web.router_use_route(logout_route, middleware.middleware_session, &session_cfg)
+	web.router_use_route(login_route, middlewares.middleware_session, &session_cfg)
+	web.router_use_route(me_route, middlewares.middleware_session, &session_cfg)
+	web.router_use_route(logout_route, middlewares.middleware_session, &session_cfg)
 
-	web.router_use_route(profile_route, middleware.middleware_jwt, &jwt_cfg)
-	web.router_use_route(assets_route, middleware.middleware_static, &static_cfg)
-	web.router_use_route(upload_route, middleware.middleware_upload, &upload_cfg)
-	web.router_use_route(big_route, middleware.middleware_gzip, &gzip_cfg)
+	web.router_use_route(profile_route, middlewares.middleware_jwt, &jwt_cfg)
+	web.router_use_route(assets_route, middlewares.middleware_static, &static_cfg)
+	web.router_use_route(upload_route, middlewares.middleware_upload, &upload_cfg)
+	web.router_use_route(big_route, middlewares.middleware_gzip, &gzip_cfg)
 
 	srv: web.Server
 	if !web.server_init(&srv, address) {

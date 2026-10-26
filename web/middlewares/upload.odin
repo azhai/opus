@@ -1,4 +1,4 @@
-package middleware
+package middlewares
 
 import ".."
 import "core:mem"
@@ -37,7 +37,7 @@ Two modes, decided by `Upload_Config.stream`:
 Streaming mode needs a hook, because the decision has to be made before the
 route handler exists:
 
-	srv.on_head = middleware.upload_stream_hook
+	srv.on_head = middlewares.upload_stream_hook
 	srv.on_head_ud = upload_cfg
 
 The hook is a no-op for requests that are not multipart and for configs with
@@ -89,7 +89,7 @@ upload_stream_hook installs the streaming sink on requests this config cares
 about. Install it as `Server.on_head` with the same `*Upload_Config` the route
 uses:
 
-	srv.on_head = middleware.upload_stream_hook
+	srv.on_head = middlewares.upload_stream_hook
 	srv.on_head_ud = cfg
 
 It returns true for "carry on with the request" and false only after it has

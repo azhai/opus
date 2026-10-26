@@ -3,11 +3,11 @@ package main
 /*
 Purpose-built middleware: auth, form parsing, Range/ETag, compression and
 SSE, each attached to the one route that needs it instead of the whole
-router. They live in the `web/middleware` subpackage, so this example
+router. They live in the `web/middlewares` subpackage, so this example
 imports both.
 
-	odin run examples/middleware            # :8080
-	odin run examples/middleware -- 127.0.0.1:9000
+	odin run examples/middlewares            # :8080
+	odin run examples/middlewares -- 127.0.0.1:9000
 
 	curl -r 10-19        http://127.0.0.1:8080/report.csv
 	curl -I              http://127.0.0.1:8080/report.csv     # ETag, Accept-Ranges
@@ -23,18 +23,18 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "../../web"
-import "../../web/middleware"
+import "../../web/middlewares"
 
 // Middleware configs outlive the server, so they live at file scope: a stack
 // temporary would dangle as soon as main's scope changed.
-admin_cfg := middleware.Basic_Auth_Config {
+admin_cfg := middlewares.Basic_Auth_Config {
 	username = "admin",
 	password = "secret",
 	realm    = "admin",
 }
 
-key_cfg := middleware.API_Key_Config {
-	tokens = []middleware.Auth_Token{middleware.Auth_Token{token = "key-live-1", name = "mobile-app"}},
+key_cfg := middlewares.API_Key_Config {
+	tokens = []middlewares.Auth_Token{middlewares.Auth_Token{token = "key-live-1", name = "mobile-app"}},
 	header = "X-API-Key",
 }
 
@@ -45,20 +45,20 @@ form_cfg := web.Form_Config {
 
 // Uploads above 64 KiB per part are written out while the body is still
 // arriving, so the size of the file is not the size of the process.
-upload_cfg := middleware.Upload_Config {
+upload_cfg := middlewares.Upload_Config {
 	dir      = "./uploads",
 	stream   = true,
 	threshold = 64 << 10,
 	max_file_bytes = 512 << 20,
 }
 
-range_cfg := middleware.Range_Config {
+range_cfg := middlewares.Range_Config {
 	etag = true, // content hash + If-None-Match -> 304
 }
 
 // "compress anything over 256 bytes on this route" - the filter's own
 // default threshold stays in force everywhere else.
-gzip_cfg := middleware.Gzip_Config {
+gzip_cfg := middlewares.Gzip_Config {
 	min_size = 256,
 }
 
@@ -104,13 +104,13 @@ big :: proc(req: ^web.Request, res: ^web.Response) {
 
 admin :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [128]byte
-	msg := fmt.bprintf(buf[:], "admin area, user=%v\n", middleware.request_principal(req))
+	msg := fmt.bprintf(buf[:], "admin area, user=%v\n", middlewares.request_principal(req))
 	web.response_text(res, .OK, msg)
 }
 
 keys :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [128]byte
-	msg := fmt.bprintf(buf[:], "key accepted for %v\n", middleware.request_principal(req))
+	msg := fmt.bprintf(buf[:], "key accepted for %v\n", middlewares.request_principal(req))
 	web.response_text(res, .OK, msg)
 }
 
@@ -130,7 +130,7 @@ submit :: proc(req: ^web.Request, res: ^web.Response) {
 // is already a file, so `data` is empty and the bytes were never all resident.
 upload :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [256]byte
-	u, ok := middleware.request_upload(req, "doc")
+	u, ok := middlewares.request_upload(req, "doc")
 	if !ok {
 		web.response_error(res, .Bad_Request, "expected a file part named doc\n")
 		return
@@ -174,9 +174,9 @@ main :: proc() {
 	router: web.Router
 	web.router_init(&router)
 	// router-wide chain: cross-cutting concerns only
-	web.router_use(&router, middleware.middleware_request_id)
-	web.router_use(&router, middleware.middleware_logger)
-	web.router_use(&router, middleware.middleware_secure_headers)
+	web.router_use(&router, middlewares.middleware_request_id)
+	web.router_use(&router, middlewares.middleware_logger)
+	web.router_use(&router, middlewares.middleware_secure_headers)
 
 	// routes are heap-allocated, so the pointers stay valid while the rest of
 	// the table is registered; attaching in a second pass keeps the two
@@ -191,18 +191,18 @@ main :: proc() {
 	web.router_get(&router, "/events", events)
 
 	// route-local middleware, one purpose per route
-	web.router_use_route(report_route, middleware.middleware_range, &range_cfg)
-	web.router_use_route(admin_route, middleware.middleware_basic_auth, &admin_cfg)
-	web.router_use_route(keys_route, middleware.middleware_api_key, &key_cfg)
-	web.router_use_route(submit_route, middleware.middleware_form, &form_cfg)
-	web.router_use_route(upload_route, middleware.middleware_upload, &upload_cfg)
-	web.router_use_route(big_route, middleware.middleware_gzip, &gzip_cfg)
+	web.router_use_route(report_route, middlewares.middleware_range, &range_cfg)
+	web.router_use_route(admin_route, middlewares.middleware_basic_auth, &admin_cfg)
+	web.router_use_route(keys_route, middlewares.middleware_api_key, &key_cfg)
+	web.router_use_route(submit_route, middlewares.middleware_form, &form_cfg)
+	web.router_use_route(upload_route, middlewares.middleware_upload, &upload_cfg)
+	web.router_use_route(big_route, middlewares.middleware_gzip, &gzip_cfg)
 
 	srv.handler = web.router_handle
 	srv.user_ptr = &router
 	// the body has to be diverted before the route is known: the hook runs on
 	// every request head and only acts on multipart bodies
-	srv.on_head = middleware.upload_stream_hook
+	srv.on_head = middlewares.upload_stream_hook
 	srv.on_head_ud = &upload_cfg
 	fmt.printf("middleware demo on http://%v\n", address)
 	if err := web.server_run(&srv); err != nil {

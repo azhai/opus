@@ -217,3 +217,64 @@ test_response_download_missing_file :: proc(t: ^testing.T) {
 	_, has_cd := response_header(&res, "Content-Disposition")
 	testing.expect(t, !has_cd)
 }
+
+@(test)
+test_request_client_ip_precedence :: proc(t: ^testing.T) {
+	c: Conn
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+	c.remote = net.Endpoint {
+		address = net.IP4_Address{127, 0, 0, 1},
+		port    = 1234,
+	}
+
+	// X-Real-IP wins over X-Forwarded-For
+	req := Request {
+		conn    = &c,
+		headers = []Header {
+			Header{key = "X-Real-IP", value = "203.0.113.9"},
+			Header{key = "X-Forwarded-For", value = "198.51.100.1, 10.0.0.1"},
+		},
+	}
+	testing.expect_value(t, request_client_ip(&req), "203.0.113.9")
+
+	// without X-Real-IP, the leftmost X-Forwarded-For entry, trimmed
+	req_xff := Request {
+		conn    = &c,
+		headers = []Header{Header{key = "X-Forwarded-For", value = " 198.51.100.2 , 10.0.0.1"}},
+	}
+	testing.expect_value(t, request_client_ip(&req_xff), "198.51.100.2")
+
+	// an empty X-Real-IP is not an address: fall through to X-Forwarded-For
+	req_empty := Request {
+		conn    = &c,
+		headers = []Header {
+			Header{key = "X-Real-IP", value = "   "},
+			Header{key = "X-Forwarded-For", value = "198.51.100.3"},
+		},
+	}
+	testing.expect_value(t, request_client_ip(&req_empty), "198.51.100.3")
+
+	// no forwarding header at all: the socket peer, without the port
+	req_peer := Request{conn = &c}
+	testing.expect_value(t, request_client_ip(&req_peer), "127.0.0.1")
+
+	// no connection: no address to report
+	req_none := Request{}
+	testing.expect_value(t, request_client_ip(&req_none), "")
+}
+
+@(test)
+test_request_is_ajax :: proc(t: ^testing.T) {
+	ajax := Request {
+		headers = []Header{Header{key = "X-Requested-With", value = "xmlhttprequest"}},
+	}
+	testing.expect(t, request_is_ajax(&ajax))
+
+	fetch := Request {
+		headers = []Header{Header{key = "X-Requested-With", value = "fetch"}},
+	}
+	testing.expect(t, !request_is_ajax(&fetch))
+
+	testing.expect(t, !request_is_ajax(&Request{}))
+}

@@ -4,9 +4,7 @@ import "core:fmt"
 import "../../web"
 
 hello :: proc(req: ^web.Request, res: ^web.Response) {
-	web.response_status(res, .OK)
-	web.response_set_header(res, "Content-Type", "text/plain; charset=utf-8")
-	web.response_write_string(res, "hello from odin web\n")
+	web.response_text(res, .OK, "hello from odin web\n")
 }
 
 main :: proc() {

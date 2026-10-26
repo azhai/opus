@@ -44,7 +44,7 @@ What you get:
     `request_client_ip`, `request_content_type`, `request_is_ajax`,
     `request_accepts`, `request_json`, plus `response_json_status`,
     `response_error`, `response_download` and `response_clear_cookie`.
-  - Middleware, split by purpose and living in the `web/middleware`
+  - Middleware, split by purpose and living in the `web/middlewares`
     subpackage (a parent package cannot import its child, so state that a
     middleware owns travels on the request as `Request.session` /
     `Request.uploads`):

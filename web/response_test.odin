@@ -117,3 +117,87 @@ test_filter_chunked_skips_files :: proc(t: ^testing.T) {
 
 	testing.expect(t, !w.chunked)
 }
+
+// ---------------------------------------------------------------------------
+// response shortcuts
+// ---------------------------------------------------------------------------
+
+@(test)
+test_response_send_and_redirect :: proc(t: ^testing.T) {
+	c: Conn
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+	c.req.method = .Get
+
+	res: Response
+	response_init(&res, &c, conn_scratch(&c))
+
+	response_send(&res, .Accepted, "application/json", `{"ok":true}`)
+	testing.expect_value(t, res.status, Status.Accepted)
+	ct, _ := response_header(&res, "Content-Type")
+	testing.expect_value(t, ct, "application/json")
+	testing.expect_value(t, string(buf_slice(&res.body)), `{"ok":true}`)
+
+	// an empty content type leaves the header alone
+	res2: Response
+	response_init(&res2, &c, conn_scratch(&c))
+	response_send(&res2, .OK, "", "raw")
+	_, has_ct := response_header(&res2, "Content-Type")
+	testing.expect(t, !has_ct)
+
+	// 302 by default, with a small body for clients that ignore Location
+	res3: Response
+	response_init(&res3, &c, conn_scratch(&c))
+	response_redirect(&res3, "/login")
+	testing.expect_value(t, res3.status, Status.Found)
+	loc, _ := response_header(&res3, "Location")
+	testing.expect_value(t, loc, "/login")
+	testing.expect_value(t, string(buf_slice(&res3.body)), "redirecting to /login\n")
+
+	// a caller-chosen status is kept
+	res4: Response
+	response_init(&res4, &c, conn_scratch(&c))
+	response_redirect(&res4, "https://example.com/new", .Moved_Permanently)
+	testing.expect_value(t, res4.status, Status.Moved_Permanently)
+}
+
+@(test)
+test_response_send_file_range :: proc(t: ^testing.T) {
+	// nbio hands out file handles only once the thread has an event loop
+	// (a server acquires one in server_run; a bare test has to ask for it)
+	if err := nbio.acquire_thread_event_loop(); !testing.expectf(t, err == nil, "event loop: %v", err) {
+		return
+	}
+	defer nbio.release_thread_event_loop()
+
+	c: Conn
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+	c.req.method = .Get
+
+	path := "/tmp/web_response_range_test.bin"
+	if err := os.write_entire_file(path, "0123456789"); !testing.expectf(t, err == nil, "cannot create fixture: %v", err) {
+		return
+	}
+	defer os.remove(path)
+
+	res: Response
+	response_init(&res, &c, conn_scratch(&c))
+	testing.expect(t, response_send_file_range(&res, path, 2, 3))
+	defer nbio.close(res.file_handle)
+	testing.expect(t, res.file_open)
+	testing.expect_value(t, res.file_size, i64(3))
+	testing.expect_value(t, res.file_offset, 2)
+	testing.expect_value(t, res.file_path, path)
+
+	// only one file body can be queued per response
+	testing.expect(t, !response_send_file_range(&res, path, 0, 1))
+
+	// bad ranges are rejected before anything is opened
+	res_bad: Response
+	response_init(&res_bad, &c, conn_scratch(&c))
+	testing.expect(t, !response_send_file_range(&res_bad, path, -1, 2))
+	testing.expect(t, !response_send_file_range(&res_bad, path, 0, -2))
+	testing.expect(t, !response_send_file_range(&res_bad, "/tmp/web_no_such_file_xyz.bin", 0, 1))
+	testing.expect(t, !res_bad.file_open)
+}

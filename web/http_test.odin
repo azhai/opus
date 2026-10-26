@@ -151,3 +151,48 @@ test_html_escape :: proc(t: ^testing.T) {
 	testing.expect_value(t, html_escape("plain text"), "plain text")
 	testing.expect_value(t, html_escape(`<a href="x">'&'</a>`), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;")
 }
+
+@(test)
+test_method_round_trip :: proc(t: ^testing.T) {
+	cases := []struct {
+		text:   string,
+		method: Method,
+	} {
+		{"GET", .Get},
+		{"HEAD", .Head},
+		{"POST", .Post},
+		{"PUT", .Put},
+		{"DELETE", .Delete},
+		{"OPTIONS", .Options},
+		{"PATCH", .Patch},
+		{"TRACE", .Trace},
+		{"CONNECT", .Connect},
+	}
+	for c in cases {
+		testing.expect_value(t, method_from_string(c.text), c.method)
+		testing.expect_value(t, method_string(c.method), c.text)
+	}
+
+	// unknown verbs and lowercase input are not coerced
+	testing.expect_value(t, method_from_string("PROPFIND"), Method.Unknown)
+	testing.expect_value(t, method_from_string("get"), Method.Unknown)
+	testing.expect_value(t, method_string(.Unknown), "UNKNOWN")
+	// .All exists only in the route table; it stringifies as a label
+	testing.expect_value(t, method_string(.All), "ALL")
+}
+
+@(test)
+test_http_date :: proc(t: ^testing.T) {
+	stamp, ok := time.datetime_to_time(1994, 11, 6, 8, 49, 37, 0)
+	testing.expect(t, ok)
+	first := http_date(stamp, context.allocator)
+	defer delete(first, context.allocator)
+	testing.expect_value(t, first, "Sun, 06 Nov 1994 08:49:37 GMT")
+
+	// a second date pins zero padding on day and time, and the month table
+	stamp2, ok2 := time.datetime_to_time(2026, 1, 5, 0, 0, 0, 0)
+	testing.expect(t, ok2)
+	second := http_date(stamp2, context.allocator)
+	defer delete(second, context.allocator)
+	testing.expect_value(t, second, "Mon, 05 Jan 2026 00:00:00 GMT")
+}

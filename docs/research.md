@@ -131,7 +131,7 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 │ threads.odin   多 acceptor：server_run_multi / on_stop│
 │ router.odin    Router：段式 + Lua 模式匹配 + 中间件链    │  ← lighttpd2 action 思想的
 │                + 内部重写（路由表之前改路径）           │     宿主语言实现
-│ middleware/    中间件子包（import ".."）：               │
+│ middlewares/   中间件子包（import ".."）：               │
 │   middleware   id/日志/CORS/限额/安全头/禁缓存/反缓冲    │
 │   auth         Basic / Bearer / API-Key                │
 │   range        Range/ETag（handler 无感）               │
@@ -416,11 +416,11 @@ Odin 原生版）。收益：
 - [x] HEAD 自动回落到同名 GET 路由（RFC 7231 §4.3.2）
 - [x] SSE：`sse_start/event/comment/retry/close`，chunked 分帧 + 重连语义；  
   `Sse_Writer` 自带复用缓冲（逐事件零分配）+ `sse_last_event_id` 读重连游标
-- [x] 117 个测试（`web` 77 + `web/middleware` 40），全过、零泄漏
+- [x] 117 个测试（`web` 77 + `web/middlewares` 40），全过、零泄漏
 
 已实现（v0.5，中间件按用途成型 + 目录结构整理）：
 
-- [x] 中间件拆成 `web/middleware` 子包（`import ".."`，父包不反向依赖）：  
+- [x] 中间件拆成 `web/middlewares` 子包（`import ".."`，父包不反向依赖）：  
   父包只留解析与请求状态，中间件全部下沉；跨包状态用 `Request.session` /  
   `Request.uploads` 两个 `rawptr` 槽位传递
 - [x] 会话：HMAC-SHA256 签名的 Cookie 会话。服务端零状态（多 acceptor 无需  
@@ -460,7 +460,7 @@ Odin 原生版）。收益：
 - [x] 流式上传落盘：`Body_Sink` 抽象 + 增量 multipart 解析  
   （`multipart_stream`，只保留分隔符尾部，且校验分隔行后缀）+ `Upload_Sink`  
   （超过阈值写临时文件，请求结束由 `teardown` 清理）；`Server.on_head`  
-  在正文读之前接管；160 个测试（`web` 118 + `web/middleware` 42），全过、零泄漏
+  在正文读之前接管；160 个测试（`web` 118 + `web/middlewares` 42），全过、零泄漏
 
 
 后续（按优先级）：
@@ -481,7 +481,7 @@ Odin 原生版）。收益：
 
 ## 7. 测试策略
 
-`odin test web/`（118 个）+ `odin test web/middleware`（42 个）覆盖三层：
+`odin test web/`（118 个）+ `odin test web/middlewares`（42 个）覆盖三层：
 
 - **纯函数单测**：parser（含畸形输入、OWS 修剪、URL 解码）、chunked 编解码、  
   router（param/405/通配/中间件链顺序）、response 序列化（GET/HEAD/空文件）、  
@@ -529,7 +529,7 @@ Odin 原生版）。收益：
   服务）、以及「1..N 字节窗口逐个喂」的增量解析等价测试（分隔符跨界、正文内含  
   分隔符前缀、空 part、无尾 CRLF、多 part 顺序与 `index`/`size`、前导/后置  
   垃圾、分隔行尾判定与 transport padding）。
-- **中间件测试**（`web/middleware/*_test.odin`，42 个）：不建 socket，  
+- **中间件测试**（`web/middlewares/*_test.odin`，42 个）：不建 socket，  
   用合成 `Conn` 走真实 `router_handle` 派发，所以链的顺序、短路与  
   路由级链都按生产路径执行。覆盖 Bearer 的三种 challenge 文案与 principal  
   传递、API-Key 的头/query 两种取法、表单 urlencoded 与 multipart（含  

@@ -141,6 +141,15 @@ conn_async_run :: proc(c: ^Conn, why: Async_Reason) {
 	}
 	a := c.async
 	c.async = {}
+	// The parked request is over: the read that watched for the client going
+	// away has to go before the response path arms a read of its own. Two
+	// readers on one socket is not a leak but a data race - the stale one can
+	// consume the next keep-alive request into a callback that no longer
+	// drives the connection.
+	if c.async_op != nil {
+		nbio.remove(c.async_op)
+		c.async_op = nil
+	}
 	if a.timer != nil {
 		// only reachable for .Resume: the timeout callback clears its own op
 		// before calling in, because a completed operation is already back in
@@ -150,13 +159,21 @@ conn_async_run :: proc(c: ^Conn, why: Async_Reason) {
 	}
 	c.state = .Process
 	a.resume(&c.req, &c.res, a.ud, why)
+	if c.state == .Closed && c.socket == 0 {
+		// the continuation took the socket over with response_hijack: the
+		// socket is no longer ours and no close callback is coming to free
+		// this Conn, so do it here - the same ending conn_drive gives a
+		// hijacking synchronous handler. A plain conn_close is not this case:
+		// the socket is still set and its callback destroys us.
+		conn_destroy(c)
+		return
+	}
 	conn_process_tail(c)
 	// conn_process_tail only *arms* the write state; in the synchronous path
 	// the conn_drive loop is what calls conn_begin_write next. A resumed
 	// response is not inside that loop, so it has to re-enter it - which also
-	// covers the two other endings: a continuation that defers again
-	// (state = .Async, drive returns at once) and one that hijacks the
-	// connection (state = .Closed).
+	// covers a continuation that defers again (state = .Async, drive returns
+	// at once).
 	conn_drive(c)
 }
 

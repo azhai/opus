@@ -1,4 +1,4 @@
-package middleware
+package middlewares
 
 import "core:crypto/hash"
 import "core:crypto/hmac"

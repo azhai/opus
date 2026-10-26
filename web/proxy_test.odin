@@ -160,6 +160,45 @@ test_proxy_parse_upstream_head :: proc(t: ^testing.T) {
 	testing.expect(t, r8 == .Malformed)
 }
 
+/*
+test_proxy_parse_http10_keepalive: an HTTP/1.0 response only keeps its
+connection open when it says so. Pooling a socket the peer is about to close
+costs the next request a failed attempt - or a 502, when the method is not
+retryable.
+*/
+@(test)
+test_proxy_parse_http10_keepalive :: proc(t: ^testing.T) {
+	c := test_conn_new(t)
+	defer test_conn_destroy(c)
+	c.req.method = .Get
+
+	// 1.0 without an explicit keep-alive: the peer closes, so not reusable
+	r := proxy_parse_head(c, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n")
+	testing.expect(t, r == .Ok)
+	testing.expectf(t, c.proxy_upstream_close, "an HTTP/1.0 response without keep-alive stayed poolable")
+
+	// 1.0 that asks for keep-alive stays reusable
+	response_reset(&c.res, c, conn_scratch(c))
+	c.proxy_upstream_close = false
+	r2 := proxy_parse_head(c, "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n")
+	testing.expect(t, r2 == .Ok)
+	testing.expect(t, !c.proxy_upstream_close)
+
+	// 1.1 is persistent without any header
+	response_reset(&c.res, c, conn_scratch(c))
+	c.proxy_upstream_close = false
+	r3 := proxy_parse_head(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+	testing.expect(t, r3 == .Ok)
+	testing.expect(t, !c.proxy_upstream_close)
+
+	// an explicit close still wins
+	response_reset(&c.res, c, conn_scratch(c))
+	c.proxy_upstream_close = false
+	r4 := proxy_parse_head(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n")
+	testing.expect(t, r4 == .Ok)
+	testing.expect(t, c.proxy_upstream_close)
+}
+
 @(test)
 test_proxy_no_upstream :: proc(t: ^testing.T) {
 	c := test_conn_new(t)
@@ -1083,4 +1122,202 @@ test_proxy_health_backoff_cap :: proc(t: ^testing.T) {
 	proxy_note_failure(&p, 7)
 	proxy_note_success(&p, -1)
 	testing.expect(t, p.upstreams[0].failures_total == 4)
+}
+
+// ---------------------------------------------------------------------------
+// upstreams that misbehave while their body is on the wire
+// ---------------------------------------------------------------------------
+
+// Raw_Http10_Upstream answers like an old server: HTTP/1.0, Content-Length,
+// no Connection header. The socket survives the response for a while, so an
+// entry the proxy wrongly pooled would still look alive when the test looks.
+Raw_Http10_Upstream :: struct {
+	listener: net.TCP_Socket,
+	port:     int,
+	ready:    bool,
+	accepts:  int,
+	hold:     time.Duration,
+}
+
+raw_http10_upstream_proc :: proc(t: ^thread.Thread) {
+	ru := cast(^Raw_Http10_Upstream) t.data
+	l, err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0})
+	if err != nil {
+		return
+	}
+	ru.listener = l
+	ep, _ := net.bound_endpoint(l)
+	ru.port = ep.port
+	intrinsics.volatile_store(&ru.ready, true)
+	// so a test that fails before its last request does not leave this
+	// thread blocked in accept forever
+	_ = net.set_option(l, .Receive_Timeout, 2 * time.Second)
+
+	for _ in 0 ..< 2 {
+		client, _, aerr := net.accept_tcp(l)
+		if aerr != nil {
+			break
+		}
+		ru.accepts += 1
+		buf: [4096]byte
+		net.recv_tcp(client, buf[:]) // the request
+		resp := "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+		net.send_tcp(client, transmute([]byte)resp)
+		time.sleep(ru.hold)
+		net.close(client)
+	}
+	net.close(l)
+}
+
+@(test)
+test_integration_proxy_http10_not_pooled :: proc(t: ^testing.T) {
+	ru := new(Raw_Http10_Upstream, context.allocator)
+	ru.hold = 300 * time.Millisecond
+	ru_th := thread.create(raw_http10_upstream_proc)
+	ru_th.data = ru
+	thread.start(ru_th)
+	for i in 0 ..< 10000 {
+		if intrinsics.volatile_load(&ru.ready) {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, intrinsics.volatile_load(&ru.ready))
+	defer thread.join(ru_th)
+	defer thread.destroy(ru_th)
+	defer free(ru, context.allocator)
+
+	addr_buf: [64]byte
+	addr := fmt.bprintf(addr_buf[:], "127.0.0.1:%d", ru.port)
+	p := new(Proxy, context.allocator)
+	testing.expect(t, proxy_init(p, {addr}))
+	p.timeout = 5 * time.Second
+	defer free(p, context.allocator)
+	defer proxy_destroy(p)
+
+	px_srv := new(Server, context.allocator)
+	testing.expect(t, server_init(px_srv, "127.0.0.1:0"))
+	px_srv.handler = proxy_serve
+	px_srv.user_ptr = p
+	px_srv.idle_timeout = 2 * time.Second
+	px_srv.on_stop = proxy_test_stop
+	px_ep, px_th, px_args := integration_spin_srv(t, px_srv)
+	defer integration_stop(t, px_args, px_th)
+
+	for i in 0 ..< 2 {
+		client, derr := net.dial_tcp_from_endpoint(px_ep)
+		testing.expect(t, derr == nil)
+		_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+		request := "GET /old HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+		net.send_tcp(client, transmute([]byte)request)
+		body := read_client_all(client)
+		net.close(client)
+		testing.expectf(t, strings.has_prefix(string(body), "HTTP/1.1 200 OK\r\n"), "request %v failed: %q", i, string(body))
+		testing.expect(t, strings.has_suffix(string(body), "ok"))
+		delete(body)
+
+		// the peer closes after every response, so a pooled socket would be
+		// a dead entry from the start
+		time.sleep(150 * time.Millisecond)
+		testing.expectf(t, len(p.pool) == 0, "request %v left %v socket(s) in the pool", i, len(p.pool))
+	}
+	testing.expectf(t, p.pool_hits == 0, "the HTTP/1.0 upstream was reused %v time(s)", p.pool_hits)
+	testing.expectf(t, ru.accepts == 2, "upstream saw %v connection(s), expected 2", ru.accepts)
+}
+
+// Raw_Bad_Chunk_Upstream sends a chunked body whose second size line is not
+// hex, followed by bytes that a scanner which kept going would happily walk
+// through on their way to a terminator.
+Raw_Bad_Chunk_Upstream :: struct {
+	listener: net.TCP_Socket,
+	port:     int,
+	ready:    bool,
+	hold:     time.Duration,
+}
+
+raw_bad_chunk_upstream_proc :: proc(t: ^thread.Thread) {
+	ru := cast(^Raw_Bad_Chunk_Upstream) t.data
+	l, err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0})
+	if err != nil {
+		return
+	}
+	ru.listener = l
+	ep, _ := net.bound_endpoint(l)
+	ru.port = ep.port
+	intrinsics.volatile_store(&ru.ready, true)
+	_ = net.set_option(l, .Receive_Timeout, 2 * time.Second)
+
+	client, _, aerr := net.accept_tcp(l)
+	if aerr != nil {
+		net.close(l)
+		return
+	}
+	buf: [4096]byte
+	net.recv_tcp(client, buf[:])
+	resp := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nZ-SHOULD-NOT-RELAY\r\n0\r\n\r\n"
+	net.send_tcp(client, transmute([]byte)resp)
+	time.sleep(ru.hold)
+	net.close(client)
+	net.close(l)
+}
+
+@(test)
+test_integration_proxy_bad_chunk_cuts_relay :: proc(t: ^testing.T) {
+	ru := new(Raw_Bad_Chunk_Upstream, context.allocator)
+	ru.hold = 300 * time.Millisecond
+	ru_th := thread.create(raw_bad_chunk_upstream_proc)
+	ru_th.data = ru
+	thread.start(ru_th)
+	for i in 0 ..< 10000 {
+		if intrinsics.volatile_load(&ru.ready) {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, intrinsics.volatile_load(&ru.ready))
+	defer thread.join(ru_th)
+	defer thread.destroy(ru_th)
+	defer free(ru, context.allocator)
+
+	addr_buf: [64]byte
+	addr := fmt.bprintf(addr_buf[:], "127.0.0.1:%d", ru.port)
+	p := new(Proxy, context.allocator)
+	testing.expect(t, proxy_init(p, {addr}))
+	p.timeout = 5 * time.Second
+	defer free(p, context.allocator)
+	defer proxy_destroy(p)
+
+	px_srv := new(Server, context.allocator)
+	testing.expect(t, server_init(px_srv, "127.0.0.1:0"))
+	px_srv.handler = proxy_serve
+	px_srv.user_ptr = p
+	px_srv.idle_timeout = 2 * time.Second
+	px_srv.on_stop = proxy_test_stop
+	px_ep, px_th, px_args := integration_spin_srv(t, px_srv)
+	defer integration_stop(t, px_args, px_th)
+
+	client, derr := net.dial_tcp_from_endpoint(px_ep)
+	testing.expect(t, derr == nil)
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+	request := "GET /bad HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+	net.send_tcp(client, transmute([]byte)request)
+	body := read_client_all(client)
+	resp := string(body)
+	testing.expect(t, strings.has_prefix(resp, "HTTP/1.1 200 OK\r\n"))
+	testing.expectf(t, strings.contains(resp, "5\r\nhello\r\n"), "the valid chunk was not relayed: %q", resp)
+	// the relay stops at the malformed size line, and the body must not look
+	// complete: the client has to be able to tell it was cut
+	testing.expectf(t, !strings.contains(resp, "SHOULD-NOT-RELAY"), "the relay continued past a malformed chunk: %q", resp)
+	testing.expectf(t, !strings.has_suffix(resp, "0\r\n\r\n"), "a truncated body was terminated: %q", resp)
+	delete(body)
+
+	time.sleep(150 * time.Millisecond)
+	testing.expectf(t, len(p.pool) == 0, "the broken upstream socket was pooled")
+	// a relay that ended on bad framing is not a completed round trip
+	testing.expectf(
+		t,
+		p.upstreams[0].failures_total == 1,
+		"the malformed chunk was not charged to the upstream (%v failure(s))",
+		p.upstreams[0].failures_total,
+	)
 }

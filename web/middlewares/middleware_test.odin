@@ -1,4 +1,4 @@
-package middleware
+package middlewares
 
 import ".."
 import "core:encoding/base64"
@@ -380,4 +380,160 @@ test_middleware_logger_passes_through :: proc(t: ^testing.T) {
 	testing.expect_value(t, res.status, web.Status.OK)
 	testing.expect_value(t, string(web.buf_slice(&res.body)), "ok")
 	testing.expect_value(t, len(req.id), 24)
+}
+
+@(test)
+test_middleware_cors_plain_request :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	web.router_use(&e.router, middleware_cors)
+	web.router_get(&e.router, "/plain", dummy_handler)
+
+	// same-origin request: no Origin header, so nothing to negotiate and no
+	// CORS headers are added
+	req := web.Request{method = .Get, path = "/plain", target = "/plain"}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+	_, has_acao := web.response_header(&res, "Access-Control-Allow-Origin")
+	testing.expect(t, !has_acao)
+	testing.expect_value(t, string(web.buf_slice(&res.body)), "ok")
+}
+
+@(test)
+test_middleware_cors_disallowed_preflight :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	cfg := CORS_Config{origins = []string{"https://admin.example"}}
+	web.router_use(&e.router, middleware_cors, &cfg)
+	web.router_get(&e.router, "/api/users", dummy_handler)
+
+	req := web.Request {
+		method  = .Options,
+		path    = "/api/users",
+		target  = "/api/users",
+		headers = []web.Header {
+			web.Header{key = "Origin", value = "https://evil.example"},
+			web.Header{key = "Access-Control-Request-Method", value = "POST"},
+		},
+	}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+
+	// no CORS grant, and no route answers OPTIONS either
+	_, has_acao := web.response_header(&res, "Access-Control-Allow-Origin")
+	testing.expect(t, !has_acao)
+	testing.expect_value(t, res.status, web.Status.Method_Not_Allowed)
+}
+
+@(test)
+test_middleware_cors_preflight_without_requested_headers :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	web.router_use(&e.router, middleware_cors)
+	web.router_get(&e.router, "/api/users", dummy_handler)
+
+	req := web.Request {
+		method  = .Options,
+		path    = "/api/users",
+		target  = "/api/users",
+		headers = []web.Header {
+			web.Header{key = "Origin", value = "https://app.example"},
+			web.Header{key = "Access-Control-Request-Method", value = "PUT"},
+		},
+	}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+
+	testing.expect_value(t, res.status, web.Status.No_Content)
+	methods, _ := web.response_header(&res, "Access-Control-Allow-Methods")
+	testing.expect(t, strings.contains(methods, "PUT"))
+	// nothing was requested, so the mirror is empty and the header is absent
+	_, has_acah := web.response_header(&res, "Access-Control-Allow-Headers")
+	testing.expect(t, !has_acah)
+}
+
+@(test)
+test_middleware_basic_auth_fails_open :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	cfg := Basic_Auth_Config{password = "s3cret"} // no username: disabled
+	web.router_use(&e.router, middleware_basic_auth, &cfg)
+	web.router_get(&e.router, "/private", dummy_handler)
+
+	req := web.Request{method = .Get, path = "/private", target = "/private"}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+	testing.expect_value(t, res.status, web.Status.OK)
+	testing.expect_value(t, string(web.buf_slice(&res.body)), "ok")
+}
+
+// ---------------------------------------------------------------------------
+// auth fail-open
+// ---------------------------------------------------------------------------
+
+@(test)
+test_middleware_bearer_auth_fails_open :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	cfg := Bearer_Auth_Config{} // no tokens: disabled
+	web.router_use(&e.router, middleware_bearer_auth, &cfg)
+	web.router_get(&e.router, "/api", dummy_handler)
+
+	req := web.Request{method = .Get, path = "/api", target = "/api"}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+	testing.expect_value(t, res.status, web.Status.OK)
+}
+
+// ---------------------------------------------------------------------------
+// body limit
+// ---------------------------------------------------------------------------
+
+@(test)
+test_middleware_body_limit_without_length :: proc(t: ^testing.T) {
+	e: Mw_Env
+	mw_env_init(&e)
+	defer mw_env_destroy(&e)
+
+	cfg := Body_Limit_Config{max_bytes = 10}
+	web.router_use(&e.router, middleware_body_limit, &cfg)
+	web.router_post(&e.router, "/upload", dummy_handler)
+
+	// a chunked body has no length up front: this middleware cannot judge it
+	req := web.Request{method = .Post, path = "/upload", target = "/upload"}
+	res: web.Response
+	mw_env_call(&e, &req, &res)
+	testing.expect_value(t, res.status, web.Status.OK)
+
+	// a malformed length is not a reason to reject either
+	req_bad := web.Request {
+		method  = .Post,
+		path    = "/upload",
+		target  = "/upload",
+		headers = []web.Header{web.Header{key = "Content-Length", value = "lots"}},
+	}
+	res_bad: web.Response
+	mw_env_call(&e, &req_bad, &res_bad)
+	testing.expect_value(t, res_bad.status, web.Status.OK)
+
+	// a value straddling whitespace is still parsed
+	req_pad := web.Request {
+		method  = .Post,
+		path    = "/upload",
+		target  = "/upload",
+		headers = []web.Header{web.Header{key = "Content-Length", value = " 50 "}},
+	}
+	res_pad: web.Response
+	mw_env_call(&e, &req_pad, &res_pad)
+	testing.expect_value(t, res_pad.status, web.Status.Payload_Too_Large)
 }

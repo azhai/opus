@@ -35,8 +35,11 @@ Model:
     grows with the response size, and the client starts receiving before
     the upstream has finished.
   - Upstream connections are kept alive and reused from a small per-host
-    pool (`keep_alive`, on by default). A pooled connection that turns out
-    to be stale is retried once on a fresh connection for idempotent
+    pool (`keep_alive`, on by default). Only a connection that finished its
+    response cleanly goes into the pool: a `Connection: close`, an HTTP/1.0
+    peer that did not ask for keep-alive, and a body cut short by a reset or
+    a malformed chunk all close it instead. A pooled connection that turns
+    out to be stale is retried once on a fresh connection for idempotent
     methods.
   - Hop-by-hop headers are dropped in both directions. `Host` is rewritten
     to the upstream, and `X-Forwarded-For` / `X-Forwarded-Proto` / `Via`
@@ -353,6 +356,7 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 	c.proxy_head_len = 0
 	c.proxy_remaining = 0
 	c.proxy_body_done = false
+	c.proxy_body_broken = false
 	c.proxy_client_started = false
 	c.proxy_upstream_close = false
 	c.proxy_retryable = false
@@ -472,7 +476,7 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 			// a reset mid-stream is only acceptable for close-delimited
 			// bodies that already have a head
 			if c.proxy_state == .Body {
-				proxy_body_finish(c)
+				proxy_body_cut(c)
 				return
 			}
 		}
@@ -643,7 +647,11 @@ proxy_pump :: proc(c: ^Conn) {
 		return
 	}
 	if c.proxy_body_done {
-		proxy_body_finish(c)
+		if c.proxy_body_broken {
+			proxy_body_cut(c)
+		} else {
+			proxy_body_finish(c)
+		}
 		return
 	}
 	proxy_recv_arm(c)
@@ -678,7 +686,10 @@ proxy_drain_body :: proc(c: ^Conn) {
 			}
 			if bad {
 				// the upstream framing went bad mid-body: stop relaying
-				// and cut the connection so the client sees a truncation
+				// here and let the connection close, so the client sees a
+				// truncation instead of a silently short body
+				c.proxy_body_broken = true
+				c.proxy_body_done = true
 				c.proxy_upstream_close = true
 				c.res.keep_alive = false
 			}
@@ -700,7 +711,7 @@ proxy_drain_body :: proc(c: ^Conn) {
 	}
 }
 
-// proxy_body_finish closes out the response: terminal chunk, upstream
+// proxy_body_finish closes out a complete response: terminal chunk, upstream
 // release, and back into the normal write/keep-alive path.
 proxy_body_finish :: proc(c: ^Conn) {
 	if c.proxy_framing == .Reframe_Chunked {
@@ -709,6 +720,31 @@ proxy_body_finish :: proc(c: ^Conn) {
 	if c.proxy_cfg != nil {
 		proxy_note_success(c.proxy_cfg, c.proxy_upstream)
 	}
+	proxy_response_end(c)
+}
+
+/*
+proxy_body_cut ends a response whose upstream went away before the body was
+complete. What already reached the client stays, but:
+
+  - the socket is closed instead of pooled: it is either dead or still
+    mid-message, and the next request must not inherit it;
+  - the client connection is closed after the last relayed byte, so a
+    close-delimited body is visibly truncated and a re-framed (chunked) one
+    is missing its terminal chunk. Writing that chunk here would tell the
+    client the short body is the whole response;
+  - the upstream is charged with the failure, exactly like a pre-head error.
+*/
+proxy_body_cut :: proc(c: ^Conn) {
+	if c.proxy_cfg != nil {
+		proxy_note_failure(c.proxy_cfg, c.proxy_upstream)
+	}
+	c.proxy_upstream_close = true
+	c.res.keep_alive = false
+	proxy_response_end(c)
+}
+
+proxy_response_end :: proc(c: ^Conn) {
 	proxy_release_upstream(c)
 	c.proxy_state = .Done
 	c.state = .Write
@@ -796,6 +832,10 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 	if sp1 <= 0 {
 		return .Malformed
 	}
+	// HTTP/1.0 has no implicit keep-alive: unless the response asks for it,
+	// the peer closes when this response ends, so pooling the socket would
+	// hand the next request a connection that is already going away.
+	version_10 := eq_ignore_case(line[:sp1], "HTTP/1.0")
 	sp2 := string_index_byte_from(line, ' ', sp1 + 1)
 	code_str := ""
 	reason := ""
@@ -822,6 +862,7 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 	cl_value := ""
 	te_count := 0
 	te_chunked := false
+	peer_keep_alive := false
 	for len(rest) > 0 {
 		// blank line terminates the head
 		if len(rest) >= 2 && rest[0] == '\r' && rest[1] == '\n' {
@@ -847,9 +888,12 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 			te_chunked = te_chunked || contains_ignore_case(value, "chunked")
 		} else if eq_ignore_case(key, "Connection") {
 			// dropped, but remembered: a peer that wants to close will
-			// not be reused from the pool
+			// not be reused from the pool, and an HTTP/1.0 peer has to ask
+			// for keep-alive explicitly
 			if contains_ignore_case(value, "close") {
 				c.proxy_upstream_close = true
+			} else if contains_ignore_case(value, "keep-alive") {
+				peer_keep_alive = true
 			}
 			continue
 		} else if is_hop_by_hop_header(key) {
@@ -883,6 +927,9 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 	}
 	if te_count > 0 && !te_chunked {
 		return .Malformed
+	}
+	if version_10 && !peer_keep_alive {
+		c.proxy_upstream_close = true
 	}
 
 	// body framing decision

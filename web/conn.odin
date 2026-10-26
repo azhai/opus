@@ -99,6 +99,7 @@ Conn :: struct {
 	proxy_client_started: bool, // response head reached the client
 	proxy_upstream_close: bool, // upstream asked for Connection: close
 	proxy_body_done:      bool, // upstream body fully relayed
+	proxy_body_broken:    bool, // relay stopped early (reset, bad chunk)
 
 	// TLS state (see tls.odin); nil on a plaintext connection
 	tls:            ^Tls_Session,
@@ -912,6 +913,7 @@ conn_request_reset :: proc(c: ^Conn) {
 	c.proxy_client_started = false
 	c.proxy_upstream_close = false
 	c.proxy_body_done = false
+	c.proxy_body_broken = false
 	c.proxy_cfg = nil
 	c.async = {}
 }

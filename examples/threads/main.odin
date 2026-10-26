@@ -47,8 +47,7 @@ handler :: proc(req: ^web.Request, res: ^web.Response) {
 
 	buf: [128]byte
 	body := fmt.bprintf(buf[:], "hello from acceptor %d\n", id)
-	web.response_set_header(res, "Content-Type", "text/plain; charset=utf-8")
-	web.response_write_string(res, body)
+	web.response_text(res, .OK, body)
 }
 
 Stop_Args :: struct {

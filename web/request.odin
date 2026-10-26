@@ -53,7 +53,7 @@ Request :: struct {
 	route: ^Route,
 	chain: []Middleware,
 	// session and uploads hold per-request state owned by middleware in the
-	// `web/middleware` subpackage. They are untyped on purpose: the concrete
+	// `web/middlewares` subpackage. They are untyped on purpose: the concrete
 	// types live in the subpackage, which the parent cannot import. Read
 	// them through that package's accessors, never directly.
 	session: rawptr,

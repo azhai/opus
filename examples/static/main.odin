@@ -7,8 +7,8 @@ import "../../web"
 /*
 Static file serving with the stat cache + sendfile, plus one dynamic route.
 
-	odin run examples/static -- ./www
-	curl localhost:8080/            -> www/index.html
+	odin run examples/static -- ./examples/www
+	curl localhost:8080/            -> examples/www/index.html
 	curl localhost:8080/css/a.css   -> served with sendfile
 	curl localhost:8080/time        -> dynamic handler
 */
@@ -49,6 +49,5 @@ static_files :: proc(req: ^web.Request, res: ^web.Response) {
 }
 
 current_time :: proc(req: ^web.Request, res: ^web.Response) {
-	web.response_set_header(res, "Content-Type", "text/plain; charset=utf-8")
-	web.response_write_string(res, "the time is now\n")
+	web.response_text(res, .OK, "the time is now\n")
 }

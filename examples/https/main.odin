@@ -29,8 +29,7 @@ Generate a real certificate with:
 */
 
 hello :: proc(req: ^web.Request, res: ^web.Response) {
-	web.response_set_header(res, "Content-Type", "text/plain; charset=utf-8")
-	web.response_write_string(res, "hello over TLS\n")
+	web.response_text(res, .OK, "hello over TLS\n")
 }
 
 main :: proc() {

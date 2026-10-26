@@ -41,12 +41,7 @@ main :: proc() {
 	web.router_init(&router)
 	web.router_get(&router, "/health", health)
 	// catch-all under /api: forward into the proxy (every method)
-	web.router_add(&router, .Get, "/api/" + "*", api_forward)
-	web.router_add(&router, .Head, "/api/" + "*", api_forward)
-	web.router_add(&router, .Post, "/api/" + "*", api_forward)
-	web.router_add(&router, .Put, "/api/" + "*", api_forward)
-	web.router_add(&router, .Delete, "/api/" + "*", api_forward)
-	web.router_add(&router, .Patch, "/api/" + "*", api_forward)
+	web.router_all(&router, "/api/" + "*", api_forward)
 
 	srv: web.Server
 	if !web.server_init(&srv, listen) {
@@ -67,8 +62,7 @@ main :: proc() {
 }
 
 health :: proc(req: ^web.Request, res: ^web.Response) {
-	web.response_set_header(res, "Content-Type", "text/plain")
-	web.response_write_string(res, "ok\n")
+	web.response_text(res, .OK, "ok\n")
 }
 
 api_forward :: proc(req: ^web.Request, res: ^web.Response) {
