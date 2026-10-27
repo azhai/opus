@@ -1,7 +1,9 @@
 package web
 
+import "base:intrinsics"
 import "core:mem"
 import "core:strings"
+import "core:sync"
 
 /*
 Router is lighttpd2's "action stack + condition evaluation" idea, expressed
@@ -205,7 +207,7 @@ router_add :: proc(r: ^Router, method: Method, pattern: string, handler: Handler
 	route.middlewares = make([dynamic]Middleware, r.allocator)
 	route.is_pattern = pattern_has_syntax(pattern)
 	append(&r.routes, route)
-	r.index_dirty = true
+	intrinsics.volatile_store(&r.index_dirty, true)
 	return route
 }
 
@@ -387,15 +389,46 @@ route_pattern_is_static :: proc(route: ^Route) -> bool {
 }
 
 /*
-router_index_build rebuilds the path hash and the dynamic list from the route
-table. Registrations mark the router dirty and the next match rebuilds, so a
-table that is built at startup and then only read pays this once.
+router_seal builds the lookup index once, on the calling thread, so that no
+match ever has to. Call it after the last `router_add` and before the server
+starts accepting.
 
-Rebuilds replace the map rather than clearing it: entries are individually
-allocated, and a router whose table is rebuilt often (a test, a plugin system)
-would otherwise leak one entry per rebuild. Freeing them while walking the old
-map is the only place that has to know they are owned here.
+It exists because the lazy rebuild in `router_match` is not safe against
+concurrent first requests: with N acceptor threads a burst of traffic can have
+several of them see `index_dirty` at once, and one rebuild frees the entries
+another is still reading. The symptom is nasty and quiet - an arbitrary subset
+of the table answers 404 for the rest of the process's life, on a server whose
+routes are all registered correctly. Sealing turns that window into zero: with
+the flag already clear, the match path takes a read lock that no one contends.
+
+A table that is registered into at runtime still rebuilds lazily; that path is
+serialized on the same lock.
 */
+router_seal :: proc(r: ^Router) {
+	sync.mutex_lock(&router_index_mutex)
+	if r.index_dirty {
+		router_index_build(r)
+	}
+	sync.mutex_unlock(&router_index_mutex)
+}
+
+/*
+router_index_mutex serializes index builds. It is only taken while the index is
+dirty - once sealed, `router_match` reads without locking because nothing can
+mutate the tables any more, which is why a plain mutex is enough.
+*/
+router_index_mutex: sync.Mutex
+
+// router_index_build rebuilds the path hash and the dynamic list from the route
+// table. Registrations mark the router dirty and the next match rebuilds, so a
+// table that is built at startup and then only read pays this once.
+//
+// Callers hold `router_index_mutex` exclusively.
+//
+// Rebuilds replace the map rather than clearing it: entries are individually
+// allocated, and a router whose table is rebuilt often (a test, a plugin system)
+// would otherwise leak one entry per rebuild. Freeing them while walking the old
+// map is the only place that has to know they are owned here.
 router_index_build :: proc(r: ^Router) {
 	if r.index != nil {
 		for _, entry in r.index {
@@ -423,7 +456,7 @@ router_index_build :: proc(r: ^Router) {
 			entry.methods[slot] = route
 		}
 	}
-	r.index_dirty = false
+	intrinsics.volatile_store(&r.index_dirty, false)
 }
 
 // route_entry_any returns any route registered for an entry, for the 405
@@ -452,8 +485,17 @@ pattern routes go to `req.captures`. A literal route produces neither, and the
 storage for them is not allocated at all on that path.
 */
 router_match :: proc(r: ^Router, req: ^Request, allocator: mem.Allocator) -> (route: ^Route, method_ok: bool) {
-	if r.index_dirty {
-		router_index_build(r)
+	// Sealed routers (the normal case: `router_seal` before serving) skip the
+	// lock entirely - one volatile load. A router that is still being
+	// registered into takes the lock exclusively to rebuild, and every thread
+	// that saw the dirty flag waits on it, so a rebuild can never free the
+	// entries another thread is reading.
+	if intrinsics.volatile_load(&r.index_dirty) {
+		sync.mutex_lock(&router_index_mutex)
+		if intrinsics.volatile_load(&r.index_dirty) {
+			router_index_build(r)
+		}
+		sync.mutex_unlock(&router_index_mutex)
 	}
 
 	entry, has_path := r.index[req.path]
