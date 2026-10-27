@@ -9,7 +9,7 @@ import "core:time"
 /*
 Static serves files from a directory tree with a TTL stat cache
 (lighttpd2's stat_cache, minus the async stat thread pool: metadata lookups
-are cached, and file bodies are streamed zero-copy with sendfile).
+are cached, and file bodies are streamed in FILE_CHUNK pieces).
 
 Usage:
 

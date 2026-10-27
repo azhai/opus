@@ -20,7 +20,9 @@ Response is the write side of a request.
 Handlers mutate it through the `response_*` procedures; `response_build`
 serializes the head (and the in-memory body, if any) into the connection's
 output buffer. For file responses only the head is serialized; the body is
-streamed with zero-copy `sendfile` afterwards.
+streamed afterwards in FILE_CHUNK pieces from a per-connection buffer (see
+conn_file_next - not `nbio.sendfile`, whose Linux path leaks a pipe per
+transfer).
 */
 Response :: struct {
 	conn:   ^Conn,
@@ -189,9 +191,9 @@ response_no_content :: proc(w: ^Response, status: Status = .No_Content) {
 	w.file_open = false
 }
 
-// response_send_file switches the response to zero-copy file streaming.
+// response_send_file switches the response to streamed file delivery.
 // The file is opened synchronously (metadata may be cached by the static
-// handler); contents are sent with `sendfile` once the head is written.
+// handler); contents start flowing once the head is written.
 response_send_file :: proc(w: ^Response, path: string) -> bool {
 	if file_pending(w) {
 		return false
@@ -220,8 +222,8 @@ response_send_file :: proc(w: ^Response, path: string) -> bool {
 }
 
 // response_send_file_range streams a byte range of a file: `offset` bytes
-// are skipped and `length` bytes are sent (sendfile with an offset, still
-// zero-copy). Used by the static handler for single-range 206 responses.
+// are skipped and `length` bytes are sent. Used by the static handler for
+// single-range 206 responses.
 response_send_file_range :: proc(w: ^Response, path: string, offset, length: i64) -> bool {
 	if file_pending(w) || offset < 0 || length < 0 {
 		return false

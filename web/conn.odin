@@ -144,6 +144,12 @@ Conn :: struct {
 	file_handle: nbio.Handle,
 	send_phase:  Send_Phase,
 
+	// file_buf/file_sent stream a file body in FILE_CHUNK pieces (see
+	// conn_file_next). The buffer is allocated on first use and kept for the
+	// life of the connection, so a keep-alive viewer pays it once.
+	file_buf:  []byte,
+	file_sent: i64,
+
 	op:      ^nbio.Operation,
 
 	// async parking (see async.odin): a deferred response keeps the request
@@ -240,6 +246,10 @@ conn_destroy :: proc(c: ^Conn) {
 	buf_destroy(&c.proxy_req)
 	buf_destroy(&c.proxy_buf)
 	buf_destroy(&c.tls_out)
+	if c.file_buf != nil {
+		delete(c.file_buf, c.server.allocator)
+		c.file_buf = nil
+	}
 	tls_destroy(c)
 	mem.dynamic_arena_destroy(&c.scratch)
 	alloc := c.server.allocator
@@ -313,9 +323,10 @@ conn_batch_next decides whether the response that was just serialized can wait
 in `c.out` while the next pipelined request is handled.
 
 It is conservative on purpose. Batching is refused when the connection is
-closing, when the response carries a file body (sendfile has its own send),
-when TLS is in play (`c.out` is not what reaches the socket), and - the one
-that matters - unless the *next* request head is already buffered. Deferring a
+closing, when the response carries a file body (its bytes come from a separate
+read/send loop), when TLS is in play (`c.out` is not what reaches the socket),
+and - the one that matters - unless the *next* request head is already
+buffered. Deferring a
 flush while waiting for more input would deadlock a client that is itself
 waiting for the responses before it sends more.
 */
@@ -919,37 +930,123 @@ on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 
 	w := &c.res
 	if file_pending(w) && c.send_phase != .File {
-		// head is on the wire; stream the file body zero-copy
+		// A HEAD response advertises the length the GET would have had, but
+		// must not put the bytes on the wire: doing so would leak the body
+		// into the next response on a keep-alive connection.
+		if c.req.method == .Head {
+			conn_file_finish(c)
+			return
+		}
+		// head is on the wire; stream the file body in FILE_CHUNK pieces
 		c.send_phase = .File
-		c.op = nbio.sendfile_poly(
-			c.socket,
-			w.file_handle,
-			c,
-			on_file_sent,
-			offset = w.file_offset,
-			nbytes = int(w.file_size),
-			timeout = c.server.write_timeout,
-		)
+		conn_file_next(c)
 		return
 	}
 	conn_after_write(c)
 }
 
-on_file_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
+/*
+FILE_CHUNK is how much of a file body is read per round trip: big enough to
+amortise a syscall, small enough that N viewers cost N*64 KiB and not N*span.
+
+Why not nbio.sendfile: on Linux core:nbio implements it as two splices over a
+pipe, and the read end of that pipe is never closed when a transfer completes
+(impl_linux.odin, sendfile_callback: it is closed only on the error path).
+That is one leaked descriptor per file body, so a 1024-fd rlimit - the OpenWrt
+default - is exhausted after ~1000 range requests. The failure is not graceful:
+stat() is open(2)+fstat(2) in core:os, so once descriptors run out every
+handler that touches the filesystem answers "404 file not found", file bodies
+get truncated after their Content-Length, and accept() starts dropping
+connections. Streaming through this buffer costs one memcpy per 64 KiB, which
+disappears next to the socket write, and keeps a single code path on every OS -
+so the tests that run here exercise the code Linux ships.
+*/
+FILE_CHUNK :: 64 << 10
+
+// conn_file_next reads the next piece of a pending file body and hands it to
+// the socket; on_file_chunk_sent comes back here until the promised byte
+// count is reached, then conn_file_finish releases the handle.
+conn_file_next :: proc(c: ^Conn) {
+	w := &c.res
+	remaining := w.file_size - c.file_sent
+	if remaining <= 0 {
+		conn_file_finish(c)
+		return
+	}
+	if c.file_buf == nil {
+		c.file_buf = make([]byte, FILE_CHUNK, c.server.allocator)
+		if c.file_buf == nil {
+			log_debug("web: conn %v cannot allocate the file buffer", c.remote)
+			conn_close(c)
+			return
+		}
+	}
+	chunk := len(c.file_buf)
+	if remaining < i64(chunk) {
+		chunk = int(remaining)
+	}
+	c.op = nbio.read_poly(
+		w.file_handle,
+		w.file_offset + int(c.file_sent),
+		c.file_buf[:chunk],
+		c,
+		on_file_read,
+		all = true,
+		timeout = c.server.write_timeout,
+	)
+}
+
+on_file_read :: proc(op: ^nbio.Operation, c: ^Conn) {
 	c.op = nil
+	if c.closed {
+		return
+	}
+	if op.read.err != nil {
+		log_debug("web: conn %v file read error: %v", c.remote, op.read.err)
+		conn_close(c)
+		return
+	}
+	n := op.read.read
+	if n <= 0 {
+		// The file shrank after the head went out (a copy still in progress,
+		// a rotated segment). Content-Length is already on the wire, so the
+		// only honest ending is to drop the connection and let the player
+		// re-request the range - padding the body would be a lie.
+		log_debug("web: conn %v file body short at %v/%v", c.remote, c.file_sent, c.res.file_size)
+		conn_close(c)
+		return
+	}
+	c.op = nbio.send_poly(
+		c.socket,
+		[][]byte{c.file_buf[:n]},
+		c,
+		on_file_chunk_sent,
+		all = true,
+		timeout = c.server.write_timeout,
+	)
+}
+
+on_file_chunk_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
+	c.op = nil
+	if c.closed {
+		return
+	}
+	if op.send.err != nil {
+		log_debug("web: conn %v file send error: %v", c.remote, op.send.err)
+		conn_close(c)
+		return
+	}
+	c.server.stats.bytes_out += u64(op.send.sent)
+	c.file_sent += i64(op.send.sent)
+	conn_file_next(c)
+}
+
+// conn_file_finish closes the file and moves on to the next request.
+conn_file_finish :: proc(c: ^Conn) {
 	if c.res.file_open {
 		nbio.close(c.res.file_handle)
 		c.res.file_open = false
 	}
-	if c.closed {
-		return
-	}
-	if op.sendfile.err != nil {
-		log_debug("web: conn %v sendfile error: %v", c.remote, op.sendfile.err)
-		conn_close(c)
-		return
-	}
-	c.server.stats.bytes_out += u64(op.sendfile.sent)
 	conn_after_write(c)
 }
 
@@ -997,6 +1094,7 @@ conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 	c.chunked = false
 	c.head_scanned = 0
 	c.send_phase = .None
+	c.file_sent = 0
 	c.idle_since = {}
 	c.proxy_state = .None
 	c.proxy_framing = .None

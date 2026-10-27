@@ -38,7 +38,7 @@ What you get:
     `router_use_route`. HEAD is served by the GET route when no HEAD route
     exists. Unmatched requests still walk the middleware chain before the
     404/405 terminal answers. A static file handler with stat caching and
-    zero-copy `sendfile` rounds out the routing layer.
+    chunked file streaming rounds out the routing layer.
   - Application-level context helpers, the surface a Go developer expects
     from Fiber/Echo: `request_hostname`, `request_scheme`,
     `request_client_ip`, `request_content_type`, `request_is_ajax`,

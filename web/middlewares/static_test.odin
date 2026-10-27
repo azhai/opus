@@ -37,7 +37,7 @@ test_middleware_static_serves_file :: proc(t: ^testing.T) {
 	mw_env_call(&e, &req, &res)
 
 	testing.expect_value(t, res.status, web.Status.OK)
-	testing.expect(t, res.file_open) // zero-copy sendfile, not a buffered body
+	testing.expect(t, res.file_open) // streamed file body, not a buffered one
 	testing.expect(t, strings.has_suffix(res.file_path, "css/a.css"))
 	if ct, ok := web.response_header(&res, "Content-Type"); testing.expect(t, ok) {
 		testing.expect(t, strings.has_prefix(ct, "text/css"))

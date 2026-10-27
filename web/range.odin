@@ -9,10 +9,10 @@ import "core:time/datetime"
 /*
 Range requests (RFC 7233) for file responses.
 
-The static handler serves single ranges zero-copy (`sendfile` with an
-offset, see `response_send_file_range`) and falls back to an in-memory
+The static handler serves single ranges out of the file (`response_send_file_range`,
+which streams just that slice) and falls back to an in-memory
 `multipart/byteranges` body when a client asks for several ranges at once
-(the rare case; zero-copy is not worth the complexity there).
+(the rare case; slicing per range is not worth the complexity there).
 
 Conditional requests ride along: `Last-Modified` is emitted from the stat
 cache, `If-Modified-Since` short-circuits with 304, and `If-Range` decides
