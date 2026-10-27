@@ -68,7 +68,10 @@ cookie_string :: proc(c: Cookie, allocator := context.allocator) -> string {
 	}
 	if c.max_age_secs != 0 {
 		buf_append_string(&b, "; Max-Age=")
-		buf_append_string(&b, int_to_string(i64(c.max_age_secs), allocator))
+		// formatted in place: int_to_string would hand back a string that
+		// nothing frees, once per Set-Cookie
+		num: [24]byte
+		buf_append(&b, num[:i64_to_buf(num[:], i64(c.max_age_secs))])
 	}
 	if c.secure {
 		buf_append_string(&b, "; Secure")

@@ -129,9 +129,11 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 	response_set_header(res, "Last-Modified", http_date(entry.mod_utc, conn_scratch(req.conn)))
 	response_set_header(res, "Accept-Ranges", "bytes")
 
-	// conditional GET: a fresh copy in the client's cache answers 304
+	// conditional GET: a fresh copy in the client's cache answers 304.
+	// The mtime is truncated to the second the `Last-Modified` above carried:
+	// the client can only ever hand back that whole-second date.
 	if ims, ok := request_header(req, "If-Modified-Since"); ok {
-		if t, tok := parse_http_date(ims); tok && time.diff(entry.mod_utc, t) >= 0 {
+		if t, tok := parse_http_date(ims); tok && time.diff(date_trunc_second(entry.mod_utc), t) >= 0 {
 			static_not_modified(res)
 			return
 		}

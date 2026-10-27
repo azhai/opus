@@ -476,37 +476,13 @@ response_build :: proc(w: ^Response, out: ^Buf, allocator: mem.Allocator) {
 	buf_append(out, buf_slice(&w.body))
 }
 
+// int_to_string renders `v` as decimal. The formatting itself is
+// i64_to_buf (range.odin), which has no allocator of its own - this only
+// copies the result into storage the caller can keep.
 int_to_string :: proc(v: i64, allocator: mem.Allocator) -> string {
-	digits := "0123456789"
-	neg := v < 0
-	mag := v
-	if neg {
-		mag = -mag
-	}
-	tmp: [24]byte
-	n := 0
-	if mag == 0 {
-		tmp[0] = '0'
-		n = 1
-	}
-	for mag > 0 {
-		tmp[n] = digits[mag % 10]
-		mag /= 10
-		n += 1
-	}
-	total := n
-	if neg {
-		total += 1
-	}
-	out := make([]byte, total, allocator)
-	i := 0
-	if neg {
-		out[0] = '-'
-		i = 1
-	}
-	for j := n - 1; j >= 0; j -= 1 {
-		out[i] = tmp[j]
-		i += 1
-	}
+	buf: [24]byte
+	n := i64_to_buf(buf[:], v)
+	out := make([]byte, n, allocator)
+	copy(out, buf[:n])
 	return string(out)
 }

@@ -1,5 +1,6 @@
 package web
 
+import "base:intrinsics"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -149,22 +150,71 @@ parse_i64_strict :: proc(s: string) -> (i64, bool) {
 	return v, true
 }
 
+/*
+i64_to_buf writes `v` as decimal into `buf` and returns how many bytes it
+took. 20 digits plus a sign is the worst case an i64 can ask for.
+
+Formatting into a caller's buffer is what lets the renderers below build
+their result in **one** allocation instead of one per number: a
+`Content-Range` used to cost four allocations and leak three of them, since
+the intermediate strings were handed to `concat_strings` and never freed.
+*/
+i64_to_buf :: proc(buf: []byte, v: i64) -> int {
+	neg := v < 0
+	// -min(i64) has no positive counterpart; widen before negating
+	mag := u64(v)
+	if neg {
+		mag = u64(-(v + 1)) + 1
+	}
+	tmp: [20]byte
+	n := 0
+	if mag == 0 {
+		tmp[0] = '0'
+		n = 1
+	}
+	for mag > 0 {
+		tmp[n] = byte('0' + mag % 10)
+		mag /= 10
+		n += 1
+	}
+	total := n
+	i := 0
+	if neg {
+		buf[0] = '-'
+		i = 1
+		total += 1
+	}
+	for j := n - 1; j >= 0; j -= 1 {
+		buf[i] = tmp[j]
+		i += 1
+	}
+	return total
+}
+
 // content_range_value renders "bytes <start>-<end>/<size>".
 content_range_value :: proc(start, end, size: i64, allocator: mem.Allocator) -> string {
-	parts := []string{
-		"bytes ",
-		int_to_string(start, allocator),
-		"-",
-		int_to_string(end, allocator),
-		"/",
-		int_to_string(size, allocator),
-	}
-	return concat_strings(parts, allocator)
+	buf: [80]byte
+	n := copy(buf[:], "bytes ")
+	n += i64_to_buf(buf[n:], start)
+	buf[n] = '-'
+	n += 1
+	n += i64_to_buf(buf[n:], end)
+	buf[n] = '/'
+	n += 1
+	n += i64_to_buf(buf[n:], size)
+	out := make([]byte, n, allocator)
+	copy(out, buf[:n])
+	return string(out)
 }
 
 // unsatisfiable_content_range renders "bytes */<size>" for 416 responses.
 unsatisfiable_content_range :: proc(size: i64, allocator: mem.Allocator) -> string {
-	return concat_strings({"bytes */", int_to_string(size, allocator)}, allocator)
+	buf: [40]byte
+	n := copy(buf[:], "bytes */")
+	n += i64_to_buf(buf[n:], size)
+	out := make([]byte, n, allocator)
+	copy(out, buf[:n])
+	return string(out)
 }
 
 /*
@@ -197,19 +247,27 @@ range_multipart_body :: proc(
 		buf_append_string(&b, "\r\nContent-Type: ")
 		buf_append_string(&b, ctype)
 		buf_append_string(&b, "\r\nContent-Range: bytes ")
-		buf_append_string(&b, int_to_string(r.start, allocator))
+		// one stack buffer for all the numbers: the intermediate strings
+		// would each be an allocation that nothing frees
+		num: [24]byte
+		n := i64_to_buf(num[:], r.start)
+		buf_append(&b, num[:n])
 		buf_append_string(&b, "-")
-		buf_append_string(&b, int_to_string(r.start + r.length - 1, allocator))
+		n = i64_to_buf(num[:], r.start + r.length - 1)
+		buf_append(&b, num[:n])
 		buf_append_string(&b, "/")
-		buf_append_string(&b, int_to_string(size, allocator))
+		n = i64_to_buf(num[:], size)
+		buf_append(&b, num[:n])
 		buf_append_string(&b, "\r\n\r\n")
 
 		chunk := make([]byte, r.length, allocator)
-		n, rerr := os.read_at(f, chunk, r.start)
-		if rerr != nil || i64(n) != r.length {
+		got, rerr := os.read_at(f, chunk, r.start)
+		if rerr != nil || i64(got) != r.length {
+			delete(chunk, allocator)
 			return nil, false
 		}
 		buf_append(&b, chunk)
+		delete(chunk, allocator) // it was a scratch buffer, not part of the result
 		buf_append_string(&b, "\r\n")
 	}
 	buf_append_string(&b, "--")
@@ -226,16 +284,38 @@ range_multipart_body :: proc(
 MULTIPART_COUNTER: int
 
 multipart_boundary :: proc(allocator: mem.Allocator) -> string {
-	MULTIPART_COUNTER += 1
+	// atomic: several acceptor threads are in here at once, and a plain
+	// `+= 1` lets two of them read the same value and store the same result
+	// - two responses then agree on a boundary, which RFC 2046 forbids.
+	// (atomic_add returns the value it replaced.)
+	seq := intrinsics.atomic_add(&MULTIPART_COUNTER, 1)
 	// nanosecond clock plus a counter: unique per message within a process
 	_, _, _, nanos := time.precise_clock_from_time(time.now())
-	parts := []string{
-		"SEPARATOR-",
-		int_to_string(i64(nanos), allocator),
-		"-",
-		int_to_string(i64(MULTIPART_COUNTER), allocator),
-	}
-	return concat_strings(parts, allocator)
+	buf: [64]byte
+	n := copy(buf[:], "SEPARATOR-")
+	n += i64_to_buf(buf[n:], i64(nanos))
+	buf[n] = '-'
+	n += 1
+	n += i64_to_buf(buf[n:], i64(seq))
+	out := make([]byte, n, allocator)
+	copy(out, buf[:n])
+	return string(out)
+}
+
+/*
+date_trunc_second truncates a timestamp to a whole second.
+
+HTTP dates have one-second resolution (RFC 7231 section 7.1.1.1), and a
+modification time from the filesystem almost always carries more: comparing
+a raw mtime against a parsed date then says "the file changed" for a file
+that did not. A file stamped 12:00:00.400 is published as 12:00:00, so a
+client handing that date back is asking about a moment 400 ms *before* the
+mtime - the comparison fails, the server re-sends the whole file, and every
+conditional GET misses. Validators are compared at the resolution they were
+published in.
+*/
+date_trunc_second :: proc(t: time.Time) -> time.Time {
+	return time.unix(time.time_to_unix(t), 0)
 }
 
 /*
@@ -451,6 +531,7 @@ if_range_allowed :: proc(header: string, mod_utc: time.Time) -> bool {
 	if !ok {
 		return false
 	}
-	// diff(mod, t) >= 0 means t >= mod: unchanged since the client's copy
-	return time.diff(mod_utc, t) >= 0
+	// diff(mod, t) >= 0 means t >= mod: unchanged since the client's copy.
+	// The mtime is truncated first: the client holds a whole-second date.
+	return time.diff(date_trunc_second(mod_utc), t) >= 0
 }

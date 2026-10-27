@@ -189,7 +189,10 @@ sse_retry :: proc(w: ^Sse_Writer, milliseconds: int) -> bool {
 	p := &w.payload
 	buf_reset(p)
 	buf_append_string(p, "retry: ")
-	buf_append_string(p, int_to_string(i64(milliseconds), w.allocator))
+	// formatted in place: int_to_string would hand back a string that
+	// nothing frees, once per keep-alive annotation
+	num: [24]byte
+	buf_append(p, num[:i64_to_buf(num[:], i64(milliseconds))])
 	buf_append_string(p, "\n\n")
 	return sse_frame(w, buf_slice(p))
 }

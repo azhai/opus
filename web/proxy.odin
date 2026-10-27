@@ -341,7 +341,10 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 	}
 	if len(req.body) > 0 {
 		buf_append_string(b, "Content-Length: ")
-		buf_append_string(b, int_to_string(i64(len(req.body)), conn_scratch(c)))
+		// formatted in place: int_to_string would hand back a string that
+		// nothing frees, once per proxied request with a body
+		num: [24]byte
+		buf_append(b, num[:i64_to_buf(num[:], i64(len(req.body)))])
 		buf_append_string(b, "\r\n")
 	}
 	buf_append_string(b, "\r\n")

@@ -13,6 +13,7 @@ import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -275,4 +276,129 @@ test_integration_static_range :: proc(t: ^testing.T) {
 	resp7 := string(buf[:total7])
 	testing.expect(t, strings.has_prefix(resp7, "HTTP/1.1 200 OK\r\n"))
 	testing.expect(t, strings.has_suffix(resp7, "abcdefghijklmnopqrstuvwxyz"))
+}
+
+// ---------------------------------------------------------------------------
+// multipart boundaries (RFC 2046)
+// ---------------------------------------------------------------------------
+
+BOUNDARY_TEST_LANES :: 8
+BOUNDARY_TEST_PER_LANE :: 500
+
+Boundary_Test :: struct {
+	mu:    sync.Mutex,
+	ids:   [dynamic]string,
+	alloc: mem.Allocator,
+}
+
+boundary_test_thread_proc :: proc(th: ^thread.Thread) {
+	bt := cast(^Boundary_Test) th.data
+	local := make([dynamic]string, bt.alloc)
+	for i in 0 ..< BOUNDARY_TEST_PER_LANE {
+		append(&local, multipart_boundary(bt.alloc))
+	}
+	sync.mutex_lock(&bt.mu)
+	append(&bt.ids, ..local[:])
+	sync.mutex_unlock(&bt.mu)
+	delete(local)
+}
+
+// boundary_counter_of returns the counter part of "SEPARATOR-<nanos>-<n>".
+boundary_counter_of :: proc(s: string) -> string {
+	last := -1
+	for i in 0 ..< len(s) {
+		if s[i] == '-' {
+			last = i
+		}
+	}
+	if last < 0 {
+		return s
+	}
+	return s[last + 1:]
+}
+
+/*
+test_multipart_boundary_concurrent: the counter inside a boundary is handed
+out once per response, even with several acceptor threads calling at once.
+
+A boundary is "timestamp + counter" and only the counter is under our
+control. Two threads doing `MULTIPART_COUNTER += 1` at the same moment read
+the same value, add one, and store the same result - two responses on two
+connections then agree on a boundary, which RFC 2046 forbids. The timestamp
+usually hides it (separate threads rarely land on the same nanosecond), so
+this asserts the counter part directly: whatever the clock does, the numbers
+have to be distinct.
+*/
+@(test)
+test_multipart_boundary_concurrent :: proc(t: ^testing.T) {
+	bt := Boundary_Test{alloc = context.allocator}
+	defer {
+		for s in bt.ids {
+			delete(s, context.allocator)
+		}
+		delete(bt.ids)
+	}
+
+	threads := make([]^thread.Thread, BOUNDARY_TEST_LANES, context.allocator)
+	defer delete(threads, context.allocator)
+	for i in 0 ..< BOUNDARY_TEST_LANES {
+		threads[i] = thread.create(boundary_test_thread_proc)
+		threads[i].data = &bt
+		thread.start(threads[i])
+	}
+	for i in 0 ..< BOUNDARY_TEST_LANES {
+		thread.join(threads[i])
+		thread.destroy(threads[i])
+	}
+
+	testing.expect_value(t, len(bt.ids), BOUNDARY_TEST_LANES * BOUNDARY_TEST_PER_LANE)
+	n_distinct := 0
+	for i in 0 ..< len(bt.ids) {
+		counter := boundary_counter_of(bt.ids[i])
+		unique := true
+		for j in 0 ..< i {
+			if boundary_counter_of(bt.ids[j]) == counter {
+				unique = false
+				break
+			}
+		}
+		if unique {
+			n_distinct += 1
+		}
+	}
+	testing.expectf(
+		t,
+		n_distinct == len(bt.ids),
+		"%v of %v boundary counters were distinct",
+		n_distinct,
+		len(bt.ids),
+	)
+}
+
+/*
+test_range_multipart_body_releases: the per-part buffer is given back to the
+allocator that supplied it.
+
+On the connection scratch arena this is invisible - the arena takes it back
+at the end of the request anyway - but the procedure takes an allocator and
+has to honour it, or a caller using the heap (and every multi-range response
+to a big file) grows the process.
+*/
+@(test)
+test_range_multipart_body_releases :: proc(t: ^testing.T) {
+	file := "/tmp/web_test_multipart_body.txt"
+	testing.expect(t, os.write_entire_file(file, transmute([]byte)string("0123456789abcdef")) == nil)
+	defer os.remove(file)
+
+	ranges := []Byte_Range{{start = 0, length = 3}, {start = 8, length = 3}}
+	body, ok := range_multipart_body(file, ranges, "SEPARATOR-1", "text/plain", 16, context.allocator)
+	testing.expect(t, ok)
+	defer delete(body, context.allocator)
+
+	text := string(body)
+	testing.expect(t, strings.contains(text, "Content-Range: bytes 0-2/16"))
+	testing.expect(t, strings.contains(text, "Content-Range: bytes 8-10/16"))
+	testing.expect(t, strings.contains(text, "\r\n\r\n012"))
+	testing.expect(t, strings.contains(text, "\r\n\r\n89a"))
+	testing.expect(t, strings.has_suffix(text, "--SEPARATOR-1--\r\n"))
 }
