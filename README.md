@@ -51,8 +51,8 @@ main :: proc() {
 - 内置中间件（`web/middlewares` 子包）：request id、访问日志、CORS（含预检）、  
   Basic/Bearer/API-Key 认证、正文限额、安全响应头、禁缓存、表单解析、  
   Range+ETag、流式反缓冲、**gzip 开关**、**签名 Cookie 会话**、**JWT(HS256) 校验**、  
-  **静态目录挂载**、**重定向规则**、**multipart 落盘上传**；可全局注册，也可用  
-  `router_use_route` **只挂到某一条路由**（认证只护 `/admin`）
+  **TOTP 两步验证**、**静态目录挂载**、**重定向规则**、**multipart 落盘上传**；  
+  可全局注册，也可用 `router_use_route` **只挂到某一条路由**（认证只护 `/admin`）
 - 表单正文：`middleware_form` 一次解析 `application/x-www-form-urlencoded` 与  
   `multipart/form-data`，字段进 `request_form` / `request_form_value`，上传文件  
   进 `request_files` / `request_file`（限字段数与单文件大小，超限 413）；  
@@ -63,6 +63,13 @@ main :: proc() {
   小 part 仍在内存（`data`），`request_file` 两者通用
 - **内部重写**：`router_rewrite` 在路由表之前改写路径（不发响应、不改地址栏），  
   与之相对的是 `middleware_redirect`（真发 3xx，让客户端再请求一次）
+- **TOTP 两步验证**：RFC 6238（HMAC-SHA1、6 位 / 30 s、默认 ±1 窗口）+ 一次性  
+  恢复码；每个用户的密钥用 master key 以 ChaCha20-Poly1305 加密后落盘（JSON、  
+  临时文件 + rename 原子写、0600）；已用验证码按**匹配到的窗口**记账，同一个码  
+  在容差窗口内重放一律拒；连续失败锁定（默认 5 次 / 15 分钟，到期自动清零）；  
+  两阶段登录的会话状态（密码通过 → 待验证 → 两因素都过）由 `middleware_totp`  
+  把关：浏览器跳 `/totp`，API 回 401 + `WWW-Authenticate: TOTP` 和  
+  `X-Totp-Challenge` 头
 - SSE：`sse_start` / `sse_event` / `sse_comment` / `sse_retry` / `sse_last_event_id` /  
   `sse_close`，chunked 分帧 + 浏览器自动重连语义，handler 不需要自己拼帧；  
   `Sse_Writer` 自带复用缓冲，逐事件零分配
@@ -178,6 +185,14 @@ curl -i --noproxy '*' localhost:8092/old                        # 308 -> /
 curl    --noproxy '*' localhost:8092/intro                      # 内部重写到 /
 curl    --noproxy '*' localhost:8092/assets/app.css             # 静态挂载
 curl --noproxy '*' -F doc=@README.md localhost:8092/upload      # 落盘到 ./uploads
+
+# 两步验证（密码 + 验证器 App 的 6 位数字，或一次性恢复码）
+TOTP_SECRET=$(openssl rand -hex 32) odin run examples/totp -- 127.0.0.1:8093
+curl -s -c /tmp/t -d 'user=admin&password=secret' localhost:8093/login   # 还没开 2FA
+curl -s -b /tmp/t -X POST localhost:8093/setup/start                     # 密钥 + 恢复码
+curl -s -b /tmp/t -d "code=$CODE" localhost:8093/setup/confirm           # 确认启用
+curl -s -c /tmp/t -d 'user=admin&password=secret' localhost:8093/login   # 302 -> /totp
+curl -s -b /tmp/t -d "code=$CODE" localhost:8093/totp                    # 302 -> /admin
 
 # 多 acceptor 线程（4 线程跑 10 秒，退出时打印每线程请求数）
 odin run examples/threads
@@ -362,6 +377,7 @@ examples/
   threads/       多 acceptor 线程（每线程请求数统计）
   middlewares/   按路由挂载的专用中间件：认证 / 表单 / Range+ETag / gzip / SSE /
                  流式上传
+  totp/          两步验证：密码 + TOTP / 恢复码，含启用与关闭
   webapp/        一个小型应用：会话 / JWT / 静态挂载 / 重写 / 重定向 / 上传
   www/           静态测试资源
 docs/
@@ -377,12 +393,14 @@ web/middlewares/              中间件子包（package middlewares，import "..
   gzip.odin        middleware_gzip / middleware_no_gzip（按响应开关压缩）
   session.odin     签名 Cookie 会话：session_get / set / delete / destroy
   jwt.odin         HS256：middleware_jwt / jwt_sign / jwt_verify
+  totp.odin        TOTP（RFC 6238）：HOTP/base32、密钥加密落盘、恢复码、重放与锁定
+  totp_auth.odin   两阶段登录：middleware_totp + 密码后 / 验证码后的会话状态
   static.odin      目录树挂载（可 SPA 回落），复用父包的 stat 缓存 + sendfile
   redirect.odin    middleware_redirect / middleware_https_redirect
   upload.odin      multipart 落盘：request_uploads / request_upload；stream 模式下
                    由 upload_stream_hook 在请求体读之前接管（见 README 流式上传）
   token.odin       共享原语：base64url + HMAC-SHA256 签名/验签
-  *_test.odin     中间件单测（42 个）
+  *_test.odin     中间件单测（60 个）
 ```
 
 
@@ -494,6 +512,7 @@ web.router_use(&router, middlewares.middleware_request_id)
 | `middleware_api_key`                     | 自定义头（默认 `X-API-Key`）+ 可选 query 兜底                                                                            | `API_Key_Config`        |
 | `middleware_jwt`                         | `Authorization: Bearer <jwt>`，HS256 校验 `alg`→签名→`exp`/`nbf`/`iss`/`aud`；401 带 `error="invalid_token"`        | `Jwt_Config`            |
 | `middleware_session`                     | 签名 Cookie 会话：验签后挂到请求，handler 返回后只在有改动时回写 Cookie                                                              | `Session_Config`        |
+| `middleware_totp`                        | 两阶段登录的闸门：两个因素都过的会话放行；只过了密码的跳 `/totp`（非导航请求回 401 + `X-Totp-Challenge`）                                             | `Totp_Gate_Config`      |
 | `middleware_body_limit`                  | 按 `Content-Length` 提前回 413（chunked 仍由 `Server.max_body_size` 兜底）                                             | `Body_Limit_Config`     |
 | `middleware_form`                        | 解析 urlencoded / multipart 正文一次并缓存；非表单正文 415、畸形 400、超限 413                                                    | `Form_Config`           |
 | `middleware_upload`                      | multipart 文件落盘（目录按需创建、文件名消毒+时间戳）；超限 413，非 multipart 放行                                                       | `Upload_Config`         |
@@ -653,6 +672,86 @@ tok, ok := middlewares.jwt_sign(claims, SECRET)
 回 401 + `WWW-Authenticate: Bearer realm="api", error="invalid_token"`。  
 会话用于浏览器登录，JWT 用于服务间调用与短时效 API 访问——它一旦签发出去  
 就收不回来，声明也会过期。
+
+**TOTP 两步验证（密码 + 验证器 App）**
+
+```odin
+totp: middlewares.Totp
+cfg := middlewares.Totp_Config {
+	issuer     = "example.com",
+	secret_hex = SECRET_HEX,                  // openssl rand -hex 32（64 个 hex 字符）
+	path       = "/var/lib/app/totp.json",    // 空 = 只放内存（演示/测试）
+}
+if middlewares.totp_init(&totp, cfg) != .None { return }  // 密钥不合法就别启动
+defer middlewares.totp_destroy(&totp)
+if middlewares.totp_load_failed(&totp) { return }         // 状态文件坏了，别静默关掉 2FA
+
+gate := middlewares.Totp_Gate_Config {
+	totp           = &totp,
+	login_path     = "/login",   // 空 = 未登录直接 401
+	challenge_path = "/totp",    // 默认就是这个
+}
+
+web.router_use(&router, middlewares.middleware_session, &session_cfg)
+web.router_use_route(admin_route, middlewares.middleware_totp, &gate)
+```
+
+登录端点分成两段，`totp_after_password` 是那个分叉点：
+
+```odin
+// 第一阶段（密码对了之后）
+if middlewares.totp_after_password(req, &totp, user, &gate) {
+	web.response_redirect(res, "/totp")   // 这个账号开了 2FA，只过了第一个因素
+	return
+}
+web.response_redirect(res, "/admin")     // 没开 2FA，会话已经是完整的
+
+// 第二阶段（POST /totp）：6 位数字或一个恢复码，按形状自动分辨
+#partial switch middlewares.totp_complete_challenge(req, &totp, code, &gate) {
+case .None:           web.response_redirect(res, "/admin")
+case .Account_Locked: web.response_error(res, .Forbidden, "locked")
+case:                 web.response_error(res, .Unauthorized, "bad code")
+}
+```
+
+设置页（**只在会话完整时开放**，否则就等于给半个登录者发密钥）：
+
+```odin
+enrollment, err := middlewares.totp_setup(&totp, user, web.request_allocator(req))
+// enrollment.secret / .otpauth_uri / .backup_codes —— 只显示这一次，请用户存好
+middlewares.totp_confirm(&totp, user, code)              // 用户确认 App 里已有该密钥
+codes, _ := middlewares.totp_regenerate_backup_codes(&totp, user, alloc)
+middlewares.totp_disable(&totp, user)                    // 关闭（先验证当前码）
+status := middlewares.totp_status(&totp, user)           // enabled/has_binding/locked/backup_codes
+```
+
+行为要点：
+
+- **密钥不进 Cookie**：会话里只有一个签名过的「已验证」标志。共享密钥留在服务端，
+  用 master key 加密（ChaCha20-Poly1305，`core:crypto/aead`）——签名 Cookie 是
+  防篡改、可读的，把密钥放进去等于把它交给客户端
+- 状态文件原子写（临时文件 + `rename`，权限 0600）；文件存在但读不出来时
+  `totp_load_failed` 为真，**调用方要拒绝启动**——从空状态起步等于把所有人的
+  2FA 悄悄关掉
+- **重放按匹配窗口记账**：容差窗口里同一个码只认一次（`.Code_Already_Used`）。
+  记「当前窗口」是错的：±1 的容差意味着同一个码还有两个窗口可用
+- **锁定**：连续 `max_attempts` 次失败锁 `lock_secs`（默认 5 次 / 15 分钟），
+  锁到期时计数清零，不会一个错字又锁一轮；`max_attempts = 0` 表示不锁
+- **恢复码**：默认 10 个、单次有效、哈希用 master key + 用户 id 作为 HMAC 输入，
+  所以 A 的恢复码在 B 的账号上一定无效；`totp_regenerate_backup_codes` 整体换新
+- **已启用的账号不能再 `totp_setup`**（`.Already_Enabled`）：换密钥必须先
+  `totp_disable`。否则一个被偷的会话就能把第二因素换到攻击者手机上
+- 闸门的判断：`login_path` / `challenge_path` 永远放行；GET/HEAD 且 `Accept`
+  里明确有 `text/html` 才回 302（curl 的 `*/*` 拿到的是 401），其余回 401 +
+  `WWW-Authenticate: TOTP`，只过了密码的再带一个 `X-Totp-Challenge: /totp`
+- `Totp` 被所有连接、所有 acceptor 线程共用，内部一把 mutex；TOTP 只在登录时跑，
+  串行化的代价可以忽略
+- 它保护的是**密码泄露**的账号；服务端被拿下时 master key 也在攻击者手里，
+  状态文件和 master key 别放同一个备份里
+
+`examples/totp` 把整套流程（启用、手动输入密钥、两阶段登录、恢复码、关闭）跑成
+一个能用 curl 走完的页面。示例不画二维码，只给出 secret 与 `otpauth://` URI——
+验证器 App 的「手动输入」两者都收。
 
 **静态挂载（挂到一条路由上，而不是接管整个服务）**
 
@@ -922,8 +1021,8 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 ## 测试覆盖
 
 ```bash
-odin test web/               # 147 个
-odin test web/middlewares     # 48 个
+odin test web/               # 156 个
+odin test web/middlewares     # 60 个
 ```
 
 `web` 侧是 parser / chunked / router（含重写）/ response 序列化 /  
@@ -954,7 +1053,11 @@ principal 传递）、表单 urlencoded/multipart/限额/415/400/413、Range 中
 伪造 Cookie 拒绝 / 过期 / 栈缓冲值被复制、JWT 的签发与验签（错误 alg、  
 错密钥、过期、错 iss/aud）、静态挂载的命中 / 回落 / 前缀剥离 / SPA、  
 重定向的状态码与 Location（含双斜杠）、上传的文件名消毒与限额 / 流式 part  
-的改名交接（rename 即所有权转移）。  
+的改名交接（rename 即所有权转移）、TOTP 的 RFC 4226/6238 向量（HOTP 0..9 与  
+8 位 TOTP）/ base32 往返与手输容错 / 密钥密文往返、错 key 与篡改拒绝 /  
+注册-确认-校验 / 同码重放 / 容差窗口 + 已用码窗口 = 匹配窗口 / 锁定与到期清零 /  
+恢复码单次有效与跨账号无效 / 状态文件落盘（明文密钥不出现）与损坏文件  
+`load_failed` / 两阶段登录闸门（401、跳转、`X-Totp-Challenge`、放行）。  
 Odin test runner 内存追踪零泄漏。
 
 ## 与 odin-http 的关系

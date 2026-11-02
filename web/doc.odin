@@ -54,6 +54,10 @@ What you get:
       in constant time and installing `request_principal`;
       sessions - a signed cookie holding the session's own state, so
       nothing is stored server-side;
+      totp - a second factor (RFC 6238): secrets sealed with a master key,
+      single-use recovery codes, replay and lockout protection, and the
+      two-stage login gate that turns a password-only session into a
+      complete one;
       form - urlencoded and multipart parsing, files included, parsed once
       per request with field/size limits, optionally spooled to disk;
       upload - the same multipart body, but spooled as it arrives
