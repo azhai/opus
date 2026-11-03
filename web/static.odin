@@ -5,6 +5,8 @@ import "core:nbio"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "../buffer"
+import "../http"
 
 /*
 Static serves files from a directory tree with a TTL stat cache
@@ -114,7 +116,7 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 	}
 	if entry.is_dir {
 		// try the index file inside the directory
-		idx_path := concat_strings({fs_path, "/", st.cfg.index}, conn_scratch(req.conn))
+		idx_path := buffer.concat_strings({fs_path, "/", st.cfg.index}, conn_scratch(req.conn))
 		idx_entry, idx_found := static_lookup(st, idx_path)
 		if !idx_found || !idx_entry.exists || idx_entry.is_dir {
 			static_not_found(res)
@@ -124,23 +126,23 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 		entry = idx_entry
 	}
 
-	ctype := mime_type(fs_path)
+	ctype := http.mime_type(fs_path)
 	response_set_header(res, "Content-Type", ctype)
-	response_set_header(res, "Last-Modified", http_date(entry.mod_utc, conn_scratch(req.conn)))
+	response_set_header(res, "Last-Modified", http.http_date(entry.mod_utc, conn_scratch(req.conn)))
 	response_set_header(res, "Accept-Ranges", "bytes")
 
 	// conditional GET: a fresh copy in the client's cache answers 304.
 	// The mtime is truncated to the second the `Last-Modified` above carried:
 	// the client can only ever hand back that whole-second date.
 	if ims, ok := request_header(req, "If-Modified-Since"); ok {
-		if t, tok := parse_http_date(ims); tok && time.diff(date_trunc_second(entry.mod_utc), t) >= 0 {
+		if t, tok := http.parse_http_date(ims); tok && time.diff(http.date_trunc_second(entry.mod_utc), t) >= 0 {
 			static_not_modified(res)
 			return
 		}
 	}
 
 	if rng, ok := request_header(req, "Range"); ok {
-		ranges, count, decision := parse_byte_ranges(rng, entry.size)
+		ranges, count, decision := http.parse_byte_ranges(rng, entry.size)
 		switch decision {
 		case .Ignore:
 			// malformed or foreign unit: full response
@@ -152,7 +154,7 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 			// file is unchanged since the client's copy
 			apply := true
 			if ir, has_ir := request_header(req, "If-Range"); has_ir {
-				apply = if_range_allowed(ir, entry.mod_utc)
+				apply = http.if_range_allowed(ir, entry.mod_utc)
 			}
 			if !apply {
 				static_send_full(res, fs_path, entry.size, ctype)
@@ -161,7 +163,7 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 			if decision == .Single {
 				r := ranges[0]
 				res.status = .Partial_Content
-				response_set_header(res, "Content-Range", content_range_value(r.start, r.start + r.length - 1, entry.size, conn_scratch(req.conn)))
+				response_set_header(res, "Content-Range", http.content_range_value(r.start, r.start + r.length - 1, entry.size, conn_scratch(req.conn)))
 				if !response_send_file_range(res, fs_path, r.start, r.length) {
 					static_not_found(res)
 					return
@@ -170,14 +172,14 @@ static_serve_root :: proc(st: ^Static, req: ^Request, res: ^Response) {
 			}
 			// several ranges: multipart/byteranges, read into memory (the
 			// rare path; zero-copy is not worth it here)
-			boundary := multipart_boundary(conn_scratch(req.conn))
-			body, mok := range_multipart_body(fs_path, ranges[:count], boundary, ctype, entry.size, conn_scratch(req.conn))
+			boundary := http.multipart_boundary(conn_scratch(req.conn))
+			body, mok := http.range_multipart_body(fs_path, ranges[:count], boundary, ctype, entry.size, conn_scratch(req.conn))
 			if !mok {
 				static_not_found(res)
 				return
 			}
 			res.status = .Partial_Content
-			response_set_header(res, "Content-Type", concat_strings({"multipart/byteranges; boundary=", boundary}, conn_scratch(req.conn)))
+			response_set_header(res, "Content-Type", buffer.concat_strings({"multipart/byteranges; boundary=", boundary}, conn_scratch(req.conn)))
 			response_write(res, body)
 			return
 		}
@@ -203,7 +205,7 @@ static_not_modified :: proc(res: ^Response) {
 // client can pick a valid range.
 static_range_unsatisfiable :: proc(res: ^Response, size: i64) {
 	res.status = .Range_Not_Satisfiable
-	response_set_header(res, "Content-Range", unsatisfiable_content_range(size, conn_scratch(res.conn)))
+	response_set_header(res, "Content-Range", http.unsatisfiable_content_range(size, conn_scratch(res.conn)))
 	response_write_string(res, "416 range not satisfiable\n")
 }
 
@@ -227,7 +229,7 @@ static_resolve_path :: proc(st: ^Static, url_path: string, allocator: mem.Alloca
 	if len(root) > 0 && root[len(root) - 1] != '/' {
 		sep = "/"
 	}
-	return concat_strings({root, sep, url_path}, allocator), true
+	return buffer.concat_strings({root, sep, url_path}, allocator), true
 }
 
 // static_lookup consults the TTL stat cache, refreshing on miss or expiry.
@@ -262,7 +264,7 @@ static_cache_put :: proc(st: ^Static, fs_path: string, entry: Stat_Cache_Entry) 
 		if limit > 0 && len(st.cache) >= limit {
 			static_cache_evict(st)
 		}
-		st.cache[clone_string(fs_path, st.allocator)] = entry
+		st.cache[buffer.clone_string(fs_path, st.allocator)] = entry
 		return
 	}
 	st.cache[fs_path] = entry
@@ -342,6 +344,6 @@ response_send_file_handle :: proc(w: ^Response, path: string, size: i64) -> bool
 	w.file_open = true
 	w.file_size = size
 	w.file_path = path
-	buf_reset(&w.body)
+	buffer.buf_reset(&w.body)
 	return true
 }

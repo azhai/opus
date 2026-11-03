@@ -16,6 +16,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // reverse proxy
 // ---------------------------------------------------------------------------
@@ -25,22 +27,22 @@ import "core:time"
 test_conn_new :: proc(t: ^testing.T) -> ^Conn {
 	c := new(Conn, context.allocator)
 	mem.dynamic_arena_init(&c.scratch, context.allocator)
-	buf_init(&c.inbuf, context.allocator)
-	buf_init(&c.out, context.allocator)
-	buf_init(&c.body_buf, context.allocator)
-	buf_init(&c.proxy_req, context.allocator)
-	buf_init(&c.proxy_buf, context.allocator)
+	buffer.buf_init(&c.inbuf, context.allocator)
+	buffer.buf_init(&c.out, context.allocator)
+	buffer.buf_init(&c.body_buf, context.allocator)
+	buffer.buf_init(&c.proxy_req, context.allocator)
+	buffer.buf_init(&c.proxy_buf, context.allocator)
 	c.state = .Process
 	response_reset(&c.res, c, conn_scratch(c))
 	return c
 }
 
 test_conn_destroy :: proc(c: ^Conn) {
-	buf_destroy(&c.inbuf)
-	buf_destroy(&c.out)
-	buf_destroy(&c.body_buf)
-	buf_destroy(&c.proxy_req)
-	buf_destroy(&c.proxy_buf)
+	buffer.buf_destroy(&c.inbuf)
+	buffer.buf_destroy(&c.out)
+	buffer.buf_destroy(&c.body_buf)
+	buffer.buf_destroy(&c.proxy_req)
+	buffer.buf_destroy(&c.proxy_buf)
 	mem.dynamic_arena_destroy(&c.scratch)
 	free(c, context.allocator)
 }
@@ -435,7 +437,7 @@ proxy_test_stop :: proc(s: ^Server) {
 proxy_upstream_handler :: proc(req: ^Request, res: ^Response) {
 	response_set_header(res, "Content-Type", "text/plain")
 	response_write_string(res, "upstream ")
-	response_write_string(res, method_string(req.method))
+	response_write_string(res, http.method_string(req.method))
 	response_write_string(res, " ")
 	response_write_string(res, req.target)
 	if v, ok := request_header(req, "X-Test"); ok {
@@ -906,7 +908,7 @@ test_integration_proxy_streams_early :: proc(t: ^testing.T) {
 	defer delete(first)
 	buf: [4096]byte
 	for {
-		if bytes_contains(first[:], "first-half") {
+		if buffer.bytes_contains(first[:], "first-half") {
 			break
 		}
 		r, rerr := net.recv_tcp(client, buf[:])
@@ -916,7 +918,7 @@ test_integration_proxy_streams_early :: proc(t: ^testing.T) {
 		append(&first, ..buf[:r])
 	}
 	elapsed := time.since(start)
-	testing.expectf(t, bytes_contains(first[:], "first-half"), "first half never arrived: %q", string(first[:]))
+	testing.expectf(t, buffer.bytes_contains(first[:], "first-half"), "first half never arrived: %q", string(first[:]))
 	testing.expectf(t, elapsed < 250 * time.Millisecond, "first body bytes took %v: the proxy is buffering", elapsed)
 
 	// and the rest still arrives, re-framed as chunked. Read until the
@@ -924,7 +926,7 @@ test_integration_proxy_streams_early :: proc(t: ^testing.T) {
 	// the terminator are separate writes, so stopping at "second-half"
 	// would race against the final flush.
 	for {
-		if bytes_contains(first[:], "0\r\n\r\n") {
+		if buffer.bytes_contains(first[:], "0\r\n\r\n") {
 			break
 		}
 		r, rerr := net.recv_tcp(client, buf[:])

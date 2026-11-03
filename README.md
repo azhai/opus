@@ -8,7 +8,7 @@ lighttpd2 的双层状态机与 filter 管线，皮肤学 Mongoose 的 `Server +
 package main
 
 import "core:fmt"
-import "web"
+import "opus:web"   // 或相对路径，见下方「引入本库」
 
 hello :: proc(req: ^web.Request, res: ^web.Response) {
 	web.response_set_header(res, "Content-Type", "text/plain")
@@ -27,6 +27,21 @@ main :: proc() {
 }
 ```
 
+**引入本库**：Odin 的相对 import 只做路径拼接、不解析包名，所以裸写 `import "web"`
+是找不到它的。两条路选一条：
+
+```bash
+# 1) 注册 collection（推荐：路径写一次，代码里统一 import "opus:web"）
+odin run . -collection:opus=/path/to/opus
+```
+
+```odin
+// 2) 相对路径：仓库内的 examples/* 就是这么写的，路径按 opus 相对你项目的位置调整
+import "../../web"
+```
+
+中间件同理：`opus:middlewares/auth`、`opus:middlewares/session`……（或相对路径）。
+
 设计取舍、架构分层图、Odin 踩坑记录与路线图见 [docs/research.md](docs/research.md)。
 
 ## 能力清单
@@ -39,7 +54,8 @@ main :: proc() {
 - 非阻塞写 + `sendfile` 零拷贝文件流（两阶段：头 → 文件体）
 - 每连接 arena：请求间一次性释放，峰值内存与连接数无关
 - Filter 输出管线：chunked 编码与 gzip/deflate 内容编码内置且默认注册  
-  （按 `Accept-Encoding` 协商，只压可压缩类型、跳过 `sendfile` 文件路径）
+  （协商按 `Accept-Encoding` 的 q 值 / `*` / `q=0` 显式拒收，只压可压缩类型、  
+  跳过 `sendfile` 文件路径）
 - Router：`:param` / `*` 模式、Lua 模式子集（`(%w+)` / `(%d+)` / `[a-z]` / `.-`，  
   回溯 VM + 捕获栈）、405 + `Allow`、HEAD 自动回落到同名 GET 路由、Odin 原生  
   中间件链（无闭包，支持全局链 + 路由级链）；未命中路径也走中间件链，末端才回  
@@ -48,9 +64,9 @@ main :: proc() {
   `request_scheme` / `request_client_ip` / `request_content_type` /  
   `request_is_ajax` / `request_accepts` / `request_json`、`response_json_status` /  
   `response_error` / `response_download` / `response_clear_cookie` 等
-- 内置中间件（`web/middlewares` 子包）：request id、访问日志、CORS（含预检）、  
+- 内置中间件（根目录 `middlewares/*` 按用途分包）：request id、访问日志、CORS（含预检）、  
   Basic/Bearer/API-Key 认证、正文限额、安全响应头、禁缓存、表单解析、  
-  Range+ETag、流式反缓冲、**gzip 开关**、**签名 Cookie 会话**、**JWT(HS256) 校验**、  
+  Range+ETag、流式反缓冲、**内容编码开关**、**签名 Cookie 会话**、**JWT(HS256) 校验**、  
   **TOTP 两步验证**、**静态目录挂载**、**重定向规则**、**multipart 落盘上传**；  
   可全局注册，也可用 `router_use_route` **只挂到某一条路由**（认证只护 `/admin`）
 - 表单正文：`middleware_form` 一次解析 `application/x-www-form-urlencoded` 与  
@@ -109,22 +125,26 @@ main :: proc() {
 ## 构建与测试
 
 ```bash
-# 编译验证库本身（库包没有 main，用 build 而非 check）
-odin build web -build-mode:static
-odin build web/middlewares -build-mode:static
+# 编译验证每个库包（库包没有 main，用 build 而非 check）
+for p in buffer http codecs multipart pattern web; do odin build $p -build-mode:static; done
+for p in common token auth session totp form upload static redirect coding range; do
+  odin build middlewares/$p -build-mode:static
+done
 
 # 运行全部测试（单测 + 起真实服务的集成测试，含泄漏检测）
 # THREADS=1 不是可选项：集成测试各自在自己线程上跑一个 nbio 事件循环，而 nbio 的
 # 操作归创建它的线程所有，多线程并行会 panic「nbio.remove called on different
 # thread」，连带把 hub / async 的用例一起带崩
-odin test web/ -define:ODIN_TEST_THREADS=1
-odin test web/middlewares -define:ODIN_TEST_THREADS=1
+for p in buffer http codecs multipart pattern web; do odin test $p -define:ODIN_TEST_THREADS=1; done
+for p in common token auth session totp form upload static redirect coding range; do
+  odin test middlewares/$p -define:ODIN_TEST_THREADS=1
+done
 
 # 只跑某个测试
-odin test web/ -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=web.test_integration_head_request
+odin test web -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=web.test_integration_head_request
 
 # 打开调试日志重新测试
-odin test web/ -define:ODIN_TEST_THREADS=1 -define:WEB_DEBUG=true
+odin test web -define:ODIN_TEST_THREADS=1 -define:WEB_DEBUG=true
 ```
 
 ## 运行示例
@@ -175,7 +195,7 @@ curl --compressed --noproxy '*' localhost:8091/big             # 单路由 gzip
 curl -N --noproxy '*' localhost:8091/events                    # SSE
 curl --noproxy '*' -F doc=@big.bin localhost:8091/upload        # 边收边落盘
 
-# 一个小型应用：会话 / JWT / 静态挂载 / 重写 / 重定向 / 上传 / gzip
+# 一个小型应用：会话 / JWT / 静态挂载 / 重写 / 重定向 / 上传 / 内容编码
 odin run examples/webapp -- 127.0.0.1:8092
 curl --noproxy '*' -c /tmp/c -d user=ada localhost:8092/login   # 会话 Cookie
 curl --noproxy '*' -b /tmp/c -c /tmp/c localhost:8092/me        # 计数递增
@@ -326,46 +346,97 @@ L1 压力上升，`parse_request` 从 253 ns 退到 272 ns，已回退。不是�
 
 ## 目录结构
 
+Odin 以目录为包：一个目录一个 package，包名与目录名一致，且**包名在整个构建里
+必须唯一**（不同目录同名也报 `Duplicate declaration`）。依赖是单向的：
+
+| 包 | 依赖 |
+| --- | --- |
+| `buffer` | 无（字节、格式化、日志、HTML 转义） |
+| `http` | `buffer`（协议规则：方法/状态/日期/URI/Range/Cookie/编码协商/分帧/SSE/表单） |
+| `multipart` | `buffer`、`http`（增量解析，只认字节） |
+| `codecs` | 只有 core（deflate / gzip / CRC-32） |
+| `pattern` | 只有 core（Lua 模式子集匹配） |
+| `web` | 上面全部 + `core:nbio`（运行时：状态机、连接、代理、TLS、路由…） |
+| `middlewares/*` | `web`、`http`、`buffer`，以及树内相邻包（`auth` ← `token` 等） |
+
+叶子包互不依赖，`web` 只向下。因为 Odin 不允许循环 import，`Conn` 上与具体功能
+绑定的状态（代理、TLS、异步续延、上传 sink）必须和状态机同包，所以它们留在
+`web`；凡是**只凭字节就能回答**的都下沉。判断标准只有一条：这段代码要不要改
+`Conn`（或指向它的 `Request`/`Response`）。
+
 ```
-web/
+buffer/          字节与字符串原语，零依赖
+  buffer.odin    Buf、字节搜索（字比较 / Horspool）、克隆与拼串
+  format.odin    i64_to_buf / write_padded_*（定宽数字，一次成形零分配）
+  html.odin      html_escape
+  log.odin       分级日志（WEB_DEBUG 门控）
+  *_test.odin    bytes_index 与朴素实现的对拍、html_escape
+http/            协议层：纯函数，不碰 socket 与事件循环
+  http.odin      Method / Status / Header / 版本 / MIME / IMF-fixdate
+  strings.odin   OWS、header 参数、文件名清洗、大小写无关比较
+  uri.odin       url_decode / url_encode / url_path_clean（路径规范化）
+  cookie.odin    Cookie 与 Set-Cookie 序列化
+  range.odin     Range 解析、multipart/byteranges、HTTP-date 解析、If-Range
+  coding.odin    Coding 枚举、Accept-Encoding 协商（q 值 / `*` / `q=0`）、可压缩类型
+  chunked.odin   chunked 解码（含流式 emit）+ 单帧编码 + 终止符
+  sse.odin       text/event-stream 线格式：event / comment / retry 的字节
+  urlencoded.odin Param、form_parse、query_param(_all)、param_get
+  *_test.odin    url / method / date / range / cookie / 编码协商 / 分帧 / SSE / 表单
+codecs/          编码器（RFC 1951 / 1952）：纯算法，零 Conn、零策略
+  bits.odin      LSB-first 位输出（Huffman 码 MSB-first，调用方自己反序）
+  deflate.odin   LZ77 匹配器（32 KiB 窗口、哈希链）+ 固定 Huffman 块
+  gzip.odin      gzip member 封装（10 字节头 + CRC + 长度）
+  crc32.odin     CRC-32（gzip 尾部校验和，不属于 deflate）
+  doc.odin       包文档：这一层只回答「这些字节、这种编码」
+  *_test.odin    CRC32 向量、deflate/gzip 往返、距离码全覆盖、共享匹配表
+multipart/       增量 multipart 解析
+  multipart_stream.odin  边收边解析、分隔符跨界保留、part 回调
+  *_test.odin    1..N 字节窗口重放、限额与 sink 拒绝、内存上界
+pattern/         Lua 模式子集：回溯 VM + 捕获栈，纯字符串
+  pattern.odin   has_syntax / match（'(', '%', '[' 触发模式模式）
+  *_test.odin    4 个用例：表驱动 24 组语义断言、模式识别、捕获清空、步数预算
+web/             运行时：连接状态机与所有持有 Conn 的功能
   doc.odin       包文档（设计 DNA + 快速上手）
   server.odin    Server：listen/accept/sweep/run，配置与统计
   conn.odin      Conn：双层状态机、每连接 arena、读写驱动
-  request.odin   parse_request：请求行 + 零拷贝 header
-  response.odin  response_*：构建、sendfile 切换、自动头
-  router.odin    Router：段式 + Lua 模式匹配、全局链 + 路由级链、内部重写
-  form.odin      表单解析（urlencoded + multipart）+ 访问器（中间件只做编排）
-  range.odin     Range：字节范围解析、multipart/byteranges、HTTP-date 解析
+  request.odin   Request + parse_request：请求行、零拷贝 header、上下文访问器
+  response.odin  response_*：构建、文件体切换、自动头
+  router.odin    Router：段式匹配（模式部分调用 pattern 包）、链、内部重写
+  form.odin      表单解析（urlencoded + 内存 multipart）+ 访问器
   static.odin    Static：stat 缓存、目录 index、MIME
-  cookie.odin    Cookie：Set-Cookie 序列化、请求解析
+  cookie.odin    request_cookie / response_set_cookie（规则在 http 包）
   json.odin      response_json（core:encoding/json）
+  coding_filter.odin  Coding_Filter：把协商结果落到响应上（唯一碰 Conn 的一处）
+  filter.odin    Filter 链 + Chunked_Filter（解码与单帧在 http 包）
+  stream.odin    Hijack 后的流式辅助：写头、写帧、对端探测
+  sse.odin       SSE：sse_start/event/comment/retry/close（格式在 http 包）
+  hub.odin       SSE 广播：一个订阅者 = 一个结构体 + 有界队列（非一线程）
+  async.odin     延迟响应：response_defer / request_resume / 超时续延
   proxy.odin     Proxy：上游转发、流式中继、keep-alive 连接池
   proxy_health.odin  上游权重（平滑加权轮询）、摘除/半开探测、fail-open
   tls.odin       TLS：core:dynlib 加载 OpenSSL + memory BIO 双向泵 + 会话复用
-  async.odin     延迟响应：response_defer / request_resume / 超时续延
-  hub.odin       SSE 广播：一个订阅者 = 一个结构体 + 有界队列（非一线程）
-  multipart_stream.odin  增量 multipart 解析（边收边解析，保留分隔符尾部）
   upload.odin    body sink：multipart part 边收边落盘（临时文件 + 清理）
   threads.odin   多 acceptor：server_run_multi、关停钩子
   socket_posix.odin   SO_REUSEPORT / listen 的系统调用补充（非 Windows）
   socket_windows.odin 同名 stub（Windows 无连接分发语义）
-  filter.odin    Filter 链 + chunked 编解码（含流式 emit 模式）
-  stream.odin    Hijack 后的流式辅助：写头、写帧、对端探测
-  sse.odin       SSE：sse_start/event/comment/retry/close（chunked 帧）
-  compress.odin  gzip/deflate 编码器 + 内容协商 filter
-  http.odin      Method / Status / Header / mime / http_date
-  uri.odin       url_decode/url_encode + url_path_clean（路径规范化）
-  html.odin      html_escape
-  buffer.odin    Buf 与字节工具
-  log.odin       分级日志（WEB_DEBUG 门控）
   testdata/      TLS 自签证书（cert.pem / key.pem）
-  middlewares/   中间件子包（import ".."）：见下
-  *_test.odin    按主题拆分的测试：parser / router / response / proxy / cookie /
-                 json / pattern / range / framing / compress / tls / http /
-                 sse / multipart_stream / upload / hub / buffer / static /
-                 conn / integration / support
+  *_test.odin    运行时测试：parser / router / response / proxy / framing /
+                 static / sse / hub / async / tls / upload / integration 等
+testenv/         测试夹具（Mw_Env 等；只有 *_test.odin 会 import）
+middlewares/     中间件，按用途分包（每个目录一个 package，都 import web）
+  common/        request id、访问日志、CORS、安全头、限额、禁缓存、反缓冲
+  token/         base64url + HMAC-SHA256 原语（auth 与 session 共用）
+  auth/          Basic / Bearer / API-Key / JWT + principal
+  session/       签名 Cookie 会话：session_get / set / delete / destroy
+  totp/          TOTP（RFC 6238）+ 两阶段登录闸门
+  form/          middleware_form（解析器在 web 包）
+  upload/        multipart 落盘：request_uploads / request_upload
+  static/        目录树挂载（可 SPA 回落），复用 web 的 stat 缓存
+  redirect/      middleware_redirect / middleware_https_redirect
+  coding/        middleware_coding / middleware_no_coding（路由级编码开关）
+  range/         Range + ETag（handler 只写完整正文）
 bench/
-  main.odin      微基准（parse/router/response/compress/multipart）+ fixtures
+  main.odin      微基准（parse/router/response/codecs/multipart/pattern）+ fixtures
   load.odin      起真实服务 + pipelined / 串行客户端，报 req/s 与每请求耗时
   multi.odin     多 acceptor：serve / client 两进程模式 + 同进程多连接压测
 examples/
@@ -375,7 +446,7 @@ examples/
   proxy/         反向代理（/api 前缀剥离转发 + 本地 /health + 连接池清理）
   https/         TLS（自签证书 + keep-alive）
   threads/       多 acceptor 线程（每线程请求数统计）
-  middlewares/   按路由挂载的专用中间件：认证 / 表单 / Range+ETag / gzip / SSE /
+  middlewares/   按路由挂载的专用中间件：认证 / 表单 / Range+ETag / 编码 / SSE /
                  流式上传
   totp/          两步验证：密码 + TOTP / 恢复码，含启用与关闭
   webapp/        一个小型应用：会话 / JWT / 静态挂载 / 重写 / 重定向 / 上传
@@ -383,26 +454,6 @@ examples/
 docs/
   research.md    调研与设计文档
 ```
-
-```
-web/middlewares/              中间件子包（package middlewares，import ".."）
-  middleware.odin  通用：request id、访问日志、CORS、限额、安全头、禁缓存、反缓冲
-  auth.odin        Basic / Bearer / API-Key + principal
-  range.odin       Range + ETag（handler 只写完整正文）
-  form.odin        middleware_form（解析留在父包的 form.odin，避免循环 import）
-  gzip.odin        middleware_gzip / middleware_no_gzip（按响应开关压缩）
-  session.odin     签名 Cookie 会话：session_get / set / delete / destroy
-  jwt.odin         HS256：middleware_jwt / jwt_sign / jwt_verify
-  totp.odin        TOTP（RFC 6238）：HOTP/base32、密钥加密落盘、恢复码、重放与锁定
-  totp_auth.odin   两阶段登录：middleware_totp + 密码后 / 验证码后的会话状态
-  static.odin      目录树挂载（可 SPA 回落），复用父包的 stat 缓存 + sendfile
-  redirect.odin    middleware_redirect / middleware_https_redirect
-  upload.odin      multipart 落盘：request_uploads / request_upload；stream 模式下
-                   由 upload_stream_hook 在请求体读之前接管（见 README 流式上传）
-  token.odin       共享原语：base64url + HMAC-SHA256 签名/验签
-  *_test.odin     中间件单测（60 个）
-```
-
 
 ## API 速览
 
@@ -489,53 +540,56 @@ my_middleware :: proc(m: ^web.Middleware, r: ^web.Router, idx: int,
 注册的 `OPTIONS`）、404 的访问日志、统一的安全头都能生效。`router_all` 注册  
 的路由对所有方法生效。
 
-**内置中间件**都在 `web/middlewares` 子包里（`router_use` 全局注册，或  
-`router_use_route` 挂到单条路由；需要配置的从 `ud` 传 `^Xxx_Config`，`nil`  
-即默认值）：
+**内置中间件**在根目录 `middlewares/` 下按用途分包，一个包一种关注点，用到哪个
+import 哪个（`router_use` 全局注册，或 `router_use_route` 挂到单条路由；需要配置
+的从 `ud` 传 `^Xxx_Config`，`nil` 即默认值）：
 
 ```odin
-import "web"
-import "web/middlewares"     // 父包不能反向 import 子包，所以两边都要写
+import "opus:web"
+import "opus:middlewares/common"       // request id / 日志 / CORS / 安全头 / 限额
+import "opus:middlewares/auth"         // Basic / Bearer / API-Key / JWT
+import "opus:middlewares/session"      // 签名 Cookie 会话
+import "opus:middlewares/coding"       // 按路由开关内容编码
 
-web.router_use(&router, middlewares.middleware_request_id)
+web.router_use(&router, common.middleware_request_id)
 ```
 
 | 过程                                       | 作用                                                                                                           | 配置                      |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------- |
-| `middleware_request_id`                  | 复用/生成 `X-Request-Id`，写回响应头并挂到 `request_id(req)`                                                              | —                       |
-| `middleware_logger`                      | 每请求一行：状态、方法、路径、字节数、耗时、id、客户端 IP、认证主体                                                                         | —                       |
-| `middleware_secure_headers`              | `nosniff` / `X-Frame-Options` / `Referrer-Policy`，可加 CSP、HSTS                                                | `Secure_Headers_Config` |
-| `middleware_no_cache`                    | `Cache-Control: no-store` 等，给登录页/API 用                                                                       | —                       |
-| `middleware_cors`                        | 预检直接回 204 不跑路由；按 Origin 白名单决定回 `*` 还是回显 + `Vary: Origin`                                                     | `CORS_Config`           |
-| `middleware_basic_auth`                  | `Authorization: Basic`，等时比较，401 带 `WWW-Authenticate`                                                         | `Basic_Auth_Config`     |
-| `middleware_bearer_auth`                 | `Authorization: Bearer <token>`，令牌表白名单，401 带 `error="invalid_token"`                                         | `Bearer_Auth_Config`    |
-| `middleware_api_key`                     | 自定义头（默认 `X-API-Key`）+ 可选 query 兜底                                                                            | `API_Key_Config`        |
-| `middleware_jwt`                         | `Authorization: Bearer <jwt>`，HS256 校验 `alg`→签名→`exp`/`nbf`/`iss`/`aud`；401 带 `error="invalid_token"`        | `Jwt_Config`            |
-| `middleware_session`                     | 签名 Cookie 会话：验签后挂到请求，handler 返回后只在有改动时回写 Cookie                                                              | `Session_Config`        |
-| `middleware_totp`                        | 两阶段登录的闸门：两个因素都过的会话放行；只过了密码的跳 `/totp`（非导航请求回 401 + `X-Totp-Challenge`）                                             | `Totp_Gate_Config`      |
-| `middleware_body_limit`                  | 按 `Content-Length` 提前回 413（chunked 仍由 `Server.max_body_size` 兜底）                                             | `Body_Limit_Config`     |
-| `middleware_form`                        | 解析 urlencoded / multipart 正文一次并缓存；非表单正文 415、畸形 400、超限 413                                                    | `Form_Config`           |
-| `middleware_upload`                      | multipart 文件落盘（目录按需创建、文件名消毒+时间戳）；超限 413，非 multipart 放行                                                       | `Upload_Config`         |
-| `middleware_range`                       | handler 只管写完整正文：单 range → 206 + `Content-Range`，不可满足 → 416，`etag = true` 再加内容哈希 ETag + `If-None-Match` → 304 | `Range_Config`          |
-| `middleware_static`                      | 把目录树挂到某条路由（可剥前缀、可 SPA 回落），命中就 serve，未命中继续走链                                                                  | `Static_Mount_Config`   |
-| `middleware_redirect`                    | 规则表命中就发 3xx（默认 308，方法保持），未命中继续走链                                                                             | `Redirect_Config`       |
-| `middleware_https_redirect`              | 同一 URL 改 https 发回（Host 取自请求）                                                                                 | `Https_Redirect_Config` |
-| `middleware_gzip` / `middleware_no_gzip` | 按路由开/关内容编码（`no_gzip` 用于图片、已压资源、流式响应、Range 响应）                                                                | `Gzip_Config`           |
-| `middleware_no_buffer`                   | `X-Accel-Buffering: no` + `no-transform`，阻止代理缓冲流式响应                                                          | —                       |
+| `common.middleware_request_id`                  | 复用/生成 `X-Request-Id`，写回响应头并挂到 `request_id(req)`                                                              | —                       |
+| `common.middleware_logger`                      | 每请求一行：状态、方法、路径、字节数、耗时、id、客户端 IP、认证主体                                                                         | —                       |
+| `common.middleware_secure_headers`              | `nosniff` / `X-Frame-Options` / `Referrer-Policy`，可加 CSP、HSTS                                                | `Secure_Headers_Config` |
+| `common.middleware_no_cache`                    | `Cache-Control: no-store` 等，给登录页/API 用                                                                       | —                       |
+| `common.middleware_cors`                        | 预检直接回 204 不跑路由；按 Origin 白名单决定回 `*` 还是回显 + `Vary: Origin`                                                     | `CORS_Config`           |
+| `auth.middleware_basic_auth`                  | `Authorization: Basic`，等时比较，401 带 `WWW-Authenticate`                                                         | `Basic_Auth_Config`     |
+| `auth.middleware_bearer_auth`                 | `Authorization: Bearer <token>`，令牌表白名单，401 带 `error="invalid_token"`                                         | `Bearer_Auth_Config`    |
+| `auth.middleware_api_key`                     | 自定义头（默认 `X-API-Key`）+ 可选 query 兜底                                                                            | `API_Key_Config`        |
+| `auth.middleware_jwt`                         | `Authorization: Bearer <jwt>`，HS256 校验 `alg`→签名→`exp`/`nbf`/`iss`/`aud`；401 带 `error="invalid_token"`        | `Jwt_Config`            |
+| `session.middleware_session`                     | 签名 Cookie 会话：验签后挂到请求，handler 返回后只在有改动时回写 Cookie                                                              | `Session_Config`        |
+| `totp.middleware_totp`                        | 两阶段登录的闸门：两个因素都过的会话放行；只过了密码的跳 `/totp`（非导航请求回 401 + `X-Totp-Challenge`）                                             | `Totp_Gate_Config`      |
+| `common.middleware_body_limit`                  | 按 `Content-Length` 提前回 413（chunked 仍由 `Server.max_body_size` 兜底）                                             | `Body_Limit_Config`     |
+| `form.middleware_form`                        | 解析 urlencoded / multipart 正文一次并缓存；非表单正文 415、畸形 400、超限 413                                                    | `Form_Config`           |
+| `upload.middleware_upload`                      | multipart 文件落盘（目录按需创建、文件名消毒+时间戳）；超限 413，非 multipart 放行                                                       | `Upload_Config`         |
+| `range.middleware_range`                       | handler 只管写完整正文：单 range → 206 + `Content-Range`，不可满足 → 416，`etag = true` 再加内容哈希 ETag + `If-None-Match` → 304 | `Range_Config`          |
+| `static.middleware_static`                      | 把目录树挂到某条路由（可剥前缀、可 SPA 回落），命中就 serve，未命中继续走链                                                                  | `Static_Mount_Config`   |
+| `redirect.middleware_redirect`                    | 规则表命中就发 3xx（默认 308，方法保持），未命中继续走链                                                                             | `Redirect_Config`       |
+| `redirect.middleware_https_redirect`              | 同一 URL 改 https 发回（Host 取自请求）                                                                                 | `Https_Redirect_Config` |
+| `coding.middleware_coding` / `middleware_no_coding` | 按路由开/关内容编码（`no_coding` 用于图片、已压资源、流式响应、Range 响应）                                                     | `Coding_Config`         |
+| `common.middleware_no_buffer`                   | `X-Accel-Buffering: no` + `no-transform`，阻止代理缓冲流式响应                                                          | —                       |
 
 三种认证都会把认证主体写到 `req.principal`（`request_principal(req)` 读取），  
 `middleware_logger` 的日志行里带 `user=`，401 与 200 都能追到同一个令牌。
 
 ```odin
-cors_cfg := middlewares.CORS_Config {
+cors_cfg := common.CORS_Config {
 	origins           = []string{"https://admin.example"},
 	allow_credentials = true,
 	expose_headers    = "X-Total-Count",
 }
-web.router_use(&router, middlewares.middleware_request_id)     // 先：id 进日志
-web.router_use(&router, middlewares.middleware_logger)
-web.router_use(&router, middlewares.middleware_secure_headers)
-web.router_use(&router, middlewares.middleware_cors, &cors_cfg) // 配置要活得比 server 长
+web.router_use(&router, common.middleware_request_id)     // 先：id 进日志
+web.router_use(&router, common.middleware_logger)
+web.router_use(&router, common.middleware_secure_headers)
+web.router_use(&router, common.middleware_cors, &cors_cfg) // 配置要活得比 server 长
 ```
 
 顺序即执行顺序（`router_use` 追加）；跨切面的放前面，鉴权/路由相关的放后面，  
@@ -549,9 +603,9 @@ web.router_use(&router, middlewares.middleware_cors, &cors_cfg) // 配置要活�
 report := web.router_get(&router, "/report.csv", report_handler)
 admin  := web.router_get(&router, "/admin", admin_handler)
 submit := web.router_add(&router, web.Method.Post, "/submit", submit_handler)
-web.router_use_route(report, middlewares.middleware_range, &range_cfg)     // Range + ETag
-web.router_use_route(admin,  middlewares.middleware_basic_auth, &admin_cfg)
-web.router_use_route(submit, middlewares.middleware_form, &form_cfg)
+web.router_use_route(report, range.middleware_range, &range_cfg)     // Range + ETag
+web.router_use_route(admin,  auth.middleware_basic_auth, &admin_cfg)
+web.router_use_route(submit, form.middleware_form, &form_cfg)
 ```
 
 路由级链在全局链之后、handler 之前执行；中间件实现不用改（`router_next` 对  
@@ -579,14 +633,14 @@ if f, ok := web.request_file(req, "avatar"); ok {
 **上传落盘**（文件不进内存：解析后直接写磁盘，handler 拿到路径）
 
 ```odin
-up_cfg := middlewares.Upload_Config { dir = "./uploads", max_file_bytes = 4 << 20, max_files = 4 }
-web.router_use_route(upload_route, middlewares.middleware_upload, &up_cfg)
+up_cfg := upload.Upload_Config { dir = "./uploads", max_file_bytes = 4 << 20, max_files = 4 }
+web.router_use_route(upload_route, upload.middleware_upload, &up_cfg)
 
 upload_handler :: proc(req: ^web.Request, res: ^web.Response) {
-	for u in middlewares.request_uploads(req) {
+	for u in upload.request_uploads(req) {
 		// u.field / u.original / u.path / u.size / u.content_type
 	}
-	if u, ok := middlewares.request_upload(req, "doc"); ok { ... }
+	if u, ok := upload.request_upload(req, "doc"); ok { ... }
 }
 ```
 
@@ -597,7 +651,7 @@ upload_handler :: proc(req: ^web.Request, res: ^web.Response) {
 
 ```odin
 range_cfg := web.Range_Config{etag = true}
-web.router_use_route(report, middlewares.middleware_range, &range_cfg)
+web.router_use_route(report, range.middleware_range, &range_cfg)
 
 report_handler :: proc(req: ^web.Request, res: ^web.Response) {
 	web.response_write_string(res, csv)   // 照常写完整正文
@@ -631,16 +685,16 @@ events :: proc(req: ^web.Request, res: ^web.Response) {
 **会话（签名 Cookie）**
 
 ```odin
-session_cfg := middlewares.Session_Config { name = "sid", secret = SECRET, max_age_secs = 3600 }
-web.router_use_route(login_route, middlewares.middleware_session, &session_cfg)
+session_cfg := session.Session_Config { name = "sid", secret = SECRET, max_age_secs = 3600 }
+web.router_use_route(login_route, session.middleware_session, &session_cfg)
 
 login :: proc(req: ^web.Request, res: ^web.Response) {
-	middlewares.session_set(req, "user", "ada")        // 值会被复制进请求 arena
+	session.session_set(req, "user", "ada")        // 值会被复制进请求 arena
 }
 me :: proc(req: ^web.Request, res: ^web.Response) {
-	user, ok := middlewares.session_get(req, "user")   // 读不到 = 新访客
-	_ = middlewares.session_id(req)                    // 日志/关联用
-	// middlewares.session_destroy(req, res, &session_cfg)  // 登出：清值 + 过期 Cookie
+	user, ok := session.session_get(req, "user")   // 读不到 = 新访客
+	_ = session.session_id(req)                    // 日志/关联用
+	// session.session_destroy(req, res, &session_cfg)  // 登出：清值 + 过期 Cookie
 }
 ```
 
@@ -657,12 +711,12 @@ acceptor 线程无需共享状态、重启不会把人踢下线、也没有东�
 **JWT（HS256）**
 
 ```odin
-jwt_cfg := middlewares.Jwt_Config { secret = SECRET, issuer = "api", audience = "web" }
-web.router_use_route(profile_route, middlewares.middleware_jwt, &jwt_cfg)
+jwt_cfg := auth.Jwt_Config { secret = SECRET, issuer = "api", audience = "web" }
+web.router_use_route(profile_route, auth.middleware_jwt, &jwt_cfg)
 
 // 签发（登录端点）：exp 由调用方负责，不带 exp 的令牌永久有效
-claims := middlewares.Jwt_Claims{sub = "service-a", exp = time.time_to_unix(time.now()) + 3600}
-tok, ok := middlewares.jwt_sign(claims, SECRET)
+claims := auth.Jwt_Claims{sub = "service-a", exp = time.time_to_unix(time.now()) + 3600}
+tok, ok := auth.jwt_sign(claims, SECRET)
 
 // 校验：middleware_jwt 已做过，handler 直接用 req.principal（= sub）
 ```
@@ -676,38 +730,38 @@ tok, ok := middlewares.jwt_sign(claims, SECRET)
 **TOTP 两步验证（密码 + 验证器 App）**
 
 ```odin
-totp: middlewares.Totp
-cfg := middlewares.Totp_Config {
+totp: totp.Totp
+cfg := totp.Totp_Config {
 	issuer     = "example.com",
 	secret_hex = SECRET_HEX,                  // openssl rand -hex 32（64 个 hex 字符）
 	path       = "/var/lib/app/totp.json",    // 空 = 只放内存（演示/测试）
 }
-if middlewares.totp_init(&totp, cfg) != .None { return }  // 密钥不合法就别启动
-defer middlewares.totp_destroy(&totp)
-if middlewares.totp_load_failed(&totp) { return }         // 状态文件坏了，别静默关掉 2FA
+if totp.totp_init(&totp, cfg) != .None { return }  // 密钥不合法就别启动
+defer totp.totp_destroy(&totp)
+if totp.totp_load_failed(&totp) { return }         // 状态文件坏了，别静默关掉 2FA
 
-gate := middlewares.Totp_Gate_Config {
+gate := totp.Totp_Gate_Config {
 	totp           = &totp,
 	login_path     = "/login",   // 空 = 未登录直接 401
 	challenge_path = "/totp",    // 默认就是这个
 }
 
-web.router_use(&router, middlewares.middleware_session, &session_cfg)
-web.router_use_route(admin_route, middlewares.middleware_totp, &gate)
+web.router_use(&router, session.middleware_session, &session_cfg)
+web.router_use_route(admin_route, totp.middleware_totp, &gate)
 ```
 
 登录端点分成两段，`totp_after_password` 是那个分叉点：
 
 ```odin
 // 第一阶段（密码对了之后）
-if middlewares.totp_after_password(req, &totp, user, &gate) {
+if totp.totp_after_password(req, &totp, user, &gate) {
 	web.response_redirect(res, "/totp")   // 这个账号开了 2FA，只过了第一个因素
 	return
 }
 web.response_redirect(res, "/admin")     // 没开 2FA，会话已经是完整的
 
 // 第二阶段（POST /totp）：6 位数字或一个恢复码，按形状自动分辨
-#partial switch middlewares.totp_complete_challenge(req, &totp, code, &gate) {
+#partial switch totp.totp_complete_challenge(req, &totp, code, &gate) {
 case .None:           web.response_redirect(res, "/admin")
 case .Account_Locked: web.response_error(res, .Forbidden, "locked")
 case:                 web.response_error(res, .Unauthorized, "bad code")
@@ -717,12 +771,12 @@ case:                 web.response_error(res, .Unauthorized, "bad code")
 设置页（**只在会话完整时开放**，否则就等于给半个登录者发密钥）：
 
 ```odin
-enrollment, err := middlewares.totp_setup(&totp, user, web.request_allocator(req))
+enrollment, err := totp.totp_setup(&totp, user, web.request_allocator(req))
 // enrollment.secret / .otpauth_uri / .backup_codes —— 只显示这一次，请用户存好
-middlewares.totp_confirm(&totp, user, code)              // 用户确认 App 里已有该密钥
-codes, _ := middlewares.totp_regenerate_backup_codes(&totp, user, alloc)
-middlewares.totp_disable(&totp, user)                    // 关闭（先验证当前码）
-status := middlewares.totp_status(&totp, user)           // enabled/has_binding/locked/backup_codes
+totp.totp_confirm(&totp, user, code)              // 用户确认 App 里已有该密钥
+codes, _ := totp.totp_regenerate_backup_codes(&totp, user, alloc)
+totp.totp_disable(&totp, user)                    // 关闭（先验证当前码）
+status := totp.totp_status(&totp, user)           // enabled/has_binding/locked/backup_codes
 ```
 
 行为要点：
@@ -758,9 +812,9 @@ status := middlewares.totp_status(&totp, user)           // enabled/has_binding/
 ```odin
 files: web.Static
 web.static_init(&files, "./examples/webapp/www")
-mount := middlewares.Static_Mount_Config{st = &files, prefix = "/assets"}
+mount := static.Static_Mount_Config{st = &files, prefix = "/assets"}
 assets := web.router_all(&router, "/assets/*", web.router_fallthrough_not_found)
-web.router_use_route(assets, middlewares.middleware_static, &mount)
+web.router_use_route(assets, static.middleware_static, &mount)
 // spa = true 时未命中的路径渲染 index.html（单页应用的客户端路由）
 ```
 
@@ -774,13 +828,13 @@ Range、`Last-Modified`/304 全都一样；中间件只决定「要不要发」�
 
 ```odin
 // 真发 3xx：客户端要再请求一次，地址栏会变，搜索引擎/书签会跟着走
-redir_cfg := middlewares.Redirect_Config {
-	rules = []middlewares.Redirect_Rule{
+redir_cfg := redirect.Redirect_Config {
+	rules = []redirect.Redirect_Rule{
 		{from = "/old",  to = "/",          exact = true},
 		{from = "/docs", to = "/assets/"},              // 前缀，拼后缀且不留双斜杠
 	},                                                   // code 默认 308（方法保持）
 }
-web.router_use(&router, middlewares.middleware_redirect, &redir_cfg)
+web.router_use(&router, redirect.middleware_redirect, &redir_cfg)
 
 // 内部重写：路由表之前改写路径，不发响应，客户端看不出来
 web.router_rewrite(&router, "/intro", "/", true)
@@ -790,19 +844,26 @@ web.router_rewrite(&router, "/static", "/assets")     // 前缀版，按段边�
 规则按注册顺序取第一条命中，所以具体路径要写在泛前缀前面。绝对 URL 目标  
 （`https://...`）原样使用，不拼后缀。
 
-**gzip 开关（按路由）**
+**内容编码开关（按路由）**
 
 ```odin
-gz := middlewares.Gzip_Config{min_size = 256}   // 只改这一条路由的阈值
-web.router_use_route(big_route, middlewares.middleware_gzip, &gz)
-web.router_use_route(img_route, middlewares.middleware_no_gzip, nil)
+cfg := coding.Coding_Config{min_size = 256}   // 只改这一条路由的阈值
+web.router_use_route(big_route, coding.middleware_coding, &cfg)
+web.router_use_route(img_route, coding.middleware_no_coding, nil)
 ```
 
-压缩本身由父包内置且默认注册的 `Compress_Filter` 做（按 `Accept-Encoding`  
-协商、只压可压缩类型、自动加 `Vary: Accept-Encoding`、压缩后不比原文小就发  
-原文）。中间件只是给这条响应设「压 / 不压 / 阈值」：`no_gzip` 用在已压缩的  
-资源、流式响应和 Range 响应（字节偏移指的是原文）上。handler 记得设  
-`Content-Type`——没有类型的正文会被协商逻辑跳过。
+内容编码就四层，一层一个职责，没有第二处实现：
+
+| 层 | 位置 | 只做一件事 |
+| --- | --- | --- |
+| 规则 | `http.negotiate_coding` / `http.content_type_compressible` | 读 `Accept-Encoding`（q 值、`*`、`q=0` 显式拒收）判断用哪种编码；判断媒体类型值不值 |
+| 编码器 | `codecs`（`deflate.odin` / `gzip.odin` / `crc32.odin`） | 纯算法：输入字节，输出编码后的字节 |
+| 执行 | `web.Coding_Filter`（`web/coding_filter.odin`） | 唯一同时看得到请求头、响应体和 `Conn` 的地方：把前两层的结果落到响应上，加 `Vary`、重算长度 |
+| 路由开关 | `middlewares/coding` | 只写两个响应字段（`Response.coding` / `coding_min_size`），一个字节都不压 |
+
+`middleware_no_coding` 用在已压缩的资源、流式响应和 Range 响应（字节偏移  
+指的是原文）上。handler 记得设 `Content-Type`——没有类型的正文会被协商逻辑  
+跳过。
 
 **Static**
 
@@ -1021,44 +1082,64 @@ web.server_run_multi(servers[:], &done)   // 主线程跑 servers[0]
 ## 测试覆盖
 
 ```bash
-odin test web/               # 156 个
-odin test web/middlewares     # 60 个
+for p in buffer http codecs multipart pattern web; do odin test $p -define:ODIN_TEST_THREADS=1; done
+for p in common token auth session totp form upload static redirect coding range; do
+  odin test middlewares/$p -define:ODIN_TEST_THREADS=1
+done
 ```
 
-`web` 侧是 parser / chunked / router（含重写）/ response 序列化 /  
-proxy 解析与分帧决策 / cookie 序列化与解析 / JSON / Lua 模式匹配（22 组模式  
-用例）/ Range 解析（14 组语法用例）/ HTTP-date 解析 / If-Range / 严格分帧  
-（15 组用例）/ CRC32 与 deflate-gzip 往返 / 可压缩类型判定 / 平滑加权轮询与  
-熔断状态机（摘除窗口倍增与封顶）/ 增量 multipart 解析（**同一正文按 1..N 字节  
-窗口逐个喂进去结果必须一致**，覆盖分隔符跨界、正文内含分隔符前缀、空 part、  
-无尾 CRLF、多 part 顺序与 index/size、前导与后置垃圾、分隔行尾判定与 transport  
-padding）/ 流式解析内存上界 / 文件名消毒 单测，加 30 多个真实起服务的集成测试  
-（请求响应闭环 + body 回显、畸形请求 400、chunked 请求体、pipelined 双请求、  
-24 深度流水线合并写且响应顺序不乱、流水线中间夹带 body 的请求、流水中途出现  
-坏请求时前面已合并的响应不丢、  
-HEAD、空文件 sendfile、代理 GET/POST、chunked 上游中继、close-delimited 上游  
-重分帧、上游拒连 502、Cookie、JSON、模式路由、静态 Range 全路径：单 range 206  
-/ 多 range multipart / 416 / 304 / If-Range、gzip 内容协商与 chunked 组合、  
-代理流式早发 / 失效池重试 / 池命中计数 / 健康探测、3 acceptor 共享端口、TLS  
-配置 / GET / keep-alive / 200 KiB 静态文件逐字节比对 / ticket 签发 / 关闭复用 /  
-session id context 稳定性、SSE 事件流、Hub 广播与优雅关闭 / 多行事件成帧 /  
-背压丢消息与恢复 / keep-alive 心跳、延迟响应的超时续延与唤醒 / 二段续延 /  
-重复停车被拒 / 超时后迟到唤醒、流式上传落盘 / 阈值内不落盘 / 两个文件各归其位 /  
-chunked 正文 / 超限 413（part 与字段）/ keep_temp / 非 multipart 不受影响 /  
-临时文件在请求结束（含 keep-alive）即清理）。
+共 **234** 个用例，按包分布：
 
-`web/middlewares` 侧是 Basic/Bearer/API-Key 认证（含 challenge 文案与  
-principal 传递）、表单 urlencoded/multipart/限额/415/400/413、Range 中间件的  
-206/416/ETag/304/If-Range/跳过文件响应、路由级中间件隔离、会话的往返与  
-伪造 Cookie 拒绝 / 过期 / 栈缓冲值被复制、JWT 的签发与验签（错误 alg、  
-错密钥、过期、错 iss/aud）、静态挂载的命中 / 回落 / 前缀剥离 / SPA、  
-重定向的状态码与 Location（含双斜杠）、上传的文件名消毒与限额 / 流式 part  
-的改名交接（rename 即所有权转移）、TOTP 的 RFC 4226/6238 向量（HOTP 0..9 与  
-8 位 TOTP）/ base32 往返与手输容错 / 密钥密文往返、错 key 与篡改拒绝 /  
-注册-确认-校验 / 同码重放 / 容差窗口 + 已用码窗口 = 匹配窗口 / 锁定与到期清零 /  
-恢复码单次有效与跨账号无效 / 状态文件落盘（明文密钥不出现）与损坏文件  
-`load_failed` / 两阶段登录闸门（401、跳转、`X-Totp-Challenge`、放行）。  
-Odin test runner 内存追踪零泄漏。
+| 包          | 用例 | 覆盖重点                                                     |
+| ----------- | ---: | ------------------------------------------------------------ |
+| `buffer`    |    3 | `bytes_index` 与朴素查找逐一对拍（短针 / 长针两条路径）、HTML 转义（`&<>"'` 与已转义文本）；`buf_*` 的生长/截断由上层用例间接覆盖 |
+| `http`      |   23 | 方法/状态行往返、URL 编解码与路径清理、HTTP-date 解析与格式化、Range 语法（14 组）、If-Range、多 range 正文释放、并发 boundary 唯一性、Cookie 序列化、**Accept-Encoding 协商（26 组，含 q 值 / `*` / `q=0` / 服务端能力）**、chunked 解码三态、SSE 线格式逐字节、urlencoded 与 query 解码 |
+| `codecs`    |    5 | CRC32 向量、deflate/gzip 往返、距离码全覆盖（30 个码各一条）、匹配表跨请求复用 |
+| `multipart` |   11 | 增量解析不变量（见下）、限额与 sink 拒绝、内存上界            |
+| `pattern`   |    4 | 表驱动 24 组语义用例（捕获 / 贪婪与懒惰 / 回溯 / 字符集 / 锚定 / 畸形模式）、`has_syntax`、捕获清空时机、步数预算 |
+| `web`       |  122 | 连接状态机、代理、TLS、SSE/Hub、异步续延、流式上传，及 30 多个真实起服务的集成测试 |
+| `common`    |   12 | request id、访问日志透传、安全头、CORS（预检 / 凭证 / 拒绝 / 普通请求）、no-buffer、body 限额（含无 Content-Length） |
+| `token`     |    6 | base64url（RFC 4648 向量 + URL-safe 字母表 + 非法输入）、HMAC-SHA256（RFC 4231 向量）、签名往返与篡改拒绝 |
+| `auth`      |   10 | Basic/Bearer/API-Key、challenge 文案、principal 传递、无密钥时 fails-open、`router_use_route` 的路由级隔离、JWT 签发与验签（错误 alg / 错密钥 / 过期 / leeway / 错 iss、aud） |
+| `session`   |    6 | 会话往返、伪造 Cookie 拒绝、过期、destroy、无密钥透传、栈缓冲值被复制 |
+| `totp`      |   12 | RFC 4226/6238 向量、base32 容错、密钥密文往返、注册-确认-校验、重放、容差与已用码窗口、锁定、恢复码、状态文件 |
+| `form`      |    4 | urlencoded / multipart 绑定、懒解析、错误映射（415/400/413）  |
+| `upload`    |    4 | 落盘、流式 part 的改名交接（rename 即所有权转移）、非 multipart 正文不受影响 |
+| `static`    |    3 | 命中 / 未命中回落 / SPA 兜底                                  |
+| `redirect`  |    4 | 状态码与 Location（含双斜杠）                                 |
+| `coding`    |    1 | 按路由写 `Response.coding` / `coding_min_size` 覆盖           |
+| `range`     |    4 | 206 / 416 / ETag / 304 / If-Range / 跳过文件响应              |
+
+各包内部各自验证自己的不变量，跨包只经由公开 API：
+
+- **`multipart`** 的核心断言是「同一正文按 1..N 字节窗口逐个喂进去结果必须一致」，
+  覆盖分隔符跨界、正文内含分隔符前缀、空 part、无尾 CRLF、多 part 顺序与
+  index/size、前导与后置垃圾、分隔行尾判定与 transport padding，另加内存上界
+  与 sink 主动拒绝。
+- **`web`** 侧是 parser / router（段式 + 重写 + 模式路由落表）/ response 序列化
+  / proxy 解析与分帧决策 / 平滑加权轮询与熔断状态机（摘除窗口倍增与封顶）/
+  JSON / 请求查询与表单解析 / 服务端 Date 缓存 /
+  Cookie 请求侧解析与响应侧构造 / 内容编码过滤器（跳过规则、`Vary`、顺序、
+  scratch 复用）/ 静态文件 / 文件名消毒 单测，加 30 多个真实起服务的集成测试
+  （请求响应闭环 + body 回显、畸形请求 400、chunked 请求体、pipelined 双请求、
+  24 深度流水线合并写且响应顺序不乱、流水线中间夹带 body 的请求、流水中途出现
+  坏请求时前面已合并的响应不丢、
+  HEAD、空文件 sendfile、代理 GET/POST、chunked 上游中继、close-delimited 上游
+  重分帧、上游拒连 502、Cookie、JSON、模式路由、静态 Range 全路径：单 range 206
+  / 多 range multipart / 416 / 304 / If-Range、内容编码协商与 chunked 组合、
+  代理流式早发 / 失效池重试 / 池命中计数 / 健康探测、3 acceptor 共享端口、TLS
+  配置 / GET / keep-alive / 200 KiB 静态文件逐字节比对 / ticket 签发 / 关闭复用 /
+  session id context 稳定性、SSE 事件流、Hub 广播与优雅关闭 / 多行事件成帧 /
+  背压丢消息与恢复 / keep-alive 心跳、延迟响应的超时续延与唤醒 / 二段续延 /
+  重复停车被拒 / 超时后迟到唤醒、流式上传落盘 / 阈值内不落盘 / 两个文件各归其位 /
+  chunked 正文 / 超限 413（part 与字段）/ keep_temp / 非 multipart 不受影响 /
+  临时文件在请求结束（含 keep-alive）即清理）。
+- **`middlewares/*`** 侧另有两处成组用例：TOTP 的「注册-确认-校验 → 同码重放
+  → 容差窗口与已用码窗口 → 锁定 → 恢复码单次有效」整条链路，以及
+  「状态文件落盘后明文密钥不出现、损坏文件报 `load_failed`」这类跨进程不变量。
+
+全部包在 Odin test runner 的内存追踪下零泄漏（`token` 的中间编码串、`multipart`
+的临时 part 元数据都在内部释放，不依赖请求 arena 兜底）。
 
 ## 与 odin-http 的关系
 

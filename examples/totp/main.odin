@@ -41,7 +41,11 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "../../web"
-import "../../web/middlewares"
+import "../../middlewares/auth"
+import "../../middlewares/common"
+import "../../middlewares/session"
+import "../../middlewares/totp"
+import "../../http"
 
 // DEMO_MASTER_KEY is used when TOTP_SECRET is unset: a real deployment
 // generates one with `openssl rand -hex 32` and keeps it out of the state
@@ -50,19 +54,19 @@ DEMO_MASTER_KEY :: "00112233445566778899aabbccddeeff00112233445566778899aabbccdd
 
 DEMO_STATE_PATH :: "./totp_state.json"
 
-session_cfg := middlewares.Session_Config {
+session_cfg := session.Session_Config {
 	name         = "sid",
 	secret       = "demo-session-secret-change-me",
 	max_age_secs = 8 * 3600,
 }
 
 // The gate config must outlive the server; `totp` is filled in by main.
-gate_cfg := middlewares.Totp_Gate_Config {
+gate_cfg := totp.Totp_Gate_Config {
 	login_path     = "/login",
 	challenge_path = "/totp",
 }
 
-totp_state: middlewares.Totp
+totp_state: totp.Totp
 
 // One account, because the point of the demo is the second factor, not a
 // user database.
@@ -91,7 +95,7 @@ WRAP_TAIL :: `
 <hr><nav><a href="/">首页</a> · <a href="/admin">后台</a> · <a href="/setup">TOTP 设置</a></nav>
 `
 
-page :: proc(res: ^web.Response, status: web.Status, inner: string) {
+page :: proc(res: ^web.Response, status: http.Status, inner: string) {
 	alloc := web.response_allocator(res)
 	web.response_html(res, status, fmt.aprintf("%s%s%s", WRAP_HEAD, inner, WRAP_TAIL, allocator = alloc))
 }
@@ -101,10 +105,10 @@ page :: proc(res: ^web.Response, status: web.Status, inner: string) {
 // ---------------------------------------------------------------------------
 
 index :: proc(req: ^web.Request, res: ^web.Response) {
-	user := middlewares.totp_session_user(req, &gate_cfg)
+	user := totp.totp_session_user(req, &gate_cfg)
 	state := "未登录"
 	if len(user) > 0 {
-		if middlewares.totp_authenticated(req, &gate_cfg) {
+		if totp.totp_authenticated(req, &gate_cfg) {
 			state = fmt.aprintf("已登录：%s（双因素已通过）", user, allocator = web.response_allocator(res))
 		} else {
 			state = fmt.aprintf("已登录：%s（等待验证码）", user, allocator = web.response_allocator(res))
@@ -127,7 +131,7 @@ index :: proc(req: ^web.Request, res: ^web.Response) {
 // stage 1: password
 // ---------------------------------------------------------------------------
 
-login_page :: proc(res: ^web.Response, status: web.Status, message: string) {
+login_page :: proc(res: ^web.Response, status: http.Status, message: string) {
 	note := ""
 	if len(message) > 0 {
 		note = fmt.aprintf(`<p class="err">%s</p>`, message, allocator = web.response_allocator(res))
@@ -168,7 +172,7 @@ login_submit :: proc(req: ^web.Request, res: ^web.Response) {
 
 	// The one call that decides whether the login is over. `true` means the
 	// account has 2FA on and the session is only half authenticated.
-	if middlewares.totp_after_password(req, &totp_state, user, &gate_cfg) {
+	if totp.totp_after_password(req, &totp_state, user, &gate_cfg) {
 		web.response_redirect(res, "/totp", .Found)
 		return
 	}
@@ -179,7 +183,7 @@ login_submit :: proc(req: ^web.Request, res: ^web.Response) {
 // stage 2: the code
 // ---------------------------------------------------------------------------
 
-challenge_page :: proc(res: ^web.Response, status: web.Status, user, message: string) {
+challenge_page :: proc(res: ^web.Response, status: http.Status, user, message: string) {
 	note := ""
 	if len(message) > 0 {
 		note = fmt.aprintf(`<p class="err">%s</p>`, message, allocator = web.response_allocator(res))
@@ -195,7 +199,7 @@ challenge_page :: proc(res: ^web.Response, status: web.Status, user, message: st
 }
 
 challenge_form :: proc(req: ^web.Request, res: ^web.Response) {
-	user, pending := middlewares.totp_challenge_pending(req, &gate_cfg)
+	user, pending := totp.totp_challenge_pending(req, &gate_cfg)
 	if !pending {
 		web.response_redirect(res, "/login", .Found)
 		return
@@ -219,7 +223,7 @@ normalize_code :: proc(code: string, alloc: mem.Allocator) -> string {
 }
 
 challenge_submit :: proc(req: ^web.Request, res: ^web.Response) {
-	user, pending := middlewares.totp_challenge_pending(req, &gate_cfg)
+	user, pending := totp.totp_challenge_pending(req, &gate_cfg)
 	if !pending {
 		web.response_redirect(res, "/login", .Found)
 		return
@@ -227,7 +231,7 @@ challenge_submit :: proc(req: ^web.Request, res: ^web.Response) {
 	raw, _ := web.request_form_value(req, "code")
 	code := normalize_code(raw, web.request_allocator(req))
 
-	#partial switch middlewares.totp_complete_challenge(req, &totp_state, code, &gate_cfg) {
+	#partial switch totp.totp_complete_challenge(req, &totp_state, code, &gate_cfg) {
 	case .None:
 		web.response_redirect(res, "/admin", .Found)
 	case .Account_Locked:
@@ -244,8 +248,8 @@ challenge_submit :: proc(req: ^web.Request, res: ^web.Response) {
 // ---------------------------------------------------------------------------
 
 admin :: proc(req: ^web.Request, res: ^web.Response) {
-	user := middlewares.request_principal(req) // set by middleware_totp
-	status := middlewares.totp_status(&totp_state, user)
+	user := auth.request_principal(req) // set by middleware_totp
+	status := totp.totp_status(&totp_state, user)
 	mode := "开启"
 	if status.enabled {
 		mode = fmt.aprintf("已开启（剩余恢复码 %d 个）", status.backup_codes, allocator = web.response_allocator(res))
@@ -262,8 +266,8 @@ admin :: proc(req: ^web.Request, res: ^web.Response) {
 }
 
 logout :: proc(req: ^web.Request, res: ^web.Response) {
-	middlewares.totp_sign_out(req, &gate_cfg)
-	middlewares.session_destroy(req, res, &session_cfg)
+	totp.totp_sign_out(req, &gate_cfg)
+	session.session_destroy(req, res, &session_cfg)
 	web.response_redirect(res, "/login", .Found)
 }
 
@@ -271,12 +275,12 @@ logout :: proc(req: ^web.Request, res: ^web.Response) {
 // enrollment
 // ---------------------------------------------------------------------------
 
-setup_page :: proc(res: ^web.Response, status: web.Status, user, message: string) {
+setup_page :: proc(res: ^web.Response, status: http.Status, user, message: string) {
 	note := ""
 	if len(message) > 0 {
 		note = fmt.aprintf(`<p class="err">%s</p>`, message, allocator = web.response_allocator(res))
 	}
-	state := middlewares.totp_status(&totp_state, user)
+	state := totp.totp_status(&totp_state, user)
 	body := fmt.aprintf(`<h1>TOTP 设置</h1><p>账号 <code>%s</code>：%s%s</p>`,
 		user, state.enabled ? "已开启" : (state.has_binding ? "已生成密钥，等待确认" : "未开启"), note,
 		allocator = web.response_allocator(res))
@@ -299,13 +303,13 @@ setup_page :: proc(res: ^web.Response, status: web.Status, user, message: string
 }
 
 setup_show :: proc(req: ^web.Request, res: ^web.Response) {
-	setup_page(res, .OK, middlewares.totp_session_user(req, &gate_cfg), "")
+	setup_page(res, .OK, totp.totp_session_user(req, &gate_cfg), "")
 }
 
 setup_start :: proc(req: ^web.Request, res: ^web.Response) {
-	user := middlewares.totp_session_user(req, &gate_cfg)
+	user := totp.totp_session_user(req, &gate_cfg)
 	alloc := web.response_allocator(res)
-	enrollment, err := middlewares.totp_setup(&totp_state, user, alloc)
+	enrollment, err := totp.totp_setup(&totp_state, user, alloc)
 	#partial switch err {
 	case .None:
 	case .Already_Enabled:
@@ -338,10 +342,10 @@ setup_start :: proc(req: ^web.Request, res: ^web.Response) {
 }
 
 setup_confirm :: proc(req: ^web.Request, res: ^web.Response) {
-	user := middlewares.totp_session_user(req, &gate_cfg)
+	user := totp.totp_session_user(req, &gate_cfg)
 	raw, _ := web.request_form_value(req, "code")
 	code := normalize_code(raw, web.request_allocator(req))
-	#partial switch middlewares.totp_confirm(&totp_state, user, code) {
+	#partial switch totp.totp_confirm(&totp_state, user, code) {
 	case .None:
 		web.response_redirect(res, "/admin", .Found)
 	case .Invalid_Code:
@@ -352,13 +356,13 @@ setup_confirm :: proc(req: ^web.Request, res: ^web.Response) {
 }
 
 setup_disable :: proc(req: ^web.Request, res: ^web.Response) {
-	user := middlewares.totp_session_user(req, &gate_cfg)
+	user := totp.totp_session_user(req, &gate_cfg)
 	raw, _ := web.request_form_value(req, "code")
 	code := normalize_code(raw, web.request_allocator(req))
 
 	// Closing the second factor is a login-strength action: the current code
 	// has to be presented, not just the session.
-	#partial switch middlewares.totp_verify(&totp_state, user, code) {
+	#partial switch totp.totp_verify(&totp_state, user, code) {
 	case .None:
 	case .Account_Locked:
 		setup_page(res, .Forbidden, user, "失败次数太多，账号临时锁定。")
@@ -367,7 +371,7 @@ setup_disable :: proc(req: ^web.Request, res: ^web.Response) {
 		setup_page(res, .Unauthorized, user, "验证码不对，无法关闭。")
 		return
 	}
-	if middlewares.totp_disable(&totp_state, user) != .None {
+	if totp.totp_disable(&totp_state, user) != .None {
 		setup_page(res, .Internal_Error, user, "关闭失败（状态文件写不进去？）")
 		return
 	}
@@ -393,17 +397,17 @@ main :: proc() {
 		master_key = DEMO_MASTER_KEY
 	}
 
-	cfg := middlewares.Totp_Config {
+	cfg := totp.Totp_Config {
 		issuer     = "web-totp-demo",
 		secret_hex = master_key,
 		path       = DEMO_STATE_PATH,
 	}
-	if err := middlewares.totp_init(&totp_state, cfg); err != .None {
+	if err := totp.totp_init(&totp_state, cfg); err != .None {
 		fmt.eprintfln("totp_init: %v (TOTP_SECRET must be 64 hex chars)", err)
 		return
 	}
-	defer middlewares.totp_destroy(&totp_state)
-	if middlewares.totp_load_failed(&totp_state) {
+	defer totp.totp_destroy(&totp_state)
+	if totp.totp_load_failed(&totp_state) {
 		// Starting empty would silently turn 2FA off for every account; a
 		// corrupt file is an operator problem, not something to paper over.
 		fmt.eprintfln("%s is unreadable - fix or move it before starting", DEMO_STATE_PATH)
@@ -415,10 +419,10 @@ main :: proc() {
 	web.router_init(&router)
 	defer web.router_destroy(&router)
 
-	web.router_use(&router, middlewares.middleware_request_id)
-	web.router_use(&router, middlewares.middleware_logger)
-	web.router_use(&router, middlewares.middleware_secure_headers)
-	web.router_use(&router, middlewares.middleware_session, &session_cfg)
+	web.router_use(&router, common.middleware_request_id)
+	web.router_use(&router, common.middleware_logger)
+	web.router_use(&router, common.middleware_secure_headers)
+	web.router_use(&router, session.middleware_session, &session_cfg)
 
 	web.router_get(&router, "/", index)
 	web.router_get(&router, "/login", login_form)
@@ -438,7 +442,7 @@ main :: proc() {
 	// complete), and enrollment needs a fully authenticated session, so it
 	// is mounted with the gate as well.
 	for route in ([]^web.Route{admin_route, setup_route, start_route, confirm_route, disable_route}) {
-		web.router_use_route(route, middlewares.middleware_totp, &gate_cfg)
+		web.router_use_route(route, totp.middleware_totp, &gate_cfg)
 	}
 
 	srv: web.Server

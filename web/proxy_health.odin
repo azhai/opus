@@ -3,6 +3,7 @@ package web
 import "core:nbio"
 import "core:net"
 import "core:time"
+import "../buffer"
 
 /*
 Upstream health and load balancing for the reverse proxy.
@@ -165,7 +166,7 @@ proxy_eject :: proc(p: ^Proxy, index: int) {
 	// an ejected backend's idle sockets are dead weight: dropping them also
 	// keeps the pool from handing out connections to a box that is down
 	proxy_pool_close_upstream(p, index)
-	log_info(
+	buffer.log_info(
 		"web: proxy: upstream %v ejected for %v after %v consecutive failure(s)",
 		u.host,
 		window,
@@ -192,7 +193,7 @@ proxy_note_success :: proc(p: ^Proxy, index: int) {
 		if p.upstreams_ejected > 0 {
 			p.upstreams_ejected -= 1
 		}
-		log_info("web: proxy: upstream %v back in rotation", u.host)
+		buffer.log_info("web: proxy: upstream %v back in rotation", u.host)
 	}
 }
 

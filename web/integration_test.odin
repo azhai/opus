@@ -18,6 +18,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // end-to-end: real sockets through the nbio event loop
 // ---------------------------------------------------------------------------
@@ -88,7 +90,7 @@ test_integration_request_response :: proc(t: ^testing.T) {
 			break
 		}
 		total += r
-		if bytes_contains(buf[:total], "\r\n\r\nhello") {
+		if buffer.bytes_contains(buf[:total], "\r\n\r\nhello") {
 			break
 		}
 	}
@@ -151,7 +153,7 @@ test_integration_bad_request :: proc(t: ^testing.T) {
 			break
 		}
 		total += r
-		if bytes_contains(buf[:total], "400") {
+		if buffer.bytes_contains(buf[:total], "400") {
 			break
 		}
 	}
@@ -241,7 +243,7 @@ test_integration_chunked_request :: proc(t: ^testing.T) {
 			break
 		}
 		total += r
-		if bytes_contains(buf[:total], "\r\n\r\nhello world") {
+		if buffer.bytes_contains(buf[:total], "\r\n\r\nhello world") {
 			break
 		}
 	}
@@ -274,7 +276,7 @@ test_integration_pipelined_requests :: proc(t: ^testing.T) {
 			break
 		}
 		total += r
-		if bytes_contains(buf[:total], "hello integrationhello integration") {
+		if buffer.bytes_contains(buf[:total], "hello integrationhello integration") {
 			break
 		}
 	}
@@ -347,7 +349,7 @@ test_integration_pipeline_batch :: proc(t: ^testing.T) {
 	// walk the stream response by response: head, then Content-Length bytes
 	pos, count, echo_at := 0, 0, -1
 	for pos < total {
-		rel := bytes_index(data[pos:total], "\r\n\r\n")
+		rel := buffer.bytes_index(data[pos:total], "\r\n\r\n")
 		testing.expectf(t, rel >= 0, "response %v has no head terminator", count)
 		if rel < 0 {
 			break
@@ -371,7 +373,7 @@ test_integration_pipeline_batch :: proc(t: ^testing.T) {
 	testing.expectf(t, echo_at == DEPTH, "echo arrived as response %v, want %v", echo_at, DEPTH)
 	testing.expect(
 		t,
-		bytes_contains(data[:total], "Connection: close\r\n"),
+		buffer.bytes_contains(data[:total], "Connection: close\r\n"),
 		"the last response does not close the connection",
 	)
 }
@@ -419,11 +421,11 @@ test_integration_pipeline_bad_request :: proc(t: ^testing.T) {
 	}
 
 	stream := data[:total]
-	testing.expect(t, bytes_contains(stream, "hello integration"))
+	testing.expect(t, buffer.bytes_contains(stream, "hello integration"))
 	// both good bodies are present, then the 400, in that order
-	first := bytes_index(stream, "hello integration")
-	second := bytes_index(stream[first + 1:], "hello integration")
-	bad := bytes_index(stream, "HTTP/1.1 400 Bad Request")
+	first := buffer.bytes_index(stream, "hello integration")
+	second := buffer.bytes_index(stream[first + 1:], "hello integration")
+	bad := buffer.bytes_index(stream, "HTTP/1.1 400 Bad Request")
 	testing.expectf(t, first >= 0 && second >= 0, "the batched responses were lost: %v", total)
 	testing.expectf(t, bad > first + 1 + second, "the 400 came before the responses it followed: %v", total)
 }
@@ -504,8 +506,8 @@ cookie_handler :: proc(req: ^Request, res: ^Response) {
 	response_write_string(res, token)
 	response_write_string(res, " theme=")
 	response_write_string(res, theme)
-	response_set_cookie(res, Cookie{name = "session", value = "abc123", path = "/", http_only = true, same_site = .Lax})
-	response_set_cookie(res, Cookie{name = "theme", value = "dark", max_age_secs = 3600})
+	response_set_cookie(res, http.Cookie{name = "session", value = "abc123", path = "/", http_only = true, same_site = .Lax})
+	response_set_cookie(res, http.Cookie{name = "theme", value = "dark", max_age_secs = 3600})
 }
 
 @(test)

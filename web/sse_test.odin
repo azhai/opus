@@ -6,6 +6,7 @@ package web
 import "core:net"
 import "core:strings"
 import "core:testing"
+import "../buffer"
 
 // ---------------------------------------------------------------------------
 // SSE over a real socket
@@ -47,7 +48,7 @@ test_integration_sse :: proc(t: ^testing.T) {
 		}
 		total += r
 		// the terminating chunk ends the stream
-		if bytes_contains(buf[:total], "0\r\n\r\n") {
+		if buffer.bytes_contains(buf[:total], "0\r\n\r\n") {
 			break
 		}
 	}
@@ -57,11 +58,11 @@ test_integration_sse :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(resp, "Transfer-Encoding: chunked\r\n"))
 	testing.expect(t, strings.contains(resp, "X-Accel-Buffering: no\r\n"))
 	// chunk framing: "<hex>\r\n<fields>"
-	testing.expect(t, bytes_contains(buf[:total], "retry: 1000\n\n"))
-	testing.expect(t, bytes_contains(buf[:total], ": keep-alive\n\n"))
-	testing.expect(t, bytes_contains(buf[:total], "event: tick\n"))
-	testing.expect(t, bytes_contains(buf[:total], "id: 42\n"))
-	testing.expect(t, bytes_contains(buf[:total], "data: line one\n"))
-	testing.expect(t, bytes_contains(buf[:total], "data: line two\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], "retry: 1000\n\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], ": keep-alive\n\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], "event: tick\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], "id: 42\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], "data: line one\n"))
+	testing.expect(t, buffer.bytes_contains(buf[:total], "data: line two\n"))
 	testing.expect(t, strings.has_suffix(resp, "0\r\n\r\n"))
 }

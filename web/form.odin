@@ -1,6 +1,9 @@
 package web
 
 import "core:mem"
+import "../buffer"
+import "../http"
+import "../multipart"
 
 /*
 Form bodies: `application/x-www-form-urlencoded` and `multipart/form-data`.
@@ -23,8 +26,6 @@ Content-Type on text fields, and send `filename=""` for an empty file input;
 keying off Content-Type would turn every empty file input into a field.
 */
 
-// MAX_FORM_FIELDS caps the number of non-file parts decoded per request.
-MAX_FORM_FIELDS :: 256
 
 // MAX_FORM_FILE_SIZE caps a single uploaded part (8 MiB) on the in-memory
 // path. The whole body is already bounded by `Server.max_body_size`. The
@@ -57,16 +58,10 @@ Form_State :: enum u8 {
 	Too_Large, // a field or file limit was hit
 }
 
-Form_Error :: enum {
-	None,
-	Not_A_Form, // neither urlencoded nor multipart (or an empty body)
-	Bad_Boundary,
-	Malformed,
-	Too_Many_Fields,
-	File_Too_Large,
-	Too_Large,   // a cached parse hit a limit; the specific one is gone
-	Sink_Error,  // a streaming consumer refused a chunk (see upload.odin)
-}
+// Form_Error and MAX_FORM_FIELDS describe the grammar both form parsers
+// share, so they live with the streaming parser and are aliased here.
+Form_Error :: multipart.Form_Error
+MAX_FORM_FIELDS :: multipart.MAX_FORM_FIELDS
 
 // Form_Config configures middleware_form. Zero fields mean the defaults:
 // MAX_FORM_FIELDS, MAX_FORM_FILE_SIZE, and `require_form = false`
@@ -79,7 +74,7 @@ Form_Config :: struct {
 
 // request_is_multipart reports a multipart/form-data body.
 request_is_multipart :: proc(r: ^Request) -> bool {
-	return eq_ignore_case(request_content_type(r), "multipart/form-data")
+	return http.eq_ignore_case(request_content_type(r), "multipart/form-data")
 }
 
 // request_files returns every uploaded file of a multipart body, parsing it
@@ -162,7 +157,7 @@ form_ensure_parsed :: proc(r: ^Request, cfg: ^Form_Config) -> Form_Error {
 		return .None
 	}
 
-	if ct := request_content_type(r); len(ct) == 0 || eq_ignore_case(ct, "application/x-www-form-urlencoded") {
+	if ct := request_content_type(r); len(ct) == 0 || http.eq_ignore_case(ct, "application/x-www-form-urlencoded") {
 		r.form = form_parse(string(r.body), alloc)
 		r.form_state = .Parsed
 		return .None
@@ -196,10 +191,10 @@ multipart_parse :: proc(
 	f := make([dynamic]Param, allocator)
 	fl := make([dynamic]Form_File, allocator)
 
-	delim := concat_strings({"--", boundary}, allocator)
-	sep := concat_strings({"\r\n", delim}, allocator)
+	delim := buffer.concat_strings({"--", boundary}, allocator)
+	sep := buffer.concat_strings({"\r\n", delim}, allocator)
 
-	pos := bytes_index(body, delim)
+	pos := buffer.bytes_index(body, delim)
 	if pos < 0 {
 		return f[:], fl[:], .Bad_Boundary
 	}
@@ -219,21 +214,21 @@ multipart_parse :: proc(
 		}
 		pos += 2
 
-		hend := bytes_index(body[pos:], "\r\n\r\n")
+		hend := buffer.bytes_index(body[pos:], "\r\n\r\n")
 		if hend < 0 {
 			return f[:], fl[:], .Malformed
 		}
 		head := string(body[pos:pos + hend])
 		content_start := pos + hend + 4
 
-		next := bytes_index(body[content_start:], sep)
+		next := buffer.bytes_index(body[content_start:], sep)
 		if next < 0 {
 			return f[:], fl[:], .Malformed
 		}
 		content := body[content_start:content_start + next]
 		pos = content_start + next + len(sep)
 
-		name, filename, ctype, is_file := multipart_part_meta(head)
+		name, filename, ctype, is_file := multipart.multipart_part_meta(head)
 		if len(name) == 0 {
 			// a part with no field name is not form data (some clients send
 			// an unnamed preamble part); skipping it is more useful than 400
@@ -259,40 +254,6 @@ multipart_parse :: proc(
 	}
 }
 
-// multipart_part_meta pulls the three fields the parser needs out of a part
-// header block: field name, file name marker, part content type.
-multipart_part_meta :: proc(head: string) -> (name, filename, ctype: string, is_file: bool) {
-	rest := head
-	for len(rest) > 0 {
-		nl := string_index(rest, "\r\n")
-		line := rest
-		if nl >= 0 {
-			line = rest[:nl]
-			rest = rest[nl + 2:]
-		} else {
-			rest = ""
-		}
-		colon := string_index_byte(line, ':')
-		if colon <= 0 {
-			continue
-		}
-		key := trim_ows(line[:colon])
-		value := trim_ows(line[colon + 1:])
-		switch {
-		case eq_ignore_case(key, "Content-Disposition"):
-			if v, ok := header_param(value, "name"); ok {
-				name = v
-			}
-			if v, ok := header_param(value, "filename"); ok {
-				filename = strip_path_components(v)
-				is_file = true
-			}
-		case eq_ignore_case(key, "Content-Type"):
-			ctype = value
-		}
-	}
-	return
-}
 
 // multipart_boundary_param extracts the `boundary` parameter of a
 // multipart Content-Type. RFC 2046 allows it quoted or bare; both are
@@ -301,56 +262,9 @@ multipart_boundary_param :: proc(content_type: string) -> string {
 	if len(content_type) == 0 {
 		return ""
 	}
-	v, _ := header_param(content_type, "boundary")
+	v, _ := http.header_param(content_type, "boundary")
 	return v
 }
 
-// header_param returns the value of one `;`-separated parameter of a header
-// value, unquoted. Parameter names match case-insensitively; a name that
-// merely ends with the wanted one ("filename*" vs "filename") does not
-// match, so an RFC 5987 extended value never shadows the plain one.
-header_param :: proc(value, param: string) -> (string, bool) {
-	rest := value
-	for len(rest) > 0 {
-		semi := string_index_byte(rest, ';')
-		seg := rest
-		if semi >= 0 {
-			seg = rest[:semi]
-			rest = rest[semi + 1:]
-		} else {
-			rest = ""
-		}
-		seg = trim_ows(seg)
-		eq := string_index_byte(seg, '=')
-		if eq <= 0 {
-			continue // the leading "media type" segment has no '='
-		}
-		if !eq_ignore_case(trim_ows(seg[:eq]), param) {
-			continue
-		}
-		return unquote_header_value(trim_ows(seg[eq + 1:])), true
-	}
-	return "", false
-}
 
-// unquote_header_value strips one layer of double quotes.
-unquote_header_value :: proc(v: string) -> string {
-	if len(v) >= 2 && v[0] == '"' && v[len(v) - 1] == '"' {
-		return v[1:len(v) - 1]
-	}
-	return v
-}
 
-// strip_path_components reduces a client-supplied file name to its base
-// name: browsers may send a full local path (IE used to), and the name is
-// echoed into Content-Disposition on download.
-strip_path_components :: proc(name: string) -> string {
-	out := name
-	if i := last_index_byte(out, '/'); i >= 0 {
-		out = out[i + 1:]
-	}
-	if i := last_index_byte(out, '\\'); i >= 0 {
-		out = out[i + 1:]
-	}
-	return out
-}

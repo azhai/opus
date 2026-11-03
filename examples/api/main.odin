@@ -4,7 +4,8 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "../../web"
-import "../../web/middlewares"
+import "../../middlewares/common"
+import "../../http"
 
 /*
 REST-ish API demo: router with params, Lua-pattern captures, cookies,
@@ -62,7 +63,7 @@ Error :: struct {
 	error: string,
 }
 
-fail :: proc(res: ^web.Response, status: web.Status, message: string) {
+fail :: proc(res: ^web.Response, status: http.Status, message: string) {
 	web.response_json_status(res, status, Error{error = message})
 }
 
@@ -76,8 +77,8 @@ main :: proc() {
 	web.router_init(&router)
 
 	// cross-cutting concerns come from the middlewares package
-	web.router_use(&router, middlewares.middleware_request_id, nil)
-	web.router_use(&router, middlewares.middleware_logger, nil)
+	web.router_use(&router, common.middleware_request_id, nil)
+	web.router_use(&router, common.middleware_logger, nil)
 	// unmatched paths answer in the same shape as the API handlers
 	router.not_found = not_found
 
@@ -172,7 +173,7 @@ whoami :: proc(req: ^web.Request, res: ^web.Response) {
 }
 
 login :: proc(req: ^web.Request, res: ^web.Response) {
-	web.response_set_cookie(res, web.Cookie{
+	web.response_set_cookie(res, http.Cookie{
 		name      = "token",
 		value     = "xyz",
 		path      = "/",

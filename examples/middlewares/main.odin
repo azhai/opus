@@ -3,7 +3,7 @@ package main
 /*
 Purpose-built middleware: auth, form parsing, Range/ETag, compression and
 SSE, each attached to the one route that needs it instead of the whole
-router. They live in the `web/middlewares` subpackage, so this example
+router. They live in the `middlewares` package tree, so this example
 imports both.
 
 	odin run examples/middlewares            # :8080
@@ -23,18 +23,24 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "../../web"
-import "../../web/middlewares"
+import "../../middlewares/range"
+import "../../middlewares/form"
+import "../../middlewares/coding"
+import mwupload "../../middlewares/upload"
+import "../../middlewares/common"
+import "../../middlewares/auth"
+import "../../http"
 
 // Middleware configs outlive the server, so they live at file scope: a stack
 // temporary would dangle as soon as main's scope changed.
-admin_cfg := middlewares.Basic_Auth_Config {
+admin_cfg := auth.Basic_Auth_Config {
 	username = "admin",
 	password = "secret",
 	realm    = "admin",
 }
 
-key_cfg := middlewares.API_Key_Config {
-	tokens = []middlewares.Auth_Token{middlewares.Auth_Token{token = "key-live-1", name = "mobile-app"}},
+key_cfg := auth.API_Key_Config {
+	tokens = []auth.Auth_Token{auth.Auth_Token{token = "key-live-1", name = "mobile-app"}},
 	header = "X-API-Key",
 }
 
@@ -45,20 +51,20 @@ form_cfg := web.Form_Config {
 
 // Uploads above 64 KiB per part are written out while the body is still
 // arriving, so the size of the file is not the size of the process.
-upload_cfg := middlewares.Upload_Config {
+upload_cfg := mwupload.Upload_Config {
 	dir      = "./uploads",
 	stream   = true,
 	threshold = 64 << 10,
 	max_file_bytes = 512 << 20,
 }
 
-range_cfg := middlewares.Range_Config {
+range_cfg := range.Range_Config {
 	etag = true, // content hash + If-None-Match -> 304
 }
 
 // "compress anything over 256 bytes on this route" - the filter's own
 // default threshold stays in force everywhere else.
-gzip_cfg := middlewares.Gzip_Config {
+coding_cfg := coding.Coding_Config {
 	min_size = 256,
 }
 
@@ -71,7 +77,7 @@ index :: proc(req: ^web.Request, res: ^web.Response) {
   GET  /api/keys     API key in X-API-Key (middleware_api_key)
   POST /submit       form parser, urlencoded or multipart (middleware_form)
   POST /upload       upload spooled to disk as it arrives (middleware_upload)
-  GET  /big          gzip above 256 bytes (middleware_gzip)
+  GET  /big          gzip above 256 bytes (middleware_coding)
   GET  /events       server-sent events (sse_*)
 
 The access log line for each request carries the authenticated principal, so
@@ -104,13 +110,13 @@ big :: proc(req: ^web.Request, res: ^web.Response) {
 
 admin :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [128]byte
-	msg := fmt.bprintf(buf[:], "admin area, user=%v\n", middlewares.request_principal(req))
+	msg := fmt.bprintf(buf[:], "admin area, user=%v\n", auth.request_principal(req))
 	web.response_text(res, .OK, msg)
 }
 
 keys :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [128]byte
-	msg := fmt.bprintf(buf[:], "key accepted for %v\n", middlewares.request_principal(req))
+	msg := fmt.bprintf(buf[:], "key accepted for %v\n", auth.request_principal(req))
 	web.response_text(res, .OK, msg)
 }
 
@@ -119,7 +125,10 @@ submit :: proc(req: ^web.Request, res: ^web.Response) {
 	name, _ := web.request_form_value(req, "name")
 	web.response_write_string(res, fmt.bprintf(buf[:], "name=%v\n", name))
 	if f, ok := web.request_file(req, "avatar"); ok {
-		web.response_write_string(res, fmt.bprintf(buf[:], "file=%v type=%v bytes=%v\n", f.filename, f.content_type, len(f.data)))
+		// `size` is the part size even when the body was spooled to disk by the
+		// upload hook (this server installs one), in which case `data` is empty
+		// by design and `len(f.data)` would read 0.
+		web.response_write_string(res, fmt.bprintf(buf[:], "file=%v type=%v bytes=%v\n", f.filename, f.content_type, f.size))
 	}
 	if len(req.files) == 0 {
 		web.response_write_string(res, "no file uploaded\n")
@@ -130,7 +139,7 @@ submit :: proc(req: ^web.Request, res: ^web.Response) {
 // is already a file, so `data` is empty and the bytes were never all resident.
 upload :: proc(req: ^web.Request, res: ^web.Response) {
 	buf: [256]byte
-	u, ok := middlewares.request_upload(req, "doc")
+	u, ok := mwupload.request_upload(req, "doc")
 	if !ok {
 		web.response_error(res, .Bad_Request, "expected a file part named doc\n")
 		return
@@ -174,9 +183,9 @@ main :: proc() {
 	router: web.Router
 	web.router_init(&router)
 	// router-wide chain: cross-cutting concerns only
-	web.router_use(&router, middlewares.middleware_request_id)
-	web.router_use(&router, middlewares.middleware_logger)
-	web.router_use(&router, middlewares.middleware_secure_headers)
+	web.router_use(&router, common.middleware_request_id)
+	web.router_use(&router, common.middleware_logger)
+	web.router_use(&router, common.middleware_secure_headers)
 
 	// routes are heap-allocated, so the pointers stay valid while the rest of
 	// the table is registered; attaching in a second pass keeps the two
@@ -185,24 +194,24 @@ main :: proc() {
 	report_route := web.router_get(&router, "/report.csv", report)
 	admin_route := web.router_get(&router, "/admin", admin)
 	keys_route := web.router_get(&router, "/api/keys", keys)
-	submit_route := web.router_add(&router, web.Method.Post, "/submit", submit)
-	upload_route := web.router_add(&router, web.Method.Post, "/upload", upload)
+	submit_route := web.router_add(&router, http.Method.Post, "/submit", submit)
+	upload_route := web.router_add(&router, http.Method.Post, "/upload", upload)
 	big_route := web.router_get(&router, "/big", big)
 	web.router_get(&router, "/events", events)
 
 	// route-local middleware, one purpose per route
-	web.router_use_route(report_route, middlewares.middleware_range, &range_cfg)
-	web.router_use_route(admin_route, middlewares.middleware_basic_auth, &admin_cfg)
-	web.router_use_route(keys_route, middlewares.middleware_api_key, &key_cfg)
-	web.router_use_route(submit_route, middlewares.middleware_form, &form_cfg)
-	web.router_use_route(upload_route, middlewares.middleware_upload, &upload_cfg)
-	web.router_use_route(big_route, middlewares.middleware_gzip, &gzip_cfg)
+	web.router_use_route(report_route, range.middleware_range, &range_cfg)
+	web.router_use_route(admin_route, auth.middleware_basic_auth, &admin_cfg)
+	web.router_use_route(keys_route, auth.middleware_api_key, &key_cfg)
+	web.router_use_route(submit_route, form.middleware_form, &form_cfg)
+	web.router_use_route(upload_route, mwupload.middleware_upload, &upload_cfg)
+	web.router_use_route(big_route, coding.middleware_coding, &coding_cfg)
 
 	srv.handler = web.router_handle
 	srv.user_ptr = &router
 	// the body has to be diverted before the route is known: the hook runs on
 	// every request head and only acts on multipart bodies
-	srv.on_head = middlewares.upload_stream_hook
+	srv.on_head = mwupload.upload_stream_hook
 	srv.on_head_ud = &upload_cfg
 	fmt.printf("middleware demo on http://%v\n", address)
 	if err := web.server_run(&srv); err != nil {

@@ -1,6 +1,7 @@
 package web
 
 import "core:encoding/json"
+import "../http"
 
 /*
 JSON responses, backed by core:encoding/json.
@@ -33,7 +34,7 @@ response_json :: proc(w: ^Response, v: any) -> json.Marshal_Error {
 
 // response_json_status is response_json with the status set in the same
 // call (Echo's c.JSON(code, i), Fiber's c.Status(...).JSON(...)).
-response_json_status :: proc(w: ^Response, status: Status, v: any) -> json.Marshal_Error {
+response_json_status :: proc(w: ^Response, status: http.Status, v: any) -> json.Marshal_Error {
 	w.status = status
 	return response_json(w, v)
 }

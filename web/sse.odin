@@ -2,6 +2,8 @@ package web
 
 import "core:mem"
 import "core:net"
+import "../buffer"
+import "../http"
 
 /*
 Server-sent events (and the framing they need) over a hijacked connection.
@@ -47,8 +49,8 @@ Sse_Writer :: struct {
 	socket:    net.TCP_Socket,
 	ok:        bool,
 	allocator: mem.Allocator,
-	payload:   Buf,
-	frame:     Buf,
+	payload:   buffer.Buf,
+	frame:     buffer.Buf,
 }
 
 // sse_last_event_id returns the reconnection cursor the client sent
@@ -60,7 +62,7 @@ sse_last_event_id :: proc(req: ^Request) -> string {
 	if !ok {
 		return ""
 	}
-	return trim_ows(v)
+	return http.trim_ows(v)
 }
 
 /*
@@ -72,38 +74,38 @@ chunked framing so the client sees a well-formed end of body.
 cookie); Content-Type, Cache-Control and Transfer-Encoding are owned here
 and a duplicate of those is skipped.
 */
-sse_start :: proc(res: ^Response, extra_headers: []Header = nil, allocator := context.allocator) -> (w: Sse_Writer, ok: bool) {
+sse_start :: proc(res: ^Response, extra_headers: []http.Header = nil, allocator := context.allocator) -> (w: Sse_Writer, ok: bool) {
 	socket, hijacked := response_hijack(res)
 	if !hijacked {
 		return {}, false
 	}
 	w = Sse_Writer{socket = socket, ok = true, allocator = allocator}
-	buf_init(&w.payload, allocator)
-	buf_init(&w.frame, allocator)
+	buffer.buf_init(&w.payload, allocator)
+	buffer.buf_init(&w.frame, allocator)
 
-	b: Buf
-	buf_init(&b, allocator)
-	defer buf_destroy(&b)
-	buf_append_string(&b, "HTTP/1.1 200 OK\r\n")
-	buf_append_string(&b, "Content-Type: text/event-stream\r\n")
-	buf_append_string(&b, "Cache-Control: no-cache, no-transform\r\n")
-	buf_append_string(&b, "X-Accel-Buffering: no\r\n")
-	buf_append_string(&b, "Transfer-Encoding: chunked\r\n")
+	b: buffer.Buf
+	buffer.buf_init(&b, allocator)
+	defer buffer.buf_destroy(&b)
+	buffer.buf_append_string(&b, "HTTP/1.1 200 OK\r\n")
+	buffer.buf_append_string(&b, "Content-Type: " + http.SSE_MEDIA_TYPE + "\r\n")
+	buffer.buf_append_string(&b, "Cache-Control: no-cache, no-transform\r\n")
+	buffer.buf_append_string(&b, "X-Accel-Buffering: no\r\n")
+	buffer.buf_append_string(&b, "Transfer-Encoding: chunked\r\n")
 	for h in extra_headers {
 		switch {
-		case eq_ignore_case(h.key, "Content-Type"),
-		     eq_ignore_case(h.key, "Cache-Control"),
-		     eq_ignore_case(h.key, "Transfer-Encoding"):
+		case http.eq_ignore_case(h.key, "Content-Type"),
+		     http.eq_ignore_case(h.key, "Cache-Control"),
+		     http.eq_ignore_case(h.key, "Transfer-Encoding"):
 			continue
 		}
-		buf_append_string(&b, h.key)
-		buf_append_string(&b, ": ")
-		buf_append_string(&b, h.value)
-		buf_append_string(&b, "\r\n")
+		buffer.buf_append_string(&b, h.key)
+		buffer.buf_append_string(&b, ": ")
+		buffer.buf_append_string(&b, h.value)
+		buffer.buf_append_string(&b, "\r\n")
 	}
-	buf_append_string(&b, "\r\n")
+	buffer.buf_append_string(&b, "\r\n")
 
-	if !stream_write(socket, buf_slice(&b)) {
+	if !stream_write(socket, buffer.buf_slice(&b)) {
 		sse_release(&w)
 		net.close(socket)
 		return {}, false
@@ -115,8 +117,8 @@ sse_start :: proc(res: ^Response, extra_headers: []Header = nil, allocator := co
 // sse_close also has to end the HTTP response, which only happens once the
 // head was written successfully.
 sse_release :: proc(w: ^Sse_Writer) {
-	buf_destroy(&w.payload)
-	buf_destroy(&w.frame)
+	buffer.buf_destroy(&w.payload)
+	buffer.buf_destroy(&w.frame)
 	w.payload = {}
 	w.frame = {}
 }
@@ -133,38 +135,10 @@ sse_event :: proc(w: ^Sse_Writer, data: string, event := "", id := "") -> bool {
 		return false
 	}
 	p := &w.payload
-	buf_reset(p)
+	buffer.buf_reset(p)
 
-	if len(event) > 0 {
-		buf_append_string(p, "event: ")
-		buf_append_string(p, event)
-		buf_append_byte(p, '\n')
-	}
-	if len(id) > 0 {
-		buf_append_string(p, "id: ")
-		buf_append_string(p, id)
-		buf_append_byte(p, '\n')
-	}
-	rest := data
-	for {
-		nl := string_index_byte(rest, '\n')
-		line := rest
-		if nl >= 0 {
-			line = rest[:nl]
-			rest = rest[nl + 1:]
-		} else {
-			rest = ""
-		}
-		buf_append_string(p, "data: ")
-		buf_append_string(p, line)
-		buf_append_byte(p, '\n')
-		if nl < 0 {
-			break
-		}
-	}
-	buf_append_byte(p, '\n')
-
-	return sse_frame(w, buf_slice(p))
+	http.sse_event_payload(p, data, event, id)
+	return sse_frame(w, buffer.buf_slice(p))
 }
 
 // sse_comment sends a comment line. Clients ignore it; it keeps proxies and
@@ -174,11 +148,9 @@ sse_comment :: proc(w: ^Sse_Writer, text: string) -> bool {
 		return false
 	}
 	p := &w.payload
-	buf_reset(p)
-	buf_append_string(p, ": ")
-	buf_append_string(p, text)
-	buf_append_string(p, "\n\n")
-	return sse_frame(w, buf_slice(p))
+	buffer.buf_reset(p)
+	http.sse_comment_payload(p, text)
+	return sse_frame(w, buffer.buf_slice(p))
 }
 
 // sse_retry tells the client how long to wait before reconnecting.
@@ -187,14 +159,9 @@ sse_retry :: proc(w: ^Sse_Writer, milliseconds: int) -> bool {
 		return false
 	}
 	p := &w.payload
-	buf_reset(p)
-	buf_append_string(p, "retry: ")
-	// formatted in place: int_to_string would hand back a string that
-	// nothing frees, once per keep-alive annotation
-	num: [24]byte
-	buf_append(p, num[:i64_to_buf(num[:], i64(milliseconds))])
-	buf_append_string(p, "\n\n")
-	return sse_frame(w, buf_slice(p))
+	buffer.buf_reset(p)
+	http.sse_retry_payload(p, milliseconds)
+	return sse_frame(w, buffer.buf_slice(p))
 }
 
 // sse_closed probes the peer without blocking (a closed tab sends FIN).
@@ -212,7 +179,7 @@ sse_close :: proc(w: ^Sse_Writer) {
 		return
 	}
 	w.ok = false
-	terminator := "0\r\n\r\n"
+	terminator := http.CHUNKED_TERMINATOR
 	_ = stream_write(w.socket, transmute([]byte) terminator)
 	net.close(w.socket)
 	sse_release(w)
@@ -225,12 +192,9 @@ sse_frame :: proc(w: ^Sse_Writer, payload: []byte) -> bool {
 		return w.ok
 	}
 	b := &w.frame
-	buf_reset(b)
-	write_hex(b, len(payload))
-	buf_append_string(b, "\r\n")
-	buf_append(b, payload)
-	buf_append_string(b, "\r\n")
-	if !stream_write(w.socket, buf_slice(b)) {
+	buffer.buf_reset(b)
+	http.chunked_frame(b, payload)
+	if !stream_write(w.socket, buffer.buf_slice(b)) {
 		w.ok = false
 		return false
 	}

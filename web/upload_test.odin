@@ -18,6 +18,7 @@ import "core:strings"
 import "core:thread"
 import "core:testing"
 import "core:time"
+import "../http"
 
 // ---------------------------------------------------------------------------
 // probe: what the handler saw
@@ -411,7 +412,7 @@ test_integration_upload_memory :: proc(t: ^testing.T) {
 test_integration_upload_chunked: the same upload sent with
 Transfer-Encoding: chunked. This is the path where the decoder releases each
 chunk to the sink instead of accumulating the body, so it exercises
-chunked_try_decode's emit mode.
+http.chunked_decode's emit mode.
 */
 @(test)
 test_integration_upload_chunked :: proc(t: ^testing.T) {

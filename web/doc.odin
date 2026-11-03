@@ -30,8 +30,10 @@ What you get:
     conflicting `Content-Length` are answered with 400 instead of being
     resolved silently. The same rules apply to upstream responses, which
     become 502 rather than being relayed.
-  - A response builder, a `Filter` chain (chunked encoding and
-    gzip/deflate content coding are built in and registered by default),
+  - A response builder, a `Filter` chain (chunked encoding and gzip/deflate
+    content coding are built in and registered by default; the coding rules
+    themselves - `Accept-Encoding` negotiation, which media types are worth
+    coding - are in `http.negotiate_coding`, and the codecs in `codecs`),
     a router with `:param` / `*` patterns plus a Lua-pattern subset
     (`(%w+)`, `(%d+)`, `[a-z]`, `.-`, ...) and an Odin-native middleware
     chain - router-wide or attached to a single route with
@@ -44,10 +46,12 @@ What you get:
     `request_client_ip`, `request_content_type`, `request_is_ajax`,
     `request_accepts`, `request_json`, plus `response_json_status`,
     `response_error`, `response_download` and `response_clear_cookie`.
-  - Middleware, split by purpose and living in the `web/middlewares`
-    subpackage (a parent package cannot import its child, so state that a
-    middleware owns travels on the request as `Request.session` /
-    `Request.uploads`):
+  - Middleware, split by purpose into one package per concern under the
+    top-level `middlewares/` tree (`common`, `auth`, `session`, `totp`,
+    `form`, `upload`, `static`, `redirect`, `range`, `coding`, on top of
+    `token` for the base64url + HMAC primitives). The middleware packages
+    import `web`, never the other way round, so state that a middleware owns
+    travels on the request as `Request.session` / `Request.uploads`:
       request id, access log (with the authenticated principal), CORS,
       security headers, no-cache, no-buffer for streams;
       auth - basic, bearer tokens, API keys and HS256 JWTs, all comparing
@@ -70,13 +74,17 @@ What you get:
       range - Range and ETag over a body an ordinary handler produced, so
       a handler that writes the whole representation still answers 206,
       416 and 304 correctly;
-      gzip - opt a single response into or out of content coding.
+      coding - opt a single response into or out of content coding, in the
+      package that also names the filter's response fields (`Response.coding`,
+      `Response.coding_min_size`) so the two are read together.
     Configured ones take their settings through `Middleware.ud`, since
     Odin has no closures.
   - Server-sent events: `sse_start` / `sse_event` / `sse_comment` /
     `sse_retry` / `sse_last_event_id` / `sse_close` hijack the connection
     and speak chunked framing, so a handler emits events instead of bytes.
-    The writer owns reusable buffers, so an event costs no allocation.
+    The writer owns reusable buffers, so an event costs no allocation. The
+    wire format itself is `http.sse_event_payload` (and `http.chunked_frame`
+    for the framing), shared with `Hub` so both produce identical bytes.
   - Range requests (RFC 7233): single ranges stream zero-copy via
     `sendfile` with an offset, multiple ranges answer as
     `multipart/byteranges`, unsatisfiable ranges get 416 with a
@@ -133,6 +141,26 @@ What you get:
   - Per-connection arena allocation: all per-request scratch memory is
     freed in one shot between keep-alive requests.
 
+Package layout: this package is the runtime - the connection state machine
+and everything that holds a `Conn` (proxy, TLS, async continuations, the
+upload sink, filters, router, static files). Pure layers live beside it in
+their own packages at the repository root: `buffer` (bytes, strings, integer
+formatting), `http` (methods, status, dates, ranges, cookies, chunked and
+urlencoded framing, the SSE wire format, `Accept-Encoding` negotiation),
+`codecs` (deflate/gzip), `multipart` (the incremental parser) and `pattern`
+(the Lua-pattern subset used for route patterns). Each has its own tests and
+imports nothing from `web`. The dependency direction is one-way
+(`buffer` <- `http` <- {`web`, `middlewares`}), because Odin forbids import
+cycles; state that a subsystem needs on the connection is carried in
+`Conn`'s own fields rather than through a shared module.
+
+What stays in `web` is decided by one rule: does it mutate a `Conn` (or the
+`Request`/`Response` that point at one)? A proxy relay, a TLS handshake, an
+async continuation, an upload sink, a response filter, a route table and a
+static sendfile all write into connection state, so they cannot leave without
+taking the connection with them. Everything that can be answered from bytes
+alone already lives outside.
+
 Not included (deliberately): HTTP/2, a config-file language, dynamic
 module loading, multi-process management (hand it to a supervisor).
 
@@ -141,7 +169,8 @@ Quick start:
 	package main
 
 	import "core:fmt"
-	import "web"
+	// Needs -collection:opus=<path to opus>, or use a relative path instead.
+	import "opus:web"
 
 	hello :: proc(req: ^web.Request, res: ^web.Response) {
 		web.response_status(res, .OK)

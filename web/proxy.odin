@@ -4,6 +4,8 @@ import "core:mem"
 import "core:nbio"
 import "core:net"
 import "core:time"
+import "../buffer"
+import "../http"
 
 /*
 Proxy forwards requests to upstream HTTP/1.1 servers and streams the
@@ -111,12 +113,12 @@ proxy_init :: proc(p: ^Proxy, upstreams: []string, allocator := context.allocato
 	for u in upstreams {
 		ep, ok := net.parse_endpoint(u)
 		if !ok {
-			log_error("web: invalid upstream address: %q", u)
+			buffer.log_error("web: invalid upstream address: %q", u)
 			return false
 		}
 		append(&p.upstreams, Upstream {
 			endpoint = ep,
-			host     = clone_string(u, allocator),
+			host     = buffer.clone_string(u, allocator),
 			weight   = 1,
 			state    = .Healthy,
 		})
@@ -148,7 +150,7 @@ is reported here so the omission is noticeable.
 */
 proxy_destroy :: proc(p: ^Proxy) {
 	if p.pool != nil && len(p.pool) > 0 {
-		log_error("web: proxy_destroy with %v idle upstream connection(s); call proxy_close_idle on the event loop thread", len(p.pool))
+		buffer.log_error("web: proxy_destroy with %v idle upstream connection(s); call proxy_close_idle on the event loop thread", len(p.pool))
 	}
 	if p.pool != nil {
 		delete(p.pool)
@@ -248,7 +250,7 @@ proxy_serve :: proc(req: ^Request, res: ^Response) {
 // proxy_method_retryable reports whether a request may be replayed on a
 // fresh connection when a pooled one turns out to be dead. Only methods
 // without side effects qualify.
-proxy_method_retryable :: proc(m: Method) -> bool {
+proxy_method_retryable :: proc(m: http.Method) -> bool {
 	return m == .Get || m == .Head || m == .Options
 }
 
@@ -288,20 +290,20 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 	}
 
 	b := &c.proxy_req
-	buf_reset(b)
-	buf_append_string(b, method_string(req.method))
-	buf_append_byte(b, ' ')
-	buf_append_string(b, target)
+	buffer.buf_reset(b)
+	buffer.buf_append_string(b, http.method_string(req.method))
+	buffer.buf_append_byte(b, ' ')
+	buffer.buf_append_string(b, target)
 	if len(req.query) > 0 {
-		buf_append_byte(b, '?')
-		buf_append_string(b, req.query)
+		buffer.buf_append_byte(b, '?')
+		buffer.buf_append_string(b, req.query)
 	}
-	buf_append_string(b, " HTTP/1.1\r\n")
+	buffer.buf_append_string(b, " HTTP/1.1\r\n")
 
 	// Host is rewritten to the upstream
-	buf_append_string(b, "Host: ")
-	buf_append_string(b, host)
-	buf_append_string(b, "\r\n")
+	buffer.buf_append_string(b, "Host: ")
+	buffer.buf_append_string(b, host)
+	buffer.buf_append_string(b, "\r\n")
 
 	// pass client headers through, minus hop-by-hop and framing headers
 	// (Content-Length is re-emitted below if there is a body)
@@ -310,49 +312,49 @@ proxy_serve_root :: proc(p: ^Proxy, req: ^Request, res: ^Response) {
 		if is_hop_by_hop_header(h.key) {
 			continue
 		}
-		if eq_ignore_case(h.key, "Host") ||
-			eq_ignore_case(h.key, "Content-Length") ||
-			eq_ignore_case(h.key, "X-Forwarded-For") {
+		if http.eq_ignore_case(h.key, "Host") ||
+			http.eq_ignore_case(h.key, "Content-Length") ||
+			http.eq_ignore_case(h.key, "X-Forwarded-For") {
 			continue
 		}
-		buf_append_string(b, h.key)
-		buf_append_string(b, ": ")
-		buf_append_string(b, h.value)
-		buf_append_string(b, "\r\n")
+		buffer.buf_append_string(b, h.key)
+		buffer.buf_append_string(b, ": ")
+		buffer.buf_append_string(b, h.value)
+		buffer.buf_append_string(b, "\r\n")
 	}
 
 	client_ip := net.address_to_string_allocator(c.remote.address, conn_scratch(c))
-	buf_append_string(b, "X-Forwarded-For: ")
+	buffer.buf_append_string(b, "X-Forwarded-For: ")
 	if has_xff {
-		buf_append_string(b, xff)
-		buf_append_string(b, ", ")
+		buffer.buf_append_string(b, xff)
+		buffer.buf_append_string(b, ", ")
 	}
-	buf_append_string(b, client_ip)
-	buf_append_string(b, "\r\n")
-	buf_append_string(b, "X-Forwarded-Proto: http\r\n")
-	buf_append_string(b, "Via: 1.1 ")
-	buf_append_string(b, SERVER_NAME)
-	buf_append_string(b, "\r\n")
+	buffer.buf_append_string(b, client_ip)
+	buffer.buf_append_string(b, "\r\n")
+	buffer.buf_append_string(b, "X-Forwarded-Proto: http\r\n")
+	buffer.buf_append_string(b, "Via: 1.1 ")
+	buffer.buf_append_string(b, SERVER_NAME)
+	buffer.buf_append_string(b, "\r\n")
 
 	if p.keep_alive {
-		buf_append_string(b, "Connection: keep-alive\r\n")
+		buffer.buf_append_string(b, "Connection: keep-alive\r\n")
 	} else {
-		buf_append_string(b, "Connection: close\r\n")
+		buffer.buf_append_string(b, "Connection: close\r\n")
 	}
 	if len(req.body) > 0 {
-		buf_append_string(b, "Content-Length: ")
+		buffer.buf_append_string(b, "Content-Length: ")
 		// formatted in place: int_to_string would hand back a string that
 		// nothing frees, once per proxied request with a body
 		num: [24]byte
-		buf_append(b, num[:i64_to_buf(num[:], i64(len(req.body)))])
-		buf_append_string(b, "\r\n")
+		buffer.buf_append(b, num[:buffer.i64_to_buf(num[:], i64(len(req.body)))])
+		buffer.buf_append_string(b, "\r\n")
 	}
-	buf_append_string(b, "\r\n")
+	buffer.buf_append_string(b, "\r\n")
 	if len(req.body) > 0 {
-		buf_append(b, req.body)
+		buffer.buf_append(b, req.body)
 	}
 
-	buf_reset(&c.proxy_buf)
+	buffer.buf_reset(&c.proxy_buf)
 	c.proxy_state = .Head
 	c.proxy_framing = .None
 	c.proxy_scan = {}
@@ -386,7 +388,7 @@ proxy_start_dial :: proc(c: ^Conn, up: net.Endpoint) {
 proxy_send_request :: proc(c: ^Conn) {
 	c.proxy_op = nbio.send_poly(
 		c.proxy_sock,
-		[][]byte{buf_slice(&c.proxy_req)},
+		[][]byte{buffer.buf_slice(&c.proxy_req)},
 		c,
 		on_proxy_sent,
 		all = true,
@@ -404,7 +406,7 @@ on_proxy_dial :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.dial.err != nil {
-		log_debug("web: proxy dial failed: %v", op.dial.err)
+		buffer.log_debug("web: proxy dial failed: %v", op.dial.err)
 		if c.proxy_cfg != nil {
 			proxy_note_failure(c.proxy_cfg, c.proxy_upstream)
 		}
@@ -428,7 +430,7 @@ on_proxy_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: proxy send failed: %v", op.send.err)
+		buffer.log_debug("web: proxy send failed: %v", op.send.err)
 		if se, ok := op.send.err.(net.TCP_Send_Error); ok && se == .Timeout {
 			proxy_upstream_failed(c, .Gateway_Timeout, "504 upstream write timeout\n")
 		} else {
@@ -444,7 +446,7 @@ proxy_recv_arm :: proc(c: ^Conn) {
 		// Defensive: every caller should be inside an active proxy request,
 		// but arming a read needs the proxy config for its timeout, so a
 		// late callback from a finished request must not reach nbio.
-		log_debug("web: proxy_recv_arm without an active request; closing")
+		buffer.log_debug("web: proxy_recv_arm without an active request; closing")
 		conn_close(c)
 		return
 	}
@@ -468,7 +470,7 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 			if c.proxy_client_started {
 				// the client already has a partial body: all we can do is
 				// cut the connection so it sees a truncated response
-				log_debug("web: proxy upstream timed out mid-stream")
+				buffer.log_debug("web: proxy upstream timed out mid-stream")
 				conn_close(c)
 				return
 			}
@@ -483,7 +485,7 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 				return
 			}
 		}
-		log_debug("web: proxy recv failed: %v", op.recv.err)
+		buffer.log_debug("web: proxy recv failed: %v", op.recv.err)
 		proxy_upstream_failed(c, .Bad_Gateway, "502 upstream read failed\n")
 		return
 	}
@@ -501,13 +503,13 @@ on_proxy_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 		proxy_upstream_failed(c, .Bad_Gateway, "502 upstream closed early\n")
 		return
 	}
-	buf_append(&c.proxy_buf, c.rbuf[:n])
+	buffer.buf_append(&c.proxy_buf, c.rbuf[:n])
 	proxy_advance(c)
 }
 
 // proxy_upstream_failed tears the upstream down and either retries on a
 // fresh connection (a pooled one that was already dead) or answers 502/504.
-proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
+proxy_upstream_failed :: proc(c: ^Conn, status: http.Status, msg: string) {
 	if c.proxy_cfg != nil {
 		// passive health: every failed attempt counts, including the one that
 		// triggers the retry below - a retry that succeeds clears the streak
@@ -518,11 +520,11 @@ proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
 		nbio.close(c.proxy_sock)
 		c.proxy_open = false
 	}
-	if c.proxy_retryable && !c.proxy_client_started && buf_len(&c.proxy_buf) == 0 {
+	if c.proxy_retryable && !c.proxy_client_started && buffer.buf_len(&c.proxy_buf) == 0 {
 		// nothing of the response made it out: a stale keep-alive
 		// connection is the likely culprit, so dial once for real
 		c.proxy_retryable = false
-		log_debug("web: proxy retrying %v on a fresh connection", c.req.path)
+		buffer.log_debug("web: proxy retrying %v on a fresh connection", c.req.path)
 		proxy_start_dial(c, c.proxy_cfg.upstreams[c.proxy_upstream].endpoint)
 		return
 	}
@@ -537,10 +539,10 @@ proxy_upstream_failed :: proc(c: ^Conn, status: Status, msg: string) {
 proxy_advance :: proc(c: ^Conn) {
 	if c.proxy_state == .Head {
 		for {
-			data := buf_slice(&c.proxy_buf)
-			idx := bytes_index(data, "\r\n\r\n")
+			data := buffer.buf_slice(&c.proxy_buf)
+			idx := buffer.bytes_index(data, "\r\n\r\n")
 			if idx < 0 {
-				if buf_len(&c.proxy_buf) >= c.server.max_header_size {
+				if buffer.buf_len(&c.proxy_buf) >= c.server.max_header_size {
 					proxy_fail(c, .Bad_Gateway, "502 upstream head too large\n")
 				}
 				return // need more data
@@ -551,7 +553,7 @@ proxy_advance :: proc(c: ^Conn) {
 				c.proxy_head_len = head_len
 			case .Skip:
 				// 1xx informational response: drop it and keep looking
-				buf_consume(&c.proxy_buf, head_len)
+				buffer.buf_consume(&c.proxy_buf, head_len)
 				continue
 			case .Malformed:
 				proxy_fail(c, .Bad_Gateway, "502 malformed upstream response\n")
@@ -596,7 +598,7 @@ proxy_stream_begin :: proc(c: ^Conn) {
 	// Serialize first, then drop the head bytes: header values are views
 	// into proxy_buf and only survive until response_build has copied them.
 	response_build(w, &c.out, conn_scratch(c))
-	buf_consume(&c.proxy_buf, c.proxy_head_len)
+	buffer.buf_consume(&c.proxy_buf, c.proxy_head_len)
 	c.proxy_client_started = true
 	proxy_send_out(c)
 }
@@ -615,7 +617,7 @@ on_proxy_stream_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: proxy client send failed: %v", op.send.err)
+		buffer.log_debug("web: proxy client send failed: %v", op.send.err)
 		conn_close(c)
 		return
 	}
@@ -645,7 +647,7 @@ proxy_pump :: proc(c: ^Conn) {
 		return
 	}
 	proxy_drain_body(c)
-	if buf_len(&c.out) > 0 {
+	if buffer.buf_len(&c.out) > 0 {
 		proxy_send_out(c)
 		return
 	}
@@ -663,16 +665,16 @@ proxy_pump :: proc(c: ^Conn) {
 // proxy_drain_body moves whatever body bytes are buffered into the client
 // output buffer, tracking the framing so completion is detected exactly.
 proxy_drain_body :: proc(c: ^Conn) {
-	for buf_len(&c.proxy_buf) > 0 && !c.proxy_body_done {
-		data := buf_slice(&c.proxy_buf)
+	for buffer.buf_len(&c.proxy_buf) > 0 && !c.proxy_body_done {
+		data := buffer.buf_slice(&c.proxy_buf)
 		switch c.proxy_framing {
 		case .Content_Length:
 			n := len(data)
 			if n > c.proxy_remaining {
 				n = c.proxy_remaining
 			}
-			buf_append(&c.out, data[:n])
-			buf_consume(&c.proxy_buf, n)
+			buffer.buf_append(&c.out, data[:n])
+			buffer.buf_consume(&c.proxy_buf, n)
 			c.proxy_remaining -= n
 			if c.proxy_remaining <= 0 {
 				c.proxy_body_done = true
@@ -681,8 +683,8 @@ proxy_drain_body :: proc(c: ^Conn) {
 			// relay the framing bytes verbatim; the scanner only counts
 			consumed, done, bad := proxy_chunk_scan_step(&c.proxy_scan, data)
 			if consumed > 0 {
-				buf_append(&c.out, data[:consumed])
-				buf_consume(&c.proxy_buf, consumed)
+				buffer.buf_append(&c.out, data[:consumed])
+				buffer.buf_consume(&c.proxy_buf, consumed)
 			}
 			if done {
 				c.proxy_body_done = true
@@ -700,14 +702,14 @@ proxy_drain_body :: proc(c: ^Conn) {
 				return // need more data
 			}
 		case .Reframe_Chunked:
-			write_hex(&c.out, len(data))
-			buf_append_string(&c.out, "\r\n")
-			buf_append(&c.out, data)
-			buf_append_string(&c.out, "\r\n")
-			buf_consume(&c.proxy_buf, len(data))
+			buffer.write_hex(&c.out, len(data))
+			buffer.buf_append_string(&c.out, "\r\n")
+			buffer.buf_append(&c.out, data)
+			buffer.buf_append_string(&c.out, "\r\n")
+			buffer.buf_consume(&c.proxy_buf, len(data))
 		case .Raw_To_Close:
-			buf_append(&c.out, data)
-			buf_consume(&c.proxy_buf, len(data))
+			buffer.buf_append(&c.out, data)
+			buffer.buf_consume(&c.proxy_buf, len(data))
 		case .None, .Until_Close:
 			c.proxy_body_done = true
 		}
@@ -718,7 +720,7 @@ proxy_drain_body :: proc(c: ^Conn) {
 // release, and back into the normal write/keep-alive path.
 proxy_body_finish :: proc(c: ^Conn) {
 	if c.proxy_framing == .Reframe_Chunked {
-		buf_append_string(&c.out, "0\r\n\r\n")
+		buffer.buf_append_string(&c.out, "0\r\n\r\n")
 	}
 	if c.proxy_cfg != nil {
 		proxy_note_success(c.proxy_cfg, c.proxy_upstream)
@@ -770,7 +772,7 @@ proxy_release_upstream :: proc(c: ^Conn) {
 
 // proxy_fail answers the client with a gateway error and closes the
 // connection after the write.
-proxy_fail :: proc(c: ^Conn, status: Status, msg: string) {
+proxy_fail :: proc(c: ^Conn, status: http.Status, msg: string) {
 	if c.proxy_open {
 		nbio.close(c.proxy_sock)
 		c.proxy_open = false
@@ -825,21 +827,21 @@ Head_Parse_Result :: enum {
 proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 	w := &c.res
 
-	line_end := string_index(head, "\r\n")
+	line_end := http.string_index(head, "\r\n")
 	if line_end <= 0 {
 		return .Malformed
 	}
 	line := head[:line_end]
 
-	sp1 := string_index_byte(line, ' ')
+	sp1 := http.string_index_byte(line, ' ')
 	if sp1 <= 0 {
 		return .Malformed
 	}
 	// HTTP/1.0 has no implicit keep-alive: unless the response asks for it,
 	// the peer closes when this response ends, so pooling the socket would
 	// hand the next request a connection that is already going away.
-	version_10 := eq_ignore_case(line[:sp1], "HTTP/1.0")
-	sp2 := string_index_byte_from(line, ' ', sp1 + 1)
+	version_10 := http.eq_ignore_case(line[:sp1], "HTTP/1.0")
+	sp2 := http.string_index_byte_from(line, ' ', sp1 + 1)
 	code_str := ""
 	reason := ""
 	if sp2 < 0 {
@@ -856,7 +858,7 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 		return .Skip
 	}
 
-	w.status = Status(u16(code))
+	w.status = http.Status(u16(code))
 	w.reason = reason
 
 	rest := head[line_end + 2:]
@@ -871,51 +873,51 @@ proxy_parse_head :: proc(c: ^Conn, head: string) -> Head_Parse_Result {
 		if len(rest) >= 2 && rest[0] == '\r' && rest[1] == '\n' {
 			break
 		}
-		nl := string_index(rest, "\r\n")
+		nl := http.string_index(rest, "\r\n")
 		if nl < 0 {
 			return .Malformed
 		}
 		hdr := rest[:nl]
 		rest = rest[nl + 2:]
-		colon := string_index_byte(hdr, ':')
+		colon := http.string_index_byte(hdr, ':')
 		if colon <= 0 {
 			return .Malformed
 		}
 		key := hdr[:colon]
-		value := trim_ows(hdr[colon + 1:])
+		value := http.trim_ows(hdr[colon + 1:])
 
-		if eq_ignore_case(key, "Transfer-Encoding") {
+		if http.eq_ignore_case(key, "Transfer-Encoding") {
 			// checked before the hop-by-hop filter: the upstream framing
 			// is relayed verbatim, so its TE header must survive
 			te_count += 1
-			te_chunked = te_chunked || contains_ignore_case(value, "chunked")
-		} else if eq_ignore_case(key, "Connection") {
+			te_chunked = te_chunked || http.contains_ignore_case(value, "chunked")
+		} else if http.eq_ignore_case(key, "Connection") {
 			// dropped, but remembered: a peer that wants to close will
 			// not be reused from the pool, and an HTTP/1.0 peer has to ask
 			// for keep-alive explicitly
-			if contains_ignore_case(value, "close") {
+			if http.contains_ignore_case(value, "close") {
 				c.proxy_upstream_close = true
-			} else if contains_ignore_case(value, "keep-alive") {
+			} else if http.contains_ignore_case(value, "keep-alive") {
 				peer_keep_alive = true
 			}
 			continue
 		} else if is_hop_by_hop_header(key) {
 			continue
-		} else if eq_ignore_case(key, "Content-Length") {
+		} else if http.eq_ignore_case(key, "Content-Length") {
 			if has_cl && value != cl_value {
 				return .Malformed // conflicting Content-Length
 			}
-			if string_index_byte(value, ',') >= 0 {
+			if http.string_index_byte(value, ',') >= 0 {
 				return .Malformed // list-valued: ambiguous
 			}
-			if n, cok := parse_int(value); cok && n >= 0 {
+			if n, cok := buffer.parse_int(value); cok && n >= 0 {
 				c.proxy_remaining = n
 				has_cl = true
 				cl_value = value
 			}
 			// pass the header through verbatim
 		}
-		append(&w.headers, Header{key = key, value = value})
+		append(&w.headers, http.Header{key = key, value = value})
 		count += 1
 		if count > MAX_HEADERS {
 			return .Malformed
@@ -974,15 +976,15 @@ parse_status_code :: proc(s: string) -> (int, bool) {
 // direction (RFC 7230 section 6.1, minus the Connection-listed ones which
 // are dropped with Connection itself).
 is_hop_by_hop_header :: proc(key: string) -> bool {
-	return eq_ignore_case(key, "Connection") ||
-		eq_ignore_case(key, "Keep-Alive") ||
-		eq_ignore_case(key, "Proxy-Connection") ||
-		eq_ignore_case(key, "Proxy-Authenticate") ||
-		eq_ignore_case(key, "Proxy-Authorization") ||
-		eq_ignore_case(key, "Te") ||
-		eq_ignore_case(key, "Trailer") ||
-		eq_ignore_case(key, "Transfer-Encoding") ||
-		eq_ignore_case(key, "Upgrade")
+	return http.eq_ignore_case(key, "Connection") ||
+		http.eq_ignore_case(key, "Keep-Alive") ||
+		http.eq_ignore_case(key, "Proxy-Connection") ||
+		http.eq_ignore_case(key, "Proxy-Authenticate") ||
+		http.eq_ignore_case(key, "Proxy-Authorization") ||
+		http.eq_ignore_case(key, "Te") ||
+		http.eq_ignore_case(key, "Trailer") ||
+		http.eq_ignore_case(key, "Transfer-Encoding") ||
+		http.eq_ignore_case(key, "Upgrade")
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1063,7 @@ proxy_chunk_scan_step :: proc(s: ^Chunk_Scan, data: []byte) -> (consumed: int, d
 				s.finished = true
 				return consumed, true, true
 			}
-			if s.remaining > MAX_CHUNK_SIZE {
+			if s.remaining > http.MAX_CHUNK_SIZE {
 				s.finished = true
 				return consumed, true, true
 			}

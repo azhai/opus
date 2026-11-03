@@ -3,6 +3,8 @@ package web
 import "core:mem"
 import "core:os"
 import "core:time"
+import "../buffer"
+import "../multipart"
 
 /*
 Uploads that outlive the request: multipart parts spilled to temporary files
@@ -77,10 +79,10 @@ Upload_Sink :: struct {
 	cfg:       Upload_Sink_Config,
 	alloc:     mem.Allocator,
 	req:       ^Request,
-	parser:    Multipart_Stream,
+	parser:    multipart.Multipart_Stream,
 	fields:    [dynamic]Param,
 	files:     [dynamic]Form_File,
-	mem:       Buf, // in-memory prefix / field value being accumulated
+	mem:       buffer.Buf, // in-memory prefix / field value being accumulated
 	file:      ^os.File, // open spill file, nil while the part fits in memory
 	cur:       int, // index into files while a file part is open, else -1
 	open_path: string,
@@ -123,16 +125,16 @@ upload_sink_attach :: proc(c: ^Conn, cfg: Upload_Sink_Config) -> Form_Error {
 	s.cur = -1
 	s.cfg = cfg
 	upload_sink_fill_defaults(&s.cfg, alloc)
-	buf_init(&s.mem, alloc)
+	buffer.buf_init(&s.mem, alloc)
 	s.fields = make([dynamic]Param, alloc)
 	s.files = make([dynamic]Form_File, alloc)
 	s.created = make([dynamic]string, alloc)
 
-	opts := Multipart_Options {
+	opts := multipart.Multipart_Options {
 		max_part_size = s.cfg.max_part_size,
 		max_fields    = s.cfg.max_fields,
 	}
-	if !multipart_stream_init(&s.parser, boundary, alloc, opts, upload_sink_handlers(s)) {
+	if !multipart.multipart_stream_init(&s.parser, boundary, alloc, opts, upload_sink_handlers(s)) {
 		return .Bad_Boundary
 	}
 
@@ -159,7 +161,7 @@ upload_sink_fill_defaults :: proc(cfg: ^Upload_Sink_Config, alloc: mem.Allocator
 		cfg.threshold = UPLOAD_SPILL_THRESHOLD
 	}
 	if cfg.max_part_size <= 0 {
-		cfg.max_part_size = MULTIPART_DEFAULT_MAX_PART
+		cfg.max_part_size = multipart.MULTIPART_DEFAULT_MAX_PART
 	}
 	if cfg.max_field_size <= 0 {
 		cfg.max_field_size = UPLOAD_MAX_FIELD_SIZE
@@ -170,7 +172,7 @@ upload_sink_fill_defaults :: proc(cfg: ^Upload_Sink_Config, alloc: mem.Allocator
 	if len(cfg.dir) == 0 {
 		// the system temp path comes from a temporary allocator: clone it,
 		// because the config outlives the call
-		cfg.dir = clone_string(upload_temp_dir(), alloc)
+		cfg.dir = buffer.clone_string(upload_temp_dir(), alloc)
 	}
 }
 
@@ -196,8 +198,8 @@ upload_temp_dir :: proc() -> string {
 // ---------------------------------------------------------------------------
 
 @(private = "file")
-upload_sink_handlers :: proc(s: ^Upload_Sink) -> Multipart_Handlers {
-	return Multipart_Handlers {
+upload_sink_handlers :: proc(s: ^Upload_Sink) -> multipart.Multipart_Handlers {
+	return multipart.Multipart_Handlers {
 		on_part = upload_on_part,
 		on_data = upload_on_data,
 		on_part_end = upload_on_part_end,
@@ -206,9 +208,9 @@ upload_sink_handlers :: proc(s: ^Upload_Sink) -> Multipart_Handlers {
 }
 
 @(private = "file")
-upload_on_part :: proc(ud: rawptr, part: ^Stream_Part) -> bool {
+upload_on_part :: proc(ud: rawptr, part: ^multipart.Stream_Part) -> bool {
 	s := cast(^Upload_Sink) ud
-	buf_reset(&s.mem)
+	buffer.buf_reset(&s.mem)
 	s.cur = -1
 	if !part.is_file {
 		return true // a field: accumulated in s.mem until on_part_end
@@ -223,23 +225,23 @@ upload_on_part :: proc(ud: rawptr, part: ^Stream_Part) -> bool {
 }
 
 @(private = "file")
-upload_on_data :: proc(ud: rawptr, part: ^Stream_Part, chunk: []byte) -> bool {
+upload_on_data :: proc(ud: rawptr, part: ^multipart.Stream_Part, chunk: []byte) -> bool {
 	s := cast(^Upload_Sink) ud
 	if s.cur < 0 {
 		// field value
-		if buf_len(&s.mem) + len(chunk) > s.cfg.max_field_size {
+		if buffer.buf_len(&s.mem) + len(chunk) > s.cfg.max_field_size {
 			// record the reason here: a refusal alone is indistinguishable from
 			// a malformed body further down, and the client should see 413
 			s.req.form_state = .Too_Large
 			return false
 		}
-		buf_append(&s.mem, chunk)
+		buffer.buf_append(&s.mem, chunk)
 		return true
 	}
 	if s.file == nil {
 		// still in the in-memory prefix
-		if buf_len(&s.mem) + len(chunk) <= s.cfg.threshold {
-			buf_append(&s.mem, chunk)
+		if buffer.buf_len(&s.mem) + len(chunk) <= s.cfg.threshold {
+			buffer.buf_append(&s.mem, chunk)
 			return true
 		}
 		if !upload_open_spill(s) {
@@ -251,16 +253,16 @@ upload_on_data :: proc(ud: rawptr, part: ^Stream_Part, chunk: []byte) -> bool {
 }
 
 @(private = "file")
-upload_on_part_end :: proc(ud: rawptr, part: ^Stream_Part) -> bool {
+upload_on_part_end :: proc(ud: rawptr, part: ^multipart.Stream_Part) -> bool {
 	s := cast(^Upload_Sink) ud
 	if s.cur < 0 {
 		if len(s.mem.data) == 0 {
 			append(&s.fields, Param{name = part.field, value = ""})
 			return true
 		}
-		value := clone_string(string(buf_slice(&s.mem)), s.alloc)
+		value := buffer.clone_string(string(buffer.buf_slice(&s.mem)), s.alloc)
 		append(&s.fields, Param{name = part.field, value = value})
-		buf_reset(&s.mem)
+		buffer.buf_reset(&s.mem)
 		return true
 	}
 	f := &s.files[s.cur]
@@ -268,7 +270,7 @@ upload_on_part_end :: proc(ud: rawptr, part: ^Stream_Part) -> bool {
 		err := os.close(s.file)
 		s.file = nil
 		if err != nil {
-			log_error("web: upload: cannot close %v: %v", s.open_path, err)
+			buffer.log_error("web: upload: cannot close %v: %v", s.open_path, err)
 			return false
 		}
 		f.path = s.open_path
@@ -278,9 +280,9 @@ upload_on_part_end :: proc(ud: rawptr, part: ^Stream_Part) -> bool {
 		return true
 	}
 	// stayed in memory: the parser's buffer is reused, so copy
-	f.data = clone_bytes(buf_slice(&s.mem), s.alloc)
+	f.data = buffer.clone_bytes(buffer.buf_slice(&s.mem), s.alloc)
 	f.size = len(f.data)
-	buf_reset(&s.mem)
+	buffer.buf_reset(&s.mem)
 	s.cur = -1
 	return true
 }
@@ -295,7 +297,7 @@ here rather than taken from the client: the original name is kept in
 upload_open_spill :: proc(s: ^Upload_Sink) -> bool {
 	dir := s.cfg.dir
 	if err := os.make_directory_all(dir); err != nil {
-		log_debug("web: upload: %v exists or could not be created: %v", dir, err)
+		buffer.log_debug("web: upload: %v exists or could not be created: %v", dir, err)
 	}
 	for attempt in 0 ..< 8 {
 		s.seq += 1
@@ -304,7 +306,7 @@ upload_open_spill :: proc(s: ^Upload_Sink) -> bool {
 			hint = upload_safe_name(s.files[s.cur].filename, s.alloc)
 		}
 		name := upload_temp_name(s.alloc, s.seq, attempt, hint)
-		path := concat_strings({dir, "/", name}, s.alloc)
+		path := buffer.concat_strings({dir, "/", name}, s.alloc)
 		f, err := os.create(path)
 		if err != nil {
 			continue // a name collision: try the next one
@@ -312,18 +314,18 @@ upload_open_spill :: proc(s: ^Upload_Sink) -> bool {
 		s.file = f
 		s.open_path = path
 		append(&s.created, path)
-		if buf_len(&s.mem) > 0 {
-			if _, werr := os.write(f, buf_slice(&s.mem)); werr != nil {
-				log_error("web: upload: cannot write %v: %v", path, werr)
+		if buffer.buf_len(&s.mem) > 0 {
+			if _, werr := os.write(f, buffer.buf_slice(&s.mem)); werr != nil {
+				buffer.log_error("web: upload: cannot write %v: %v", path, werr)
 				os.close(f)
 				s.file = nil
 				return false
 			}
-			buf_reset(&s.mem)
+			buffer.buf_reset(&s.mem)
 		}
 		return true
 	}
-	log_error("web: upload: cannot create a temp file in %v", dir)
+	buffer.log_error("web: upload: cannot create a temp file in %v", dir)
 	return false
 }
 
@@ -338,9 +340,9 @@ upload_temp_name :: proc(alloc: mem.Allocator, seq, attempt: int, hint: string) 
 	if len(hint) > 0 {
 		// the client's (sanitised) name, only to make the file recognisable in
 		// a directory listing - the unique part of the name comes first
-		tail = concat_strings({"-", hint}, alloc)
+		tail = buffer.concat_strings({"-", hint}, alloc)
 	}
-	return concat_strings(
+	return buffer.concat_strings(
 		{
 			UPLOAD_TEMP_PREFIX,
 			upload_itoa(alloc, nano),
@@ -376,7 +378,7 @@ upload_itoa :: proc(alloc: mem.Allocator, v: u64) -> string {
 			buf[i], buf[n - 1 - i] = buf[n - 1 - i], buf[i]
 		}
 	}
-	return clone_string(string(buf[:n]), alloc)
+	return buffer.clone_string(string(buf[:n]), alloc)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +388,7 @@ upload_itoa :: proc(alloc: mem.Allocator, v: u64) -> string {
 @(private = "file")
 upload_sink_write :: proc(ud: rawptr, chunk: []byte) -> bool {
 	s := cast(^Upload_Sink) ud
-	if multipart_stream_feed(&s.parser, chunk) {
+	if multipart.multipart_stream_feed(&s.parser, chunk) {
 		return true
 	}
 	// record why, so the connection can answer 413 rather than 400 for a
@@ -406,7 +408,7 @@ upload_sink_record_error :: proc(s: ^Upload_Sink) {
 	if s.req.form_state == .Too_Large {
 		return
 	}
-	switch multipart_stream_error(&s.parser) {
+	switch multipart.multipart_stream_error(&s.parser) {
 	case .Too_Many_Fields, .File_Too_Large:
 		s.req.form_state = .Too_Large
 	case .None, .Not_A_Form, .Bad_Boundary, .Malformed, .Too_Large, .Sink_Error:
@@ -418,7 +420,7 @@ upload_sink_record_error :: proc(s: ^Upload_Sink) {
 upload_sink_finish :: proc(ud: rawptr) -> bool {
 	s := cast(^Upload_Sink) ud
 	r := s.req
-	if !multipart_stream_finish(&s.parser) {
+	if !multipart.multipart_stream_finish(&s.parser) {
 		upload_sink_record_error(s)
 		return false
 	}
@@ -446,7 +448,7 @@ upload_sink_teardown :: proc(ud: rawptr) {
 	for path in s.created {
 		if err := os.remove(path); err != nil {
 			// already renamed away (or gone): the normal way to keep a file
-			log_debug("web: upload: %v not removed: %v", path, err)
+			buffer.log_debug("web: upload: %v not removed: %v", path, err)
 		}
 	}
 	clear(&s.created)

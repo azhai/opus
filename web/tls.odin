@@ -6,6 +6,7 @@ import "core:nbio"
 import "core:net"
 import "core:strings"
 import "core:time"
+import "../buffer"
 
 /*
 TLS support, loaded at run time from the system's OpenSSL.
@@ -231,7 +232,7 @@ when ODIN_OS == .Darwin {
 tls_open_library :: proc(names: []string) -> dynlib.Library {
 	for name in names {
 		if lib, ok := dynlib.load_library(name); ok {
-			log_info("web: tls: loaded %v", name)
+			buffer.log_info("web: tls: loaded %v", name)
 			return lib
 		}
 	}
@@ -242,7 +243,7 @@ tls_open_library :: proc(names: []string) -> dynlib.Library {
 tls_symbol :: proc(lib: dynlib.Library, name: string, target: ^$T) -> bool {
 	ptr, found := dynlib.symbol_address(lib, name)
 	if !found {
-		log_error("web: tls: missing symbol %v", name)
+		buffer.log_error("web: tls: missing symbol %v", name)
 		return false
 	}
 	target^ = cast(T) ptr
@@ -260,12 +261,12 @@ tls_load :: proc() -> bool {
 	}
 	ssl_lib := tls_open_library(TLS_SSL_NAMES[:])
 	if ssl_lib == nil {
-		log_error("web: tls: libssl not found; install OpenSSL to serve HTTPS")
+		buffer.log_error("web: tls: libssl not found; install OpenSSL to serve HTTPS")
 		return false
 	}
 	crypto_lib := tls_open_library(TLS_CRYPTO_NAMES[:])
 	if crypto_lib == nil {
-		log_error("web: tls: libcrypto not found")
+		buffer.log_error("web: tls: libcrypto not found")
 		return false
 	}
 
@@ -355,23 +356,23 @@ tls_config_init :: proc(
 	}
 	ctx := TLS.ctx_new(TLS.server_method())
 	if ctx == nil {
-		log_error("web: tls: SSL_CTX_new failed: %v", tls_last_error())
+		buffer.log_error("web: tls: SSL_CTX_new failed: %v", tls_last_error())
 		return false
 	}
 	cert := strings.clone_to_cstring(cert_file, context.temp_allocator)
 	key := strings.clone_to_cstring(key_file, context.temp_allocator)
 	if TLS.ctx_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) != 1 {
-		log_error("web: tls: cannot read certificate %v: %v", cert_file, tls_last_error())
+		buffer.log_error("web: tls: cannot read certificate %v: %v", cert_file, tls_last_error())
 		TLS.ctx_free(ctx)
 		return false
 	}
 	if TLS.ctx_use_private_key_file(ctx, key, SSL_FILETYPE_PEM) != 1 {
-		log_error("web: tls: cannot read private key %v: %v", key_file, tls_last_error())
+		buffer.log_error("web: tls: cannot read private key %v: %v", key_file, tls_last_error())
 		TLS.ctx_free(ctx)
 		return false
 	}
 	if TLS.ctx_check_private_key(ctx) != 1 {
-		log_error("web: tls: private key does not match the certificate: %v", tls_last_error())
+		buffer.log_error("web: tls: private key does not match the certificate: %v", tls_last_error())
 		TLS.ctx_free(ctx)
 		return false
 	}
@@ -380,7 +381,7 @@ tls_config_init :: proc(
 	cfg.key = key_file
 	cfg.resumption = resumption
 	tls_apply_resumption(cfg)
-	log_info("web: tls: serving with %v%v", cert_file, cfg.resumption.cache || cfg.resumption.tickets ? " (resumption on)" : "")
+	buffer.log_info("web: tls: serving with %v%v", cert_file, cfg.resumption.cache || cfg.resumption.tickets ? " (resumption on)" : "")
 	return true
 }
 
@@ -428,7 +429,7 @@ tls_apply_resumption :: proc(cfg: ^Tls_Config) -> bool {
 	// session at all, which is the silent half of the resumption story.
 	id_ctx := tls_session_id_context(r.id_context, cfg.cert)
 	if TLS.ctx_set_session_id_context(ctx, rawptr(&id_ctx[0]), c.uint(len(id_ctx))) != 1 {
-		log_error("web: tls: cannot set session id context: %v", tls_last_error())
+		buffer.log_error("web: tls: cannot set session id context: %v", tls_last_error())
 		return false
 	}
 
@@ -497,14 +498,14 @@ tls_attach :: proc(c: ^Conn, cfg: ^Tls_Config) -> bool {
 	s := new(Tls_Session, c.server.allocator)
 	s.ssl = TLS.ssl_new(cfg.ctx)
 	if s.ssl == nil {
-		log_error("web: tls: SSL_new failed: %v", tls_last_error())
+		buffer.log_error("web: tls: SSL_new failed: %v", tls_last_error())
 		free(s, c.server.allocator)
 		return false
 	}
 	s.rbio = TLS.bio_new(TLS.bio_s_mem())
 	s.wbio = TLS.bio_new(TLS.bio_s_mem())
 	if s.rbio == nil || s.wbio == nil {
-		log_error("web: tls: cannot allocate memory BIOs")
+		buffer.log_error("web: tls: cannot allocate memory BIOs")
 		TLS.ssl_free(s.ssl)
 		free(s, c.server.allocator)
 		return false
@@ -568,7 +569,7 @@ tls_handshake_step :: proc(c: ^Conn) {
 		if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
 			break
 		}
-		log_debug("web: tls handshake failed: %v", tls_last_error())
+		buffer.log_debug("web: tls handshake failed: %v", tls_last_error())
 		conn_close(c)
 		return
 	}
@@ -584,12 +585,12 @@ on_tls_handshake_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: tls handshake send failed: %v", op.send.err)
+		buffer.log_debug("web: tls handshake send failed: %v", op.send.err)
 		conn_close(c)
 		return
 	}
 	c.server.stats.bytes_out += u64(op.send.sent)
-	buf_reset(&c.tls_out)
+	buffer.buf_reset(&c.tls_out)
 	if c.tls.handshaking {
 		conn_recv_arm(c, c.server.header_timeout)
 		return
@@ -632,7 +633,7 @@ tls_drain_wbio :: proc(c: ^Conn) {
 		if pending <= 0 {
 			return
 		}
-		start := buf_len(&c.tls_out)
+		start := buffer.buf_len(&c.tls_out)
 		resize(&c.tls_out.data, start + pending)
 		got := TLS.bio_read(c.tls.wbio, raw_data(c.tls_out.data[start:]), i32(pending))
 		if got <= 0 {
@@ -653,12 +654,12 @@ send operation is now in flight and the callback owns the flow.
 */
 tls_send_pending :: proc(c: ^Conn, cb: proc(op: ^nbio.Operation, c: ^Conn)) -> bool {
 	tls_drain_wbio(c)
-	if buf_len(&c.tls_out) == 0 {
+	if buffer.buf_len(&c.tls_out) == 0 {
 		return true
 	}
 	c.op = nbio.send_poly(
 		c.socket,
-		[][]byte{buf_slice(&c.tls_out)},
+		[][]byte{buffer.buf_slice(&c.tls_out)},
 		c,
 		cb,
 		all = true,
@@ -677,10 +678,10 @@ tls_encrypt :: proc(c: ^Conn, data: []byte) -> bool {
 			if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
 				// memory BIOs never fill, so this would mean a renegotiation
 				// request; not supported here
-				log_debug("web: tls write wants more I/O")
+				buffer.log_debug("web: tls write wants more I/O")
 				return false
 			}
-			log_debug("web: tls write failed: %v", tls_last_error())
+			buffer.log_debug("web: tls write failed: %v", tls_last_error())
 			return false
 		}
 		off += int(n)
@@ -696,7 +697,7 @@ tls_read_plain :: proc(c: ^Conn) -> bool {
 	for {
 		n := TLS.read(c.tls.ssl, raw_data(c.rbuf[:]), i32(len(c.rbuf)))
 		if n > 0 {
-			buf_append(&c.inbuf, c.rbuf[:int(n)])
+			buffer.buf_append(&c.inbuf, c.rbuf[:int(n)])
 			c.server.stats.bytes_in += u64(n)
 			got = true
 			continue
@@ -710,7 +711,7 @@ tls_read_plain :: proc(c: ^Conn) -> bool {
 			break
 		}
 		c.tls.failed = true
-		log_debug("web: tls read failed: %v", tls_last_error())
+		buffer.log_debug("web: tls read failed: %v", tls_last_error())
 		break
 	}
 	return got
@@ -734,7 +735,7 @@ on_tls_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.recv.err != nil {
-		log_debug("web: tls socket recv error: %v", op.recv.err)
+		buffer.log_debug("web: tls socket recv error: %v", op.recv.err)
 		conn_close(c)
 		return
 	}
@@ -778,12 +779,12 @@ pieces (there is no sendfile once the bytes have to be encrypted).
 tls_write_loop :: proc(c: ^Conn) {
 	w := &c.res
 
-	if buf_len(&c.out) > 0 {
-		if !tls_encrypt(c, buf_slice(&c.out)) {
+	if buffer.buf_len(&c.out) > 0 {
+		if !tls_encrypt(c, buffer.buf_slice(&c.out)) {
 			conn_close(c)
 			return
 		}
-		buf_reset(&c.out)
+		buffer.buf_reset(&c.out)
 	}
 
 	if file_pending(w) && c.tls_file_offset < w.file_size {
@@ -823,7 +824,7 @@ on_tls_file_read :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.read.err != nil {
-		log_debug("web: tls file read failed: %v", op.read.err)
+		buffer.log_debug("web: tls file read failed: %v", op.read.err)
 		conn_close(c)
 		return
 	}
@@ -846,11 +847,11 @@ on_tls_write_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: tls send failed: %v", op.send.err)
+		buffer.log_debug("web: tls send failed: %v", op.send.err)
 		conn_close(c)
 		return
 	}
 	c.server.stats.bytes_out += u64(op.send.sent)
-	buf_reset(&c.tls_out)
+	buffer.buf_reset(&c.tls_out)
 	tls_write_loop(c)
 }

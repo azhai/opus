@@ -16,6 +16,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // request parser
 // ---------------------------------------------------------------------------
@@ -107,43 +109,4 @@ test_url_decode_path :: proc(t: ^testing.T) {
 	testing.expect(t, ok2)
 	testing.expect(t, p2 == "/plain/path")
 	delete(p)
-}
-
-// ---------------------------------------------------------------------------
-// chunked codec
-// ---------------------------------------------------------------------------
-
-@(test)
-test_chunked_decode_complete :: proc(t: ^testing.T) {
-	body: Buf
-	buf_init(&body, context.allocator)
-	defer buf_destroy(&body)
-
-	input := "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
-	status, consumed := chunked_try_decode(transmute([]byte)input, &body)
-	testing.expect(t, status == 1)
-	testing.expect(t, consumed == len(input))
-	testing.expect(t, string(buf_slice(&body)) == "hello world")
-}
-
-@(test)
-test_chunked_decode_partial :: proc(t: ^testing.T) {
-	body: Buf
-	buf_init(&body, context.allocator)
-	defer buf_destroy(&body)
-
-	input := "5\r\nhel"
-	status, _ := chunked_try_decode(transmute([]byte)input, &body)
-	testing.expect(t, status == 0)
-	testing.expect(t, buf_len(&body) == 0)
-}
-
-@(test)
-test_chunked_decode_malformed :: proc(t: ^testing.T) {
-	body: Buf
-	buf_init(&body, context.allocator)
-	defer buf_destroy(&body)
-
-	status, _ := chunked_try_decode(transmute([]byte)string("zz\r\nnope\r\n"), &body)
-	testing.expect(t, status == -1)
 }

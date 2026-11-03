@@ -3,6 +3,8 @@ package web
 import "core:mem"
 import "core:nbio"
 import "core:time"
+import "../buffer"
+import "../http"
 
 /*
 Hub fans out events to many subscribers from one event loop thread.
@@ -61,8 +63,8 @@ Hub :: struct {
 
 	// scratch buffers reused by every publish: a feed that emits an event per
 	// second must not allocate per event
-	payload: Buf, // the event body (data:/event:/id: lines)
-	frame:   Buf, // one chunked frame wrapping `payload`
+	payload: buffer.Buf, // the event body (data:/event:/id: lines)
+	frame:   buffer.Buf, // one chunked frame wrapping `payload`
 
 	published: u64, // events fanned out
 	delivered: u64, // subscriber-event pairs written
@@ -75,7 +77,7 @@ Hub :: struct {
 Hub_Sink :: struct {
 	hub:       ^Hub,
 	conn:      ^Conn,
-	queue:     Buf,
+	queue:     buffer.Buf,
 	// index is this sink's slot in `hub.subs`. Removal is then a swap with the
 	// last element instead of a scan, which matters when a client churns: a
 	// scan costs O(subscribers) per disconnect, i.e. O(n^2) to turn the whole
@@ -93,8 +95,8 @@ hub_init :: proc(h: ^Hub, allocator := context.allocator) {
 	h.subs = make([dynamic]^Hub_Sink, allocator)
 	h.max_queue = HUB_MAX_QUEUE
 	h.keep_alive = HUB_KEEP_ALIVE
-	buf_init(&h.payload, allocator)
-	buf_init(&h.frame, allocator)
+	buffer.buf_init(&h.payload, allocator)
+	buffer.buf_init(&h.frame, allocator)
 }
 
 /*
@@ -105,14 +107,14 @@ forgetting that step leaks a connection per client.
 */
 hub_destroy :: proc(h: ^Hub) {
 	if len(h.subs) > 0 {
-		log_error("web: hub_destroy with %v live subscriber(s); call hub_close on the event loop thread", len(h.subs))
+		buffer.log_error("web: hub_destroy with %v live subscriber(s); call hub_close on the event loop thread", len(h.subs))
 	}
 	if h.subs != nil {
 		delete(h.subs)
 		h.subs = nil
 	}
-	buf_destroy(&h.payload)
-	buf_destroy(&h.frame)
+	buffer.buf_destroy(&h.payload)
+	buffer.buf_destroy(&h.frame)
 }
 
 // hub_subscribers reports how many streams are open.
@@ -148,21 +150,21 @@ hub_subscribe :: proc(h: ^Hub, req: ^Request, res: ^Response) -> (sink: ^Hub_Sin
 	s := new(Hub_Sink, h.allocator)
 	s.hub = h
 	s.conn = c
-	buf_init(&s.queue, h.allocator)
+	buffer.buf_init(&s.queue, h.allocator)
 
 	// The head goes through response_build like any other response, with
 	// chunked framing and content coding switched off; the body that follows
 	// is written by hub_flush as raw chunk frames.
 	res.status = .OK
-	response_set_header(res, "Content-Type", "text/event-stream")
+	response_set_header(res, "Content-Type", http.SSE_MEDIA_TYPE)
 	response_set_header(res, "Cache-Control", "no-cache, no-transform")
 	response_set_header(res, "X-Accel-Buffering", "no")
 	res.chunked = true
-	res.compress = .Deny
+	res.coding = .Deny
 	response_build(res, &c.out, conn_scratch(c))
 
 	if !response_defer(res, hub_resume, s, 0, hub_on_close) {
-		buf_destroy(&s.queue)
+		buffer.buf_destroy(&s.queue)
 		free(s, h.allocator)
 		return nil, false
 	}
@@ -201,7 +203,7 @@ hub_on_close :: proc(ud: rawptr) {
 		// sees it; adding `s.skipped` here would count every drop twice
 	}
 	s.closed = true
-	buf_destroy(&s.queue)
+	buffer.buf_destroy(&s.queue)
 	free(s, s.hub.allocator)
 }
 
@@ -246,12 +248,12 @@ hub_flush :: proc(s: ^Hub_Sink) {
 	if s.closed || s.sending || c == nil || c.closed || c.op != nil {
 		return
 	}
-	if buf_len(&c.out) == 0 {
-		if buf_len(&s.queue) == 0 {
+	if buffer.buf_len(&c.out) == 0 {
+		if buffer.buf_len(&s.queue) == 0 {
 			return
 		}
-		buf_append(&c.out, buf_slice(&s.queue))
-		buf_reset(&s.queue)
+		buffer.buf_append(&c.out, buffer.buf_slice(&s.queue))
+		buffer.buf_reset(&s.queue)
 	}
 	if !conn_flush_out(c, on_hub_sent) {
 		return // nothing to send after all
@@ -271,12 +273,12 @@ on_hub_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 	s.sending = false
 	if op.send.err != nil {
-		log_debug("web: hub stream to %v failed: %v", c.remote, op.send.err)
+		buffer.log_debug("web: hub stream to %v failed: %v", c.remote, op.send.err)
 		conn_close(c) // hub_on_close removes the sink
 		return
 	}
 	conn_after_send(c, op.send.sent)
-	if buf_len(&s.queue) == 0 && s.closing {
+	if buffer.buf_len(&s.queue) == 0 && s.closing {
 		conn_close(c)
 		return
 	}
@@ -302,36 +304,9 @@ hub_send :: proc(h: ^Hub, event, data, id: string) {
 		return
 	}
 	p := &h.payload
-	buf_reset(p)
-	if len(event) > 0 {
-		buf_append_string(p, "event: ")
-		buf_append_string(p, event)
-		buf_append_byte(p, '\n')
-	}
-	if len(id) > 0 {
-		buf_append_string(p, "id: ")
-		buf_append_string(p, id)
-		buf_append_byte(p, '\n')
-	}
-	rest := data
-	for {
-		nl := string_index_byte(rest, '\n')
-		line := rest
-		if nl >= 0 {
-			line = rest[:nl]
-			rest = rest[nl + 1:]
-		} else {
-			rest = ""
-		}
-		buf_append_string(p, "data: ")
-		buf_append_string(p, line)
-		buf_append_byte(p, '\n')
-		if nl < 0 {
-			break
-		}
-	}
-	buf_append_byte(p, '\n')
-	hub_publish(h, buf_slice(p))
+	buffer.buf_reset(p)
+	http.sse_event_payload(p, data, event, id)
+	hub_publish(h, buffer.buf_slice(p))
 }
 
 // hub_comment sends a comment line to every subscriber. Clients ignore it; it
@@ -341,11 +316,9 @@ hub_comment :: proc(h: ^Hub, text: string) {
 		return
 	}
 	p := &h.payload
-	buf_reset(p)
-	buf_append_string(p, ": ")
-	buf_append_string(p, text)
-	buf_append_string(p, "\n\n")
-	hub_publish(h, buf_slice(p))
+	buffer.buf_reset(p)
+	http.sse_comment_payload(p, text)
+	hub_publish(h, buffer.buf_slice(p))
 }
 
 /*
@@ -361,15 +334,12 @@ hub_publish :: proc(h: ^Hub, payload: []byte) {
 		return
 	}
 	f := &h.frame
-	buf_reset(f)
-	write_hex(f, len(payload))
-	buf_append_string(f, "\r\n")
-	buf_append(f, payload)
-	buf_append_string(f, "\r\n")
+	buffer.buf_reset(f)
+	http.chunked_frame(f, payload)
 
 	h.published += 1
 	now := nbio.now()
-	frame := buf_slice(f)
+	frame := buffer.buf_slice(f)
 	for i := len(h.subs) - 1; i >= 0; i -= 1 {
 		s := h.subs[i]
 		if s.closed {
@@ -399,10 +369,10 @@ event is broadcast to every subscriber, that is the dominant cost.
 @(private)
 hub_enqueue :: proc(s: ^Hub_Sink, chunk: []byte) {
 	c := s.conn
-	if !s.sending && c != nil && !c.closed && c.op == nil && buf_len(&c.out) == 0 && buf_len(&s.queue) == 0 {
-		buf_append(&c.out, chunk)
+	if !s.sending && c != nil && !c.closed && c.op == nil && buffer.buf_len(&c.out) == 0 && buffer.buf_len(&s.queue) == 0 {
+		buffer.buf_append(&c.out, chunk)
 	} else {
-		buf_append(&s.queue, chunk)
+		buffer.buf_append(&s.queue, chunk)
 	}
 	hub_flush(s)
 }
@@ -418,9 +388,9 @@ backlog would be twice the configured limit.
 */
 @(private)
 hub_backlog :: proc(s: ^Hub_Sink) -> int {
-	n := buf_len(&s.queue)
+	n := buffer.buf_len(&s.queue)
 	if c := s.conn; c != nil && !c.closed {
-		n += buf_len(&c.out)
+		n += buffer.buf_len(&c.out)
 	}
 	return n
 }
@@ -444,14 +414,14 @@ hub_tick :: proc(h: ^Hub) {
 		if s.closed {
 			continue
 		}
-		if buf_len(&s.queue) > 0 {
+		if buffer.buf_len(&s.queue) > 0 {
 			hub_flush(s)
 			continue
 		}
 		if h.keep_alive > 0 && s.last_send != {} && time.diff(s.last_send, now) > h.keep_alive {
 			// a comment costs 20 bytes and proves the connection is alive in
 			// both directions: the send fails on a client that left
-			buf_append_string(&s.queue, "14\r\n: keep-alive\n\n\r\n")
+			buffer.buf_append_string(&s.queue, "14\r\n: keep-alive\n\n\r\n")
 			s.last_send = now
 			hub_flush(s)
 		}
@@ -488,7 +458,7 @@ hub_terminate :: proc(s: ^Hub_Sink) {
 	if c == nil || c.closed {
 		return
 	}
-	buf_append_string(&s.queue, "0\r\n\r\n")
+	buffer.buf_append_string(&s.queue, "0\r\n\r\n")
 	if s.sending || c.op != nil {
 		return // on_hub_sent closes once the queue drains
 	}

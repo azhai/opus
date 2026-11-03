@@ -16,6 +16,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 
 
 /*
@@ -34,7 +36,7 @@ test_static_cache_bounded :: proc(t: ^testing.T) {
 	testing.expect(t, os.make_directory_all(dir) == nil)
 	defer os.remove_all(dir)
 
-	file := concat_strings({dir, "/index.html"}, context.temp_allocator)
+	file := buffer.concat_strings({dir, "/index.html"}, context.temp_allocator)
 	testing.expect(t, os.write_entire_file(file, transmute([]byte)string("<html></html>")) == nil)
 
 	st: Static
@@ -165,7 +167,7 @@ static_test_exchange :: proc(t: ^testing.T, ep: net.Endpoint, request: string) -
 
 // static_test_header pulls one header value out of a raw response head.
 static_test_header :: proc(resp, name: string) -> string {
-	want := concat_strings({name, ": "}, context.temp_allocator)
+	want := buffer.concat_strings({name, ": "}, context.temp_allocator)
 	rest := resp
 	for {
 		nl := strings.index(rest, "\r\n")
@@ -213,7 +215,7 @@ test_static_conditional_get_304 :: proc(t: ^testing.T) {
 	defer os.remove_all(dir)
 
 	content := "<html></html>"
-	file := concat_strings({dir, "/index.html"}, context.temp_allocator)
+	file := buffer.concat_strings({dir, "/index.html"}, context.temp_allocator)
 	testing.expect(t, os.write_entire_file(file, transmute([]byte)string(content)) == nil)
 
 	ep, th, args := static_test_spin(t, dir)
@@ -224,7 +226,7 @@ test_static_conditional_get_304 :: proc(t: ^testing.T) {
 	st := args.st
 	fs_path, ok := static_resolve_path(st, "/index.html", context.temp_allocator)
 	testing.expect(t, ok)
-	st.cache[clone_string(fs_path, st.allocator)] = Stat_Cache_Entry {
+	st.cache[buffer.clone_string(fs_path, st.allocator)] = Stat_Cache_Entry {
 		exists  = true,
 		size    = i64(len(content)),
 		mod_utc = time.unix(1_700_000_000, 400_000_000),
@@ -251,7 +253,7 @@ test_static_conditional_get_304 :: proc(t: ^testing.T) {
 	// and a copy that really is older still gets the file
 	stale := fmt.aprintf(
 		"GET /index.html HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: %v\r\nConnection: close\r\n\r\n",
-		http_date(time.unix(1_600_000_000, 0), context.temp_allocator),
+		http.http_date(time.unix(1_600_000_000, 0), context.temp_allocator),
 		allocator = context.temp_allocator,
 	)
 	third := static_test_exchange(t, ep, stale)
@@ -272,7 +274,7 @@ test_static_range_responses :: proc(t: ^testing.T) {
 	defer os.remove_all(dir)
 
 	content := "0123456789abcdef"
-	file := concat_strings({dir, "/a.txt"}, context.temp_allocator)
+	file := buffer.concat_strings({dir, "/a.txt"}, context.temp_allocator)
 	testing.expect(t, os.write_entire_file(file, transmute([]byte)string(content)) == nil)
 
 	ep, th, args := static_test_spin(t, dir)
@@ -281,7 +283,7 @@ test_static_range_responses :: proc(t: ^testing.T) {
 	st := args.st
 	fs_path, ok := static_resolve_path(st, "/a.txt", context.temp_allocator)
 	testing.expect(t, ok)
-	st.cache[clone_string(fs_path, st.allocator)] = Stat_Cache_Entry {
+	st.cache[buffer.clone_string(fs_path, st.allocator)] = Stat_Cache_Entry {
 		exists  = true,
 		size    = i64(len(content)),
 		mod_utc = time.unix(1_700_000_000, 0),
@@ -309,10 +311,10 @@ test_static_range_responses :: proc(t: ^testing.T) {
 	body := static_test_body(two)
 	testing.expect(t, strings.contains(body, "Content-Range: bytes 0-1/16"))
 	testing.expect(t, strings.contains(body, "Content-Range: bytes 4-5/16"))
-	testing.expect(t, strings.has_prefix(body, concat_strings({"--", boundary, "\r\n"}, context.temp_allocator)))
+	testing.expect(t, strings.has_prefix(body, buffer.concat_strings({"--", boundary, "\r\n"}, context.temp_allocator)))
 	testing.expect(
 		t,
-		strings.has_suffix(body, concat_strings({"--", boundary, "--\r\n"}, context.temp_allocator)),
+		strings.has_suffix(body, buffer.concat_strings({"--", boundary, "--\r\n"}, context.temp_allocator)),
 	)
 
 	past := static_test_exchange(

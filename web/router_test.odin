@@ -16,6 +16,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // router
 // ---------------------------------------------------------------------------
@@ -90,7 +92,7 @@ test_router_middleware_chain :: proc(t: ^testing.T) {
 	response_init(&res, &c, alloc)
 	router_handle_with(&r, &req, &res)
 
-	testing.expect(t, strings.contains(string(buf_slice(&res.body)), "a>b>final"))
+	testing.expect(t, strings.contains(string(buffer.buf_slice(&res.body)), "a>b>final"))
 }
 
 middleware_mark_a :: proc(m: ^Middleware, r: ^Router, idx: int, final: Handler, req: ^Request, res: ^Response) {
@@ -184,7 +186,7 @@ test_router_all_methods :: proc(t: ^testing.T) {
 	defer router_destroy(&r)
 	router_all(&r, "/any", dummy_handler)
 
-	methods := []Method{Method.Get, Method.Post, Method.Put, Method.Patch, Method.Delete, Method.Options}
+	methods := []http.Method{http.Method.Get, http.Method.Post, http.Method.Put, http.Method.Patch, http.Method.Delete, http.Method.Options}
 	for method in methods {
 		req := Request{method = method, path = "/any"}
 		route, ok := router_match(&r, &req, alloc)
@@ -228,15 +230,15 @@ test_router_fallthrough :: proc(t: ^testing.T) {
 	response_init(&res, &c, conn_scratch(&c))
 	req := Request{conn = &c, method = .Get, path = "/missing", target = "/missing"}
 	router_handle(&req, &res)
-	testing.expect_value(t, res.status, Status.Not_Found)
-	testing.expect_value(t, string(buf_slice(&res.body)), "404 page not found\n")
+	testing.expect_value(t, res.status, http.Status.Not_Found)
+	testing.expect_value(t, string(buffer.buf_slice(&res.body)), "404 page not found\n")
 
 	// a known path under the wrong method gets 405 + Allow
 	res_405: Response
 	response_init(&res_405, &c, conn_scratch(&c))
 	req_405 := Request{conn = &c, method = .Post, path = "/only", target = "/only"}
 	router_handle(&req_405, &res_405)
-	testing.expect_value(t, res_405.status, Status.Method_Not_Allowed)
+	testing.expect_value(t, res_405.status, http.Status.Method_Not_Allowed)
 	allow, has_allow := response_header(&res_405, "Allow")
 	testing.expect(t, has_allow)
 	testing.expect(t, strings.contains(allow, "GET"))
@@ -247,8 +249,8 @@ test_router_fallthrough :: proc(t: ^testing.T) {
 	response_init(&res_custom, &c, conn_scratch(&c))
 	req_custom := Request{conn = &c, method = .Get, path = "/missing", target = "/missing"}
 	router_handle(&req_custom, &res_custom)
-	testing.expect_value(t, res_custom.status, Status.Not_Found)
-	testing.expect_value(t, string(buf_slice(&res_custom.body)), "custom 404")
+	testing.expect_value(t, res_custom.status, http.Status.Not_Found)
+	testing.expect_value(t, string(buffer.buf_slice(&res_custom.body)), "custom 404")
 }
 
 /*
@@ -336,7 +338,7 @@ test_router_all_and_head :: proc(t: ^testing.T) {
 	router_get(&r, "/report", dummy_handler)
 	router_all(&r, "/health", dummy_handler)
 
-	for method in ([]Method{.Get, .Post, .Delete, .Patch}) {
+	for method in ([]http.Method{.Get, .Post, .Delete, .Patch}) {
 		req := Request{method = method, path = "/health"}
 		route, ok := router_match(&r, &req, alloc)
 		testing.expectf(t, route != nil && ok, "%v /health did not match the .All route", method)
@@ -346,7 +348,7 @@ test_router_all_and_head :: proc(t: ^testing.T) {
 	route, ok := router_match(&r, &req, alloc)
 	testing.expect(t, route != nil && ok)
 	if route != nil {
-		testing.expect_value(t, route.method, Method.Get)
+		testing.expect_value(t, route.method, http.Method.Get)
 	}
 
 	// a HEAD with no GET route anywhere is a 404, not a 405

@@ -2,6 +2,7 @@ package web
 
 import "core:nbio"
 import "core:time"
+import "../buffer"
 
 /*
 Deferred responses: a handler that cannot finish inside one call.
@@ -228,12 +229,12 @@ on_async_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 	// A client that talks while its response is still open is pipelining
 	// behind an unbounded response. Keep a bounded amount (it may be a
 	// legitimate pipelined request once the stream ends) and drop the rest.
-	if buf_len(&c.inbuf) + n > c.server.max_header_size {
-		log_debug("web: conn %v pipelined too much behind a deferred response", c.remote)
+	if buffer.buf_len(&c.inbuf) + n > c.server.max_header_size {
+		buffer.log_debug("web: conn %v pipelined too much behind a deferred response", c.remote)
 		conn_close(c)
 		return
 	}
-	buf_append(&c.inbuf, c.rbuf[:n])
+	buffer.buf_append(&c.inbuf, c.rbuf[:n])
 	conn_async_arm_recv(c)
 }
 

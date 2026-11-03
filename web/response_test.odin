@@ -16,6 +16,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // response builder
 // ---------------------------------------------------------------------------
@@ -36,11 +38,11 @@ test_response_build :: proc(t: ^testing.T) {
 	response_write_string(&w, "hello")
 	w.keep_alive = true
 
-	out: Buf
-	buf_init(&out, alloc)
+	out: buffer.Buf
+	buffer.buf_init(&out, alloc)
 	response_build(&w, &out, alloc)
 
-	s := string(buf_slice(&out))
+	s := string(buffer.buf_slice(&out))
 	testing.expect(t, strings.has_prefix(s, "HTTP/1.1 200 OK\r\n"))
 	testing.expect(t, strings.contains(s, "Content-Length: 5\r\n"))
 	testing.expect(t, strings.contains(s, "Content-Type: text/plain\r\n"))
@@ -64,11 +66,11 @@ test_response_head_has_no_body :: proc(t: ^testing.T) {
 	response_write_string(&w, "hello")
 	w.keep_alive = false
 
-	out: Buf
-	buf_init(&out, alloc)
+	out: buffer.Buf
+	buffer.buf_init(&out, alloc)
 	response_build(&w, &out, alloc)
 
-	s := string(buf_slice(&out))
+	s := string(buffer.buf_slice(&out))
 	testing.expect(t, strings.has_suffix(s, "\r\n\r\n"))
 	testing.expect(t, !strings.has_suffix(s, "hello"))
 	testing.expect(t, strings.contains(s, "Content-Length: 5\r\n"))
@@ -96,7 +98,7 @@ test_filter_chunked :: proc(t: ^testing.T) {
 	filter_chunked_init(&f)
 	chunked_apply(&f.filter, &c)
 
-	testing.expect(t, string(buf_slice(&w.body)) == "5\r\nhello\r\n0\r\n\r\n")
+	testing.expect(t, string(buffer.buf_slice(&w.body)) == "5\r\nhello\r\n0\r\n\r\n")
 }
 
 @(test)
@@ -133,10 +135,10 @@ test_response_send_and_redirect :: proc(t: ^testing.T) {
 	response_init(&res, &c, conn_scratch(&c))
 
 	response_send(&res, .Accepted, "application/json", `{"ok":true}`)
-	testing.expect_value(t, res.status, Status.Accepted)
+	testing.expect_value(t, res.status, http.Status.Accepted)
 	ct, _ := response_header(&res, "Content-Type")
 	testing.expect_value(t, ct, "application/json")
-	testing.expect_value(t, string(buf_slice(&res.body)), `{"ok":true}`)
+	testing.expect_value(t, string(buffer.buf_slice(&res.body)), `{"ok":true}`)
 
 	// an empty content type leaves the header alone
 	res2: Response
@@ -149,16 +151,16 @@ test_response_send_and_redirect :: proc(t: ^testing.T) {
 	res3: Response
 	response_init(&res3, &c, conn_scratch(&c))
 	response_redirect(&res3, "/login")
-	testing.expect_value(t, res3.status, Status.Found)
+	testing.expect_value(t, res3.status, http.Status.Found)
 	loc, _ := response_header(&res3, "Location")
 	testing.expect_value(t, loc, "/login")
-	testing.expect_value(t, string(buf_slice(&res3.body)), "redirecting to /login\n")
+	testing.expect_value(t, string(buffer.buf_slice(&res3.body)), "redirecting to /login\n")
 
 	// a caller-chosen status is kept
 	res4: Response
 	response_init(&res4, &c, conn_scratch(&c))
 	response_redirect(&res4, "https://example.com/new", .Moved_Permanently)
-	testing.expect_value(t, res4.status, Status.Moved_Permanently)
+	testing.expect_value(t, res4.status, http.Status.Moved_Permanently)
 }
 
 @(test)

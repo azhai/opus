@@ -3,13 +3,15 @@ package web
 import "core:encoding/json"
 import "core:mem"
 import "core:net"
+import "../buffer"
+import "../http"
 
 MAX_HEADERS :: 128
 
-Param :: struct {
-	name:  string,
-	value: string,
-}
+// Param is http's name/value pair. The alias keeps `web.Param` in every
+// signature that already used it (query, form, route parameters) while the
+// decoding rules themselves live in the http package.
+Param :: http.Param
 
 /*
 Request is a parsed HTTP/1.1 request.
@@ -21,12 +23,12 @@ request is done.
 */
 Request :: struct {
 	conn:       ^Conn,
-	method:     Method,
-	version:    HTTP_Version,
+	method:     http.Method,
+	version:    http.HTTP_Version,
 	target:     string,
 	path:       string,
 	query:      string,
-	headers:    []Header,
+	headers:    []http.Header,
 	body:       []byte,
 	keep_alive: bool,
 	params:     []Param,
@@ -53,7 +55,7 @@ Request :: struct {
 	route: ^Route,
 	chain: []Middleware,
 	// session and uploads hold per-request state owned by middleware in the
-	// `web/middlewares` subpackage. They are untyped on purpose: the concrete
+	// `middlewares/*` packages. They are untyped on purpose: the concrete
 	// types live in the subpackage, which the parent cannot import. Read
 	// them through that package's accessors, never directly.
 	session: rawptr,
@@ -62,7 +64,7 @@ Request :: struct {
 
 request_header :: proc(r: ^Request, name: string) -> (value: string, ok: bool) {
 	for h in r.headers {
-		if eq_ignore_case(h.key, name) {
+		if http.eq_ignore_case(h.key, name) {
 			return h.value, true
 		}
 	}
@@ -83,88 +85,18 @@ request_allocator :: proc(r: ^Request) -> mem.Allocator {
 // QueryParam, Fiber's Query). Keys and values are form-decoded ('+' → space,
 // %XX), so callers compare and use the decoded forms.
 request_query :: proc(r: ^Request, key: string) -> (string, bool) {
-	alloc := request_allocator(r)
-	q := r.query
-	for len(q) > 0 {
-		end := string_index_byte(q, '&')
-		pair := q
-		if end >= 0 {
-			pair = q[:end]
-			q = q[end + 1:]
-		} else {
-			q = ""
-		}
-		eq := string_index_byte(pair, '=')
-		if eq < 0 {
-			continue
-		}
-		if url_decode(pair[:eq], alloc) == key {
-			return url_decode(pair[eq + 1:], alloc), true
-		}
-	}
-	return "", false
+	return http.query_param(r.query, key, request_allocator(r))
 }
 
 // request_query_all returns every value for key, in order (Echo's
 // QueryParams; repeated query keys are legitimate).
 request_query_all :: proc(r: ^Request, key: string) -> []string {
-	alloc := request_allocator(r)
-	out := make([dynamic]string, alloc)
-	q := r.query
-	for len(q) > 0 {
-		end := string_index_byte(q, '&')
-		pair := q
-		if end >= 0 {
-			pair = q[:end]
-			q = q[end + 1:]
-		} else {
-			q = ""
-		}
-		eq := string_index_byte(pair, '=')
-		if eq < 0 {
-			continue
-		}
-		if url_decode(pair[:eq], alloc) == key {
-			append(&out, url_decode(pair[eq + 1:], alloc))
-		}
-	}
-	return out[:]
+	return http.query_param_all(r.query, key, request_allocator(r))
 }
 
-// form_parse parses an application/x-www-form-urlencoded body into
-// name/value pairs. '+' and %XX are decoded; malformed escapes are kept
-// literally, the same tolerance browsers apply to query strings. Empty
-// segments are skipped, and a key without '=' maps to an empty value.
-form_parse :: proc(body: string, allocator: mem.Allocator = context.allocator) -> []Param {
-	out := make([dynamic]Param, allocator)
-	i := 0
-	for i <= len(body) {
-		j := i
-		for j < len(body) && body[j] != '&' {
-			j += 1
-		}
-		item := body[i:j]
-		if len(item) > 0 {
-			eq := string_index_byte(item, '=')
-			name, value: string
-			if eq >= 0 {
-				name = item[:eq]
-				value = item[eq + 1:]
-			} else {
-				name = item
-			}
-			append(&out, Param {
-				name  = url_decode(name, allocator),
-				value = url_decode(value, allocator),
-			})
-		}
-		i = j + 1
-		if j >= len(body) {
-			break
-		}
-	}
-	return out[:]
-}
+// form_parse decodes an urlencoded body; it is http's rule, named here because
+// the request layer is where callers look for it.
+form_parse :: http.form_parse
 
 // request_form parses the request body as a form and returns its fields. Both
 // encodings are handled: application/x-www-form-urlencoded directly, and
@@ -181,16 +113,8 @@ request_form_value :: proc(r: ^Request, key: string) -> (string, bool) {
 	return param_get(request_form(r), key)
 }
 
-// param_get returns the first value for name in a name/value list; it works
-// for both query and form results (first wins, like Echo's FormValue).
-param_get :: proc(params: []Param, name: string) -> (string, bool) {
-	for p in params {
-		if p.name == name {
-			return p.value, true
-		}
-	}
-	return "", false
-}
+// param_get is http.param_get: first match wins, which is Echo's FormValue.
+param_get :: http.param_get
 
 request_param :: proc(r: ^Request, name: string) -> (string, bool) {
 	for p in r.params {
@@ -244,10 +168,10 @@ request_content_type :: proc(r: ^Request) -> string {
 	if !ok {
 		return ""
 	}
-	if semi := string_index_byte(v, ';'); semi >= 0 {
+	if semi := http.string_index_byte(v, ';'); semi >= 0 {
 		v = v[:semi]
 	}
-	return ascii_lower(trim_ows(v), request_allocator(r))
+	return ascii_lower(http.trim_ows(v), request_allocator(r))
 }
 
 // request_host returns the Host header as sent, port included. Empty for an
@@ -265,12 +189,12 @@ request_hostname :: proc(r: ^Request) -> string {
 		return ""
 	}
 	if host[0] == '[' {
-		if close := string_index_byte(host, ']'); close > 0 {
+		if close := http.string_index_byte(host, ']'); close > 0 {
 			return host[1:close]
 		}
 		return host
 	}
-	if colon := last_index_byte(host, ':'); colon >= 0 {
+	if colon := http.last_index_byte(host, ':'); colon >= 0 {
 		return host[:colon]
 	}
 	return host
@@ -299,16 +223,16 @@ request_remote_addr :: proc(r: ^Request) -> string {
 // to X-Forwarded-For, so the leftmost entry is the client (Echo's RealIP).
 request_client_ip :: proc(r: ^Request) -> string {
 	if v, ok := request_header(r, "X-Real-IP"); ok {
-		if t := trim_ows(v); len(t) > 0 {
+		if t := http.trim_ows(v); len(t) > 0 {
 			return t
 		}
 	}
 	if v, ok := request_header(r, "X-Forwarded-For"); ok {
 		first := v
-		if comma := string_index_byte(v, ','); comma >= 0 {
+		if comma := http.string_index_byte(v, ','); comma >= 0 {
 			first = v[:comma]
 		}
-		if t := trim_ows(first); len(t) > 0 {
+		if t := http.trim_ows(first); len(t) > 0 {
 			return t
 		}
 	}
@@ -322,7 +246,7 @@ request_client_ip :: proc(r: ^Request) -> string {
 // convention jQuery and friends still send.
 request_is_ajax :: proc(r: ^Request) -> bool {
 	v, ok := request_header(r, "X-Requested-With")
-	return ok && eq_ignore_case(trim_ows(v), "XMLHttpRequest")
+	return ok && http.eq_ignore_case(http.trim_ows(v), "XMLHttpRequest")
 }
 
 // request_accepts answers content negotiation for a single media type
@@ -331,32 +255,32 @@ request_is_ajax :: proc(r: ^Request) -> bool {
 // everything (RFC 7231 section 5.3.2).
 request_accepts :: proc(r: ^Request, media_type: string) -> bool {
 	accept, ok := request_header(r, "Accept")
-	if !ok || len(trim_ows(accept)) == 0 {
+	if !ok || len(http.trim_ows(accept)) == 0 {
 		return true
 	}
 	alloc := request_allocator(r)
 	// media type parameters are not part of negotiation
 	wanted := media_type
-	if semi := string_index_byte(wanted, ';'); semi >= 0 {
+	if semi := http.string_index_byte(wanted, ';'); semi >= 0 {
 		wanted = wanted[:semi]
 	}
-	want := ascii_lower(trim_ows(wanted), alloc)
+	want := ascii_lower(http.trim_ows(wanted), alloc)
 	rest := accept
 	for len(rest) > 0 {
 		item := rest
-		if comma := string_index_byte(rest, ','); comma >= 0 {
+		if comma := http.string_index_byte(rest, ','); comma >= 0 {
 			item = rest[:comma]
 			rest = rest[comma + 1:]
 		} else {
 			rest = ""
 		}
-		item = trim_ows(item)
+		item = http.trim_ows(item)
 		if len(item) == 0 {
 			continue
 		}
 		token, params := item, ""
-		if semi := string_index_byte(item, ';'); semi >= 0 {
-			token = trim_ows(item[:semi])
+		if semi := http.string_index_byte(item, ';'); semi >= 0 {
+			token = http.trim_ows(item[:semi])
 			params = item[semi + 1:]
 		}
 		if accept_q_is_zero(params) {
@@ -368,7 +292,7 @@ request_accepts :: proc(r: ^Request, media_type: string) -> bool {
 		}
 		if len(got) >= 2 && got[len(got) - 1] == '*' && got[len(got) - 2] == '/' {
 			prefix := got[:len(got) - 1] // "text/" out of "text/*"
-			if len(want) >= len(prefix) && eq_ignore_case(want[:len(prefix)], prefix) {
+			if len(want) >= len(prefix) && http.eq_ignore_case(want[:len(prefix)], prefix) {
 				return true
 			}
 		}
@@ -387,7 +311,7 @@ request_json :: proc(r: ^Request, v: ^$T, spec := json.DEFAULT_SPECIFICATION) ->
 // accept_q_is_zero reports a q=0 parameter, an explicit refusal. Only a
 // literal zero counts: q=0.000 refuses, q=0.5 does not.
 accept_q_is_zero :: proc(params: string) -> bool {
-	i := string_index(params, "q=")
+	i := http.string_index(params, "q=")
 	if i < 0 {
 		return false
 	}
@@ -421,27 +345,27 @@ Parse_Error :: enum {
 // alive for the lifetime of the request. Header storage is allocated from
 // `allocator`.
 parse_request :: proc(r: ^Request, head: string, allocator: mem.Allocator) -> Parse_Error {
-	line_end := string_index(head, "\r\n")
+	line_end := http.string_index(head, "\r\n")
 	if line_end <= 0 {
 		return .Bad_Request
 	}
 	line := head[:line_end]
 
-	sp1 := string_index_byte(line, ' ')
+	sp1 := http.string_index_byte(line, ' ')
 	if sp1 <= 0 {
 		return .Bad_Request
 	}
-	sp2 := string_index_byte_from(line, ' ', sp1 + 1)
+	sp2 := http.string_index_byte_from(line, ' ', sp1 + 1)
 	if sp2 < 0 {
 		return .Bad_Request
 	}
-	r.method = method_from_string(line[:sp1])
+	r.method = http.method_from_string(line[:sp1])
 	r.target = line[sp1 + 1:sp2]
 	if !parse_version(line[sp2 + 1:], &r.version) {
 		return .Bad_Request
 	}
 
-	qmark := string_index_byte(r.target, '?')
+	qmark := http.string_index_byte(r.target, '?')
 	if qmark >= 0 {
 		r.path = r.target[:qmark]
 		r.query = r.target[qmark + 1:]
@@ -449,7 +373,7 @@ parse_request :: proc(r: ^Request, head: string, allocator: mem.Allocator) -> Pa
 		r.path = r.target
 	}
 
-	headers := make([dynamic]Header, allocator)
+	headers := make([dynamic]http.Header, allocator)
 	rest := head[line_end + 2:]
 	count := 0
 	for len(rest) > 0 {
@@ -457,19 +381,19 @@ parse_request :: proc(r: ^Request, head: string, allocator: mem.Allocator) -> Pa
 		if len(rest) >= 2 && rest[0] == '\r' && rest[1] == '\n' {
 			break
 		}
-		nl := string_index(rest, "\r\n")
+		nl := http.string_index(rest, "\r\n")
 		if nl < 0 {
 			return .Bad_Request
 		}
 		hdr := rest[:nl]
 		rest = rest[nl + 2:]
-		colon := string_index_byte(hdr, ':')
+		colon := http.string_index_byte(hdr, ':')
 		if colon <= 0 {
 			return .Bad_Request
 		}
 		key := hdr[:colon]
-		value := trim_ows(hdr[colon + 1:])
-		append(&headers, Header{key = key, value = value})
+		value := http.trim_ows(hdr[colon + 1:])
+		append(&headers, http.Header{key = key, value = value})
 		count += 1
 		if count > MAX_HEADERS {
 			return .Header_Too_Large
@@ -483,7 +407,7 @@ parse_request :: proc(r: ^Request, head: string, allocator: mem.Allocator) -> Pa
 // Returns the decoded path (a view into the original string when nothing
 // needed decoding).
 url_decode_path :: proc(path: string, allocator: mem.Allocator) -> (string, bool) {
-	if string_index_byte(path, '%') < 0 {
+	if http.string_index_byte(path, '%') < 0 {
 		return path, true
 	}
 	decoded := make([]byte, len(path), allocator)
@@ -491,8 +415,8 @@ url_decode_path :: proc(path: string, allocator: mem.Allocator) -> (string, bool
 	for i := 0; i < len(path); {
 		c := path[i]
 		if c == '%' && i + 2 < len(path) {
-			hi := hex_nibble(path[i + 1])
-			lo := hex_nibble(path[i + 2])
+			hi := http.hex_nibble(path[i + 1])
+			lo := http.hex_nibble(path[i + 2])
 			if hi >= 0 && lo >= 0 {
 				decoded[n] = byte(hi << 4 | lo)
 				n += 1
@@ -507,9 +431,9 @@ url_decode_path :: proc(path: string, allocator: mem.Allocator) -> (string, bool
 	return string(decoded[:n]), true
 }
 
-parse_version :: proc(s: string, v: ^HTTP_Version) -> bool {
+parse_version :: proc(s: string, v: ^http.HTTP_Version) -> bool {
 	// "HTTP/1.1"
-	if len(s) < 8 || !eq_ignore_case(s[:5], "HTTP/") {
+	if len(s) < 8 || !http.eq_ignore_case(s[:5], "HTTP/") {
 		return false
 	}
 	major := s[5] - '0'
@@ -525,68 +449,10 @@ parse_version :: proc(s: string, v: ^HTTP_Version) -> bool {
 	return true
 }
 
-string_index :: proc(s: string, needle: string) -> int {
-	n, m := len(s), len(needle)
-	if m == 0 || n < m {
-		return -1
-	}
-	// header framing needles are one to four bytes; compare them as a word
-	if m <= 8 {
-		return index_word(transmute([]byte)s, needle)
-	}
-	last := n - m
-	for i in 0..=last {
-		match := true
-		for j in 0..<m {
-			if s[i + j] != needle[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
-}
 
-string_index_byte :: proc(s: string, c: byte) -> int {
-	for i in 0..<len(s) {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
 
-string_index_byte_from :: proc(s: string, c: byte, from: int) -> int {
-	for i := from; i < len(s); i += 1 {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
 
-trim_ows :: proc(s: string) -> string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t') {
-		start += 1
-	}
-	for end > start && (s[end - 1] == ' ' || s[end - 1] == '\t') {
-		end -= 1
-	}
-	return s[start:end]
-}
 
-last_index_byte :: proc(s: string, c: byte) -> int {
-	for i := len(s) - 1; i >= 0; i -= 1 {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
 
 // ascii_lower lowercases ASCII letters. The input is returned as a view when
 // it is already lowercase; otherwise the copy lives on `allocator`.
@@ -606,14 +472,3 @@ ascii_lower :: proc(s: string, allocator: mem.Allocator) -> string {
 	return s
 }
 
-hex_nibble :: proc(c: byte) -> int {
-	switch c {
-	case '0'..='9':
-		return int(c - '0')
-	case 'a'..='f':
-		return int(c - 'a' + 10)
-	case 'A'..='F':
-		return int(c - 'A' + 10)
-	}
-	return -1
-}

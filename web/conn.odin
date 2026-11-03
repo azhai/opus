@@ -5,6 +5,8 @@ import "core:mem"
 import "core:nbio"
 import "core:net"
 import "core:time"
+import "../buffer"
+import "../http"
 
 RECV_BUF_SIZE :: 16 << 10
 
@@ -76,13 +78,13 @@ Conn :: struct {
 	scratch: mem.Dynamic_Arena,
 
 	rbuf:     [RECV_BUF_SIZE]byte,
-	inbuf: Buf, // raw bytes not yet consumed (head + body + pipelined)
-	out:      Buf, // response head (and body) pending write
-	body_buf: Buf, // chunked request body staging
+	inbuf: buffer.Buf, // raw bytes not yet consumed (head + body + pipelined)
+	out:      buffer.Buf, // response head (and body) pending write
+	body_buf: buffer.Buf, // chunked request body staging
 
 	// proxy state (see proxy.odin); only live while state == .Proxy
-	proxy_req:      Buf, // serialized upstream request
-	proxy_buf:      Buf, // upstream bytes not yet relayed
+	proxy_req:      buffer.Buf, // serialized upstream request
+	proxy_buf:      buffer.Buf, // upstream bytes not yet relayed
 	proxy_sock:     net.TCP_Socket,
 	proxy_open:     bool,
 	proxy_op:       ^nbio.Operation,
@@ -104,7 +106,7 @@ Conn :: struct {
 	// TLS state (see tls.odin); nil on a plaintext connection
 	tls:            ^Tls_Session,
 	tls_net:        []byte, // ciphertext received from the socket
-	tls_out:        Buf,    // ciphertext waiting to be sent
+	tls_out:        buffer.Buf,    // ciphertext waiting to be sent
 	tls_file_buf:   []byte, // plaintext chunk of a file body
 	tls_file_offset: i64,
 
@@ -214,16 +216,16 @@ conn_new :: proc(s: ^Server, socket: net.TCP_Socket, remote: net.Endpoint) -> ^C
 	c.remote = remote
 	c.state = .Read_Head
 	mem.dynamic_arena_init(&c.scratch, s.allocator)
-	buf_init(&c.inbuf, s.allocator)
-	buf_init(&c.out, s.allocator)
-	buf_init(&c.body_buf, s.allocator)
-	buf_init(&c.proxy_req, s.allocator)
-	buf_init(&c.proxy_buf, s.allocator)
-	buf_init(&c.tls_out, s.allocator)
+	buffer.buf_init(&c.inbuf, s.allocator)
+	buffer.buf_init(&c.out, s.allocator)
+	buffer.buf_init(&c.body_buf, s.allocator)
+	buffer.buf_init(&c.proxy_req, s.allocator)
+	buffer.buf_init(&c.proxy_buf, s.allocator)
+	buffer.buf_init(&c.tls_out, s.allocator)
 	append(&s.conns, c)
 	s.stats.conns_opened += 1
 	s.stats.conns_active = len(s.conns)
-	log_debug("web: conn %v opened", remote)
+	buffer.log_debug("web: conn %v opened", remote)
 	if s.on_conn_open != nil {
 		s.on_conn_open(s, c)
 	}
@@ -240,12 +242,12 @@ conn_destroy :: proc(c: ^Conn) {
 		nbio.close(c.proxy_sock)
 		c.proxy_open = false
 	}
-	buf_destroy(&c.inbuf)
-	buf_destroy(&c.out)
-	buf_destroy(&c.body_buf)
-	buf_destroy(&c.proxy_req)
-	buf_destroy(&c.proxy_buf)
-	buf_destroy(&c.tls_out)
+	buffer.buf_destroy(&c.inbuf)
+	buffer.buf_destroy(&c.out)
+	buffer.buf_destroy(&c.body_buf)
+	buffer.buf_destroy(&c.proxy_req)
+	buffer.buf_destroy(&c.proxy_buf)
+	buffer.buf_destroy(&c.tls_out)
 	if c.file_buf != nil {
 		delete(c.file_buf, c.server.allocator)
 		c.file_buf = nil
@@ -297,7 +299,7 @@ conn_close :: proc(c: ^Conn) {
 	if s.on_conn_close != nil {
 		s.on_conn_close(s, c)
 	}
-	log_debug("web: conn %v closed after %v request(s)", c.remote, c.requests)
+	buffer.log_debug("web: conn %v closed after %v request(s)", c.remote, c.requests)
 	nbio.close_poly(c.socket, c, on_socket_closed)
 }
 
@@ -337,16 +339,16 @@ conn_batch_next :: proc(c: ^Conn) -> bool {
 	if c.tls != nil || file_pending(&c.res) || !c.batch_ok {
 		return false
 	}
-	if buf_len(&c.out) >= WRITE_BATCH_BYTES {
+	if buffer.buf_len(&c.out) >= WRITE_BATCH_BYTES {
 		return false
 	}
-	data := buf_slice(&c.inbuf)
+	data := buffer.buf_slice(&c.inbuf)
 	if len(data) == 0 {
 		return false
 	}
 	// batch_ok means `data` starts at a request head, so the first terminator
 	// found belongs to that head and not to a body left in the buffer
-	return bytes_index(data, "\r\n\r\n") >= 0
+	return buffer.bytes_index(data, "\r\n\r\n") >= 0
 }
 
 // conn_drive advances the connection state machine as far as it can go
@@ -354,7 +356,7 @@ conn_batch_next :: proc(c: ^Conn) -> bool {
 // the Write state is always asynchronous and returns.
 conn_drive :: proc(c: ^Conn) {
 	for {
-		log_debug("DRIVE state=%v in=%v out=%v reqs=%v", c.state, buf_len(&c.inbuf), buf_len(&c.out), c.requests)
+		buffer.log_debug("DRIVE state=%v in=%v out=%v reqs=%v", c.state, buffer.buf_len(&c.inbuf), buffer.buf_len(&c.out), c.requests)
 		switch c.state {
 		case .Read_Head:
 			if !conn_try_head(c) {
@@ -411,7 +413,7 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.recv.err != nil {
-		log_debug("web: conn %v recv error: %v", c.remote, op.recv.err)
+		buffer.log_debug("web: conn %v recv error: %v", c.remote, op.recv.err)
 		conn_close(c)
 		return
 	}
@@ -422,7 +424,7 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	c.server.stats.bytes_in += u64(n)
-	buf_append(&c.inbuf, c.rbuf[:n])
+	buffer.buf_append(&c.inbuf, c.rbuf[:n])
 	conn_drive(c)
 }
 
@@ -432,8 +434,8 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 conn_try_head :: proc(c: ^Conn) -> bool {
 	// anything already in `out` belongs to an earlier request in this pipeline
 	// batch: an error from here on may only discard what this request writes
-	c.out_mark = buf_len(&c.out)
-	data := buf_slice(&c.inbuf)
+	c.out_mark = buffer.buf_len(&c.out)
+	data := buffer.buf_slice(&c.inbuf)
 	// resume where the last scan stopped; a terminator can straddle the
 	// boundary, so back up by its length minus one
 	from := c.head_scanned - 3
@@ -444,12 +446,12 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		from = len(data)
 	}
 	idx := -1
-	if rel := bytes_index(data[from:], "\r\n\r\n"); rel >= 0 {
+	if rel := buffer.bytes_index(data[from:], "\r\n\r\n"); rel >= 0 {
 		idx = from + rel
 	}
 	if idx < 0 {
 		c.head_scanned = len(data)
-		if buf_len(&c.inbuf) >= c.server.max_header_size {
+		if buffer.buf_len(&c.inbuf) >= c.server.max_header_size {
 			conn_error(c, .Header_Too_Large, "431 request header fields too large\n")
 			return true
 		}
@@ -457,7 +459,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		return false
 	}
 	head_len := idx + 4
-	head := clone_string(string(data[:head_len]), conn_scratch(c))
+	head := buffer.clone_string(string(data[:head_len]), conn_scratch(c))
 
 	req := &c.req
 	req^ = {}
@@ -474,7 +476,7 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 		conn_error(c, .Bad_Request, "400 bad request\n")
 		return true
 	}
-	buf_consume(&c.inbuf, head_len)
+	buffer.buf_consume(&c.inbuf, head_len)
 	c.head_scanned = 0
 
 	// the previous response's storage lived on the scratch arena, which was
@@ -487,10 +489,10 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 	// keep-alive negotiation (RFC 7230 section 6.3)
 	conn_hdr, has_conn := request_header(req, "Connection")
 	if req.version.major == 1 && req.version.minor == 0 {
-		c.res.keep_alive = has_conn && eq_ignore_case(conn_hdr, "keep-alive")
+		c.res.keep_alive = has_conn && http.eq_ignore_case(conn_hdr, "keep-alive")
 	} else {
 		c.res.keep_alive = c.server.keep_alive
-		if has_conn && eq_ignore_case(conn_hdr, "close") {
+		if has_conn && http.eq_ignore_case(conn_hdr, "close") {
 			c.res.keep_alive = false
 		}
 	}
@@ -541,9 +543,9 @@ conn_try_head :: proc(c: ^Conn) -> bool {
 			c.state = .Process
 			return true
 		}
-		if buf_len(&c.inbuf) >= blen {
-			c.req.body = clone_bytes(buf_slice(&c.inbuf)[:blen], conn_scratch(c))
-			buf_consume(&c.inbuf, blen)
+		if buffer.buf_len(&c.inbuf) >= blen {
+			c.req.body = buffer.clone_bytes(buffer.buf_slice(&c.inbuf)[:blen], conn_scratch(c))
+			buffer.buf_consume(&c.inbuf, blen)
 			c.state = .Process
 			return true
 		}
@@ -598,17 +600,17 @@ request_framing :: proc(r: ^Request) -> (kind: Body_Kind, length: int, err: Fram
 	cl_count := 0
 	cl_value := ""
 	for h in r.headers {
-		if eq_ignore_case(h.key, "Transfer-Encoding") {
+		if http.eq_ignore_case(h.key, "Transfer-Encoding") {
 			te_count += 1
 			te_last = h.value
-		} else if eq_ignore_case(h.key, "Content-Length") {
+		} else if http.eq_ignore_case(h.key, "Content-Length") {
 			cl_count += 1
 			if cl_count == 1 {
 				cl_value = h.value
 			} else if h.value != cl_value {
 				return .None, 0, .CL_Conflict
 			}
-			if string_index_byte(h.value, ',') >= 0 {
+			if http.string_index_byte(h.value, ',') >= 0 {
 				// a list in one header line: ambiguous, treat as conflict
 				return .None, 0, .CL_Conflict
 			}
@@ -627,7 +629,7 @@ request_framing :: proc(r: ^Request) -> (kind: Body_Kind, length: int, err: Fram
 				break
 			}
 		}
-		if !eq_ignore_case(trim_ows(last), "chunked") {
+		if !http.eq_ignore_case(http.trim_ows(last), "chunked") {
 			return .None, 0, .TE_Unsupported
 		}
 		return .Chunked, 0, .None
@@ -636,7 +638,7 @@ request_framing :: proc(r: ^Request) -> (kind: Body_Kind, length: int, err: Fram
 	if cl_count == 0 {
 		return .None, 0, .None
 	}
-	n, ok := parse_int(cl_value)
+	n, ok := buffer.parse_int(cl_value)
 	if !ok || n < 0 {
 		return .None, 0, .CL_Invalid
 	}
@@ -665,9 +667,9 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 		if c.body_sink.write != nil {
 			// streaming: release each complete chunk instead of accumulating,
 			// and drop the bytes the decoder already released
-			status, consumed := chunked_try_decode(buf_slice(&c.inbuf), &c.body_buf, conn_chunk_emit, c)
+			status, consumed := http.chunked_decode(buffer.buf_slice(&c.inbuf), &c.body_buf, conn_chunk_emit, c)
 			if consumed > 0 {
-				buf_consume(&c.inbuf, consumed)
+				buffer.buf_consume(&c.inbuf, consumed)
 			}
 			switch status {
 			case 1:
@@ -678,7 +680,7 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 				c.state = .Process
 				return true
 			case 0:
-				if buf_len(&c.inbuf) >= c.server.max_body_size {
+				if buffer.buf_len(&c.inbuf) >= c.server.max_body_size {
 					conn_error(c, .Payload_Too_Large, "413 payload too large\n")
 					return true
 				}
@@ -691,24 +693,24 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 			}
 		}
 
-		mark := buf_len(&c.body_buf)
-		status, consumed := chunked_try_decode(buf_slice(&c.inbuf), &c.body_buf)
+		mark := buffer.buf_len(&c.body_buf)
+		status, consumed := http.chunked_decode(buffer.buf_slice(&c.inbuf), &c.body_buf)
 		if status < 0 {
 			conn_error(c, .Bad_Request, "400 malformed chunked body\n")
 			return true
 		}
 		if status == 0 {
-			buf_truncate(&c.body_buf, mark)
-			if buf_len(&c.inbuf) >= c.server.max_body_size {
+			buffer.buf_truncate(&c.body_buf, mark)
+			if buffer.buf_len(&c.inbuf) >= c.server.max_body_size {
 				conn_error(c, .Payload_Too_Large, "413 payload too large\n")
 				return true
 			}
 			conn_recv_arm(c, c.server.header_timeout)
 			return false
 		}
-		c.req.body = clone_bytes(buf_slice(&c.body_buf), conn_scratch(c))
-		buf_reset(&c.body_buf)
-		buf_consume(&c.inbuf, consumed)
+		c.req.body = buffer.clone_bytes(buffer.buf_slice(&c.body_buf), conn_scratch(c))
+		buffer.buf_reset(&c.body_buf)
+		buffer.buf_consume(&c.inbuf, consumed)
 		c.chunked = false
 		c.state = .Process
 		return true
@@ -719,18 +721,18 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 		// the body never has to fit in `inbuf`. A pipelined request behind
 		// this one stays in `inbuf` untouched, because `body_remaining` is
 		// what bounds the slice taken.
-		avail := buf_len(&c.inbuf)
+		avail := buffer.buf_len(&c.inbuf)
 		if avail > 0 {
 			n := avail
 			if n > c.body_remaining {
 				n = c.body_remaining
 			}
-			if !c.body_sink.write(c.body_sink.ud, buf_slice(&c.inbuf)[:n]) {
+			if !c.body_sink.write(c.body_sink.ud, buffer.buf_slice(&c.inbuf)[:n]) {
 				c.body_sink = {}
 				conn_body_sink_error(c)
 				return true
 			}
-			buf_consume(&c.inbuf, n)
+			buffer.buf_consume(&c.inbuf, n)
 			c.body_remaining -= n
 		}
 		if c.body_remaining > 0 {
@@ -744,22 +746,22 @@ conn_try_body :: proc(c: ^Conn) -> bool {
 		return true
 	}
 
-	if buf_len(&c.inbuf) < c.body_remaining {
-		if buf_len(&c.inbuf) > c.server.max_body_size {
+	if buffer.buf_len(&c.inbuf) < c.body_remaining {
+		if buffer.buf_len(&c.inbuf) > c.server.max_body_size {
 			conn_error(c, .Payload_Too_Large, "413 payload too large\n")
 			return true
 		}
 		conn_recv_arm(c, c.server.header_timeout)
 		return false
 	}
-	c.req.body = clone_bytes(buf_slice(&c.inbuf)[:c.body_remaining], conn_scratch(c))
-	buf_consume(&c.inbuf, c.body_remaining)
+	c.req.body = buffer.clone_bytes(buffer.buf_slice(&c.inbuf)[:c.body_remaining], conn_scratch(c))
+	buffer.buf_consume(&c.inbuf, c.body_remaining)
 	c.body_remaining = 0
 	c.state = .Process
 	return true
 }
 
-// conn_chunk_emit is the Chunk_Emit adapter for a chunked body delivered to a
+// conn_chunk_emit is the http.Chunk_Emit adapter for a chunked body delivered to a
 // body sink: the decoder calls it once per complete chunk.
 @(private)
 conn_chunk_emit :: proc(ud: rawptr, chunk: []byte) -> bool {
@@ -833,9 +835,9 @@ conn_process_tail :: proc(c: ^Conn) {
 
 	// an explicit Connection header from the handler wins over negotiation
 	if v, ok := response_header(w, "Connection"); ok {
-		if eq_ignore_case(v, "close") {
+		if http.eq_ignore_case(v, "close") {
 			w.keep_alive = false
-		} else if eq_ignore_case(v, "keep-alive") {
+		} else if http.eq_ignore_case(v, "keep-alive") {
 			w.keep_alive = true
 		}
 	}
@@ -850,13 +852,13 @@ conn_begin_write :: proc(c: ^Conn) {
 		tls_write_loop(c)
 		return
 	}
-	if buf_len(&c.out) == 0 {
+	if buffer.buf_len(&c.out) == 0 {
 		conn_after_write(c)
 		return
 	}
 	c.op = nbio.send_poly(
 		c.socket,
-		[][]byte{buf_slice(&c.out)},
+		[][]byte{buffer.buf_slice(&c.out)},
 		c,
 		on_sent,
 		all = true,
@@ -871,19 +873,19 @@ send, so callers can continue synchronously.
 */
 conn_flush_out :: proc(c: ^Conn, cb: proc(op: ^nbio.Operation, c: ^Conn)) -> bool {
 	if c.tls != nil {
-		if buf_len(&c.out) > 0 {
-			if !tls_encrypt(c, buf_slice(&c.out)) {
+		if buffer.buf_len(&c.out) > 0 {
+			if !tls_encrypt(c, buffer.buf_slice(&c.out)) {
 				conn_close(c)
 				return true
 			}
-			buf_reset(&c.out)
+			buffer.buf_reset(&c.out)
 		}
-		if buf_len(&c.tls_out) == 0 {
+		if buffer.buf_len(&c.tls_out) == 0 {
 			return false
 		}
 		c.op = nbio.send_poly(
 			c.socket,
-			[][]byte{buf_slice(&c.tls_out)},
+			[][]byte{buffer.buf_slice(&c.tls_out)},
 			c,
 			cb,
 			all = true,
@@ -891,12 +893,12 @@ conn_flush_out :: proc(c: ^Conn, cb: proc(op: ^nbio.Operation, c: ^Conn)) -> boo
 		)
 		return true
 	}
-	if buf_len(&c.out) == 0 {
+	if buffer.buf_len(&c.out) == 0 {
 		return false
 	}
 	c.op = nbio.send_poly(
 		c.socket,
-		[][]byte{buf_slice(&c.out)},
+		[][]byte{buffer.buf_slice(&c.out)},
 		c,
 		cb,
 		all = true,
@@ -909,10 +911,10 @@ conn_flush_out :: proc(c: ^Conn, cb: proc(op: ^nbio.Operation, c: ^Conn)) -> boo
 conn_after_send :: proc(c: ^Conn, sent: int) {
 	c.server.stats.bytes_out += u64(sent)
 	if c.tls != nil {
-		buf_reset(&c.tls_out)
+		buffer.buf_reset(&c.tls_out)
 		return
 	}
-	buf_reset(&c.out)
+	buffer.buf_reset(&c.out)
 }
 
 on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
@@ -921,12 +923,12 @@ on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: conn %v send error: %v", c.remote, op.send.err)
+		buffer.log_debug("web: conn %v send error: %v", c.remote, op.send.err)
 		conn_close(c)
 		return
 	}
 	c.server.stats.bytes_out += u64(op.send.sent)
-	buf_reset(&c.out)
+	buffer.buf_reset(&c.out)
 
 	w := &c.res
 	if file_pending(w) && c.send_phase != .File {
@@ -976,7 +978,7 @@ conn_file_next :: proc(c: ^Conn) {
 	if c.file_buf == nil {
 		c.file_buf = make([]byte, FILE_CHUNK, c.server.allocator)
 		if c.file_buf == nil {
-			log_debug("web: conn %v cannot allocate the file buffer", c.remote)
+			buffer.log_debug("web: conn %v cannot allocate the file buffer", c.remote)
 			conn_close(c)
 			return
 		}
@@ -1002,7 +1004,7 @@ on_file_read :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.read.err != nil {
-		log_debug("web: conn %v file read error: %v", c.remote, op.read.err)
+		buffer.log_debug("web: conn %v file read error: %v", c.remote, op.read.err)
 		conn_close(c)
 		return
 	}
@@ -1012,7 +1014,7 @@ on_file_read :: proc(op: ^nbio.Operation, c: ^Conn) {
 		// a rotated segment). Content-Length is already on the wire, so the
 		// only honest ending is to drop the connection and let the player
 		// re-request the range - padding the body would be a lie.
-		log_debug("web: conn %v file body short at %v/%v", c.remote, c.file_sent, c.res.file_size)
+		buffer.log_debug("web: conn %v file body short at %v/%v", c.remote, c.file_sent, c.res.file_size)
 		conn_close(c)
 		return
 	}
@@ -1032,7 +1034,7 @@ on_file_chunk_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	if op.send.err != nil {
-		log_debug("web: conn %v file send error: %v", c.remote, op.send.err)
+		buffer.log_debug("web: conn %v file send error: %v", c.remote, op.send.err)
 		conn_close(c)
 		return
 	}
@@ -1053,7 +1055,7 @@ conn_file_finish :: proc(c: ^Conn) {
 // conn_after_write either starts the next pipelined request or parks the
 // connection in keep-alive idle.
 conn_after_write :: proc(c: ^Conn) {
-	log_debug("AFTER_WRITE closed=%v keep_alive=%v closing=%v in=%v", c.closed, c.res.keep_alive, c.closing, buf_len(&c.inbuf))
+	buffer.log_debug("AFTER_WRITE closed=%v keep_alive=%v closing=%v in=%v", c.closed, c.res.keep_alive, c.closing, buffer.buf_len(&c.inbuf))
 	if c.closed {
 		return
 	}
@@ -1066,7 +1068,7 @@ conn_after_write :: proc(c: ^Conn) {
 	c.state = .Read_Head
 
 	// pipelined bytes may already be buffered
-	if buf_len(&c.inbuf) > 0 {
+	if buffer.buf_len(&c.inbuf) > 0 {
 		conn_drive(c)
 		return
 	}
@@ -1083,11 +1085,11 @@ conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 		// still accumulating: the buffered responses live in arena memory, and
 		// rewinding the arena would hand their bytes to the next request.
 		mem.dynamic_arena_reset(&c.scratch)
-		buf_reset(&c.out)
+		buffer.buf_reset(&c.out)
 	}
-	buf_reset(&c.body_buf)
-	buf_reset(&c.proxy_req)
-	buf_reset(&c.proxy_buf)
+	buffer.buf_reset(&c.body_buf)
+	buffer.buf_reset(&c.proxy_req)
+	buffer.buf_reset(&c.proxy_buf)
 	c.req = {}
 	c.res = {}
 	c.body_remaining = 0
@@ -1114,11 +1116,11 @@ conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 
 // conn_error emits a minimal error response and closes the connection
 // once it has been written.
-conn_error :: proc(c: ^Conn, status: Status, msg: string) {
-	log_debug("web: conn %v error %v", c.remote, status)
+conn_error :: proc(c: ^Conn, status: http.Status, msg: string) {
+	buffer.log_debug("web: conn %v error %v", c.remote, status)
 	// truncate, not reset: responses for earlier requests in the same pipeline
 	// batch are already sitting in `c.out` and their client is waiting for them
-	buf_truncate(&c.out, c.out_mark)
+	buffer.buf_truncate(&c.out, c.out_mark)
 	w := &c.res
 	response_reset(w, c, conn_scratch(c))
 	w.status = status
@@ -1129,7 +1131,7 @@ conn_error :: proc(c: ^Conn, status: Status, msg: string) {
 	c.closing = true
 }
 
-parse_error_status :: proc(e: Parse_Error) -> Status {
+parse_error_status :: proc(e: Parse_Error) -> http.Status {
 	#partial switch e {
 	case .URI_Too_Long:
 		return .URI_Too_Long
@@ -1143,7 +1145,7 @@ path_is_safe :: proc(p: string) -> bool {
 	if !path_prefix_ok(p) {
 		return false
 	}
-	if string_index(p, "..") >= 0 {
+	if http.string_index(p, "..") >= 0 {
 		return false
 	}
 	return true
@@ -1167,46 +1169,5 @@ path_prefix_ok :: proc(p: string) -> bool {
 	return true
 }
 
-contains_ignore_case :: proc(s, sub: string) -> bool {
-	if len(sub) == 0 {
-		return true
-	}
-	if len(s) < len(sub) {
-		return false
-	}
-	for i in 0..=len(s) - len(sub) {
-		match := true
-		for j in 0..<len(sub) {
-			if lower_ascii(s[i + j]) != lower_ascii(sub[j]) {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}
 
-lower_ascii :: proc(c: byte) -> byte {
-	if c >= 'A' && c <= 'Z' {
-		return c + ('a' - 'A')
-	}
-	return c
-}
 
-parse_int :: proc(s: string) -> (int, bool) {
-	if len(s) == 0 || len(s) > 18 {
-		return 0, false
-	}
-	v := 0
-	for i in 0..<len(s) {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		v = v * 10 + int(c - '0')
-	}
-	return v, true
-}

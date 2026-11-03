@@ -1,6 +1,8 @@
 package web
 
 import "core:net"
+import "../buffer"
+import "../http"
 
 /*
 Streaming helpers for connections taken over with response_hijack.
@@ -57,38 +59,38 @@ it outlives the call.
 */
 stream_write_head :: proc(
 	socket: net.TCP_Socket,
-	status: Status,
-	headers: []Header,
+	status: http.Status,
+	headers: []http.Header,
 	content_length: int,
 	allocator := context.allocator,
 ) -> bool {
-	b: Buf
-	buf_init(&b, allocator)
-	defer buf_destroy(&b)
+	b: buffer.Buf
+	buffer.buf_init(&b, allocator)
+	defer buffer.buf_destroy(&b)
 
-	buf_append_string(&b, "HTTP/1.1 ")
-	write_padded_i64(&b, i64(status), 3)
-	buf_append_byte(&b, ' ')
-	buf_append_string(&b, status_text(status))
-	buf_append_string(&b, "\r\n")
+	buffer.buf_append_string(&b, "HTTP/1.1 ")
+	buffer.write_padded_i64(&b, i64(status), 3)
+	buffer.buf_append_byte(&b, ' ')
+	buffer.buf_append_string(&b, http.status_text(status))
+	buffer.buf_append_string(&b, "\r\n")
 	connection_set := false
 	for h in headers {
-		if eq_ignore_case(h.key, "Connection") {
+		if http.eq_ignore_case(h.key, "Connection") {
 			connection_set = true
 		}
-		buf_append_string(&b, h.key)
-		buf_append_string(&b, ": ")
-		buf_append_string(&b, h.value)
-		buf_append_string(&b, "\r\n")
+		buffer.buf_append_string(&b, h.key)
+		buffer.buf_append_string(&b, ": ")
+		buffer.buf_append_string(&b, h.value)
+		buffer.buf_append_string(&b, "\r\n")
 	}
 	if content_length >= 0 {
-		buf_append_string(&b, "Content-Length: ")
-		write_padded_i64(&b, i64(content_length), 1)
-		buf_append_string(&b, "\r\n")
+		buffer.buf_append_string(&b, "Content-Length: ")
+		buffer.write_padded_i64(&b, i64(content_length), 1)
+		buffer.buf_append_string(&b, "\r\n")
 	} else if !connection_set {
-		buf_append_string(&b, "Connection: close\r\n")
+		buffer.buf_append_string(&b, "Connection: close\r\n")
 	}
-	buf_append_string(&b, "\r\n")
+	buffer.buf_append_string(&b, "\r\n")
 
-	return stream_write(socket, buf_slice(&b))
+	return stream_write(socket, buffer.buf_slice(&b))
 }

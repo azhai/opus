@@ -5,6 +5,7 @@ import "core:nbio"
 import "core:net"
 import "core:thread"
 import "core:time"
+import "../buffer"
 
 /*
 Multi-acceptor mode: several Server instances, one per thread, each with its
@@ -109,7 +110,7 @@ server_run_multi :: proc(servers: []^Server, done: ^bool) -> bool {
 
 	boost_thread_qos()
 	if err := nbio.acquire_thread_event_loop(); err != nil {
-		log_error("web: cannot acquire event loop: %v", err)
+		buffer.log_error("web: cannot acquire event loop: %v", err)
 		return false
 	}
 	defer nbio.release_thread_event_loop()
@@ -123,7 +124,7 @@ server_run_multi :: proc(servers: []^Server, done: ^bool) -> bool {
 	if len(servers) > 1 {
 		ep, oerr := nbio.bound_endpoint(main.listen_socket)
 		if oerr != nil {
-			log_error("web: cannot read bound endpoint: %v", oerr)
+			buffer.log_error("web: cannot read bound endpoint: %v", oerr)
 			server_release(main)
 			return false
 		}
@@ -173,7 +174,7 @@ server_thread_proc :: proc(t: ^thread.Thread) {
 	s := a.srv
 	boost_thread_qos()
 	if err := nbio.acquire_thread_event_loop(); err != nil {
-		log_error("web: acceptor thread cannot acquire an event loop: %v", err)
+		buffer.log_error("web: acceptor thread cannot acquire an event loop: %v", err)
 		return
 	}
 	defer nbio.release_thread_event_loop()

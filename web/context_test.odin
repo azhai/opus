@@ -8,6 +8,8 @@ import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:testing"
+import "../buffer"
+import "../http"
 
 // context_test_conn builds a Conn whose scratch arena the caller owns: the
 // request allocator routes through it, so decoded strings are freed by
@@ -29,12 +31,12 @@ test_request_context_helpers :: proc(t: ^testing.T) {
 	req.target = "/search?q=odin&tag=a&tag=b"
 	req.path = "/search"
 	req.query = "q=odin&tag=a&tag=b"
-	req.headers = []Header {
-		Header{key = "Host", value = "example.com:8080"},
-		Header{key = "Content-Type", value = "Application/JSON; charset=utf-8"},
-		Header{key = "Accept", value = "text/html, application/json;q=0.9"},
-		Header{key = "X-Requested-With", value = "XMLHttpRequest"},
-		Header{key = "X-Forwarded-For", value = "203.0.113.7, 10.0.0.1"},
+	req.headers = []http.Header {
+		http.Header{key = "Host", value = "example.com:8080"},
+		http.Header{key = "Content-Type", value = "Application/JSON; charset=utf-8"},
+		http.Header{key = "Accept", value = "text/html, application/json;q=0.9"},
+		http.Header{key = "X-Requested-With", value = "XMLHttpRequest"},
+		http.Header{key = "X-Forwarded-For", value = "203.0.113.7, 10.0.0.1"},
 	}
 
 	testing.expect_value(t, request_content_type(&req), "application/json")
@@ -63,7 +65,7 @@ test_request_context_helpers :: proc(t: ^testing.T) {
 test_request_hostname_variants :: proc(t: ^testing.T) {
 	by_host :: proc(host: string) -> string {
 		req := Request {
-			headers = []Header{Header{key = "Host", value = host}},
+			headers = []http.Header{http.Header{key = "Host", value = host}},
 		}
 		return request_hostname(&req)
 	}
@@ -83,7 +85,7 @@ test_request_accepts_wildcards :: proc(t: ^testing.T) {
 	// "type/*" matches every subtype of that type, nothing else
 	req := Request {
 		conn    = &c,
-		headers = []Header{Header{key = "Accept", value = "text/*"}},
+		headers = []http.Header{http.Header{key = "Accept", value = "text/*"}},
 	}
 	testing.expect(t, request_accepts(&req, "text/plain"))
 	testing.expect(t, request_accepts(&req, "text/html; charset=utf-8"))
@@ -92,14 +94,14 @@ test_request_accepts_wildcards :: proc(t: ^testing.T) {
 	// "*/*" accepts everything
 	req_wild := Request {
 		conn    = &c,
-		headers = []Header{Header{key = "Accept", value = "*/*"}},
+		headers = []http.Header{http.Header{key = "Accept", value = "*/*"}},
 	}
 	testing.expect(t, request_accepts(&req_wild, "image/png"))
 
 	// q=0 is a refusal
 	req_zero := Request {
 		conn    = &c,
-		headers = []Header{Header{key = "Accept", value = "application/json;q=0"}},
+		headers = []http.Header{http.Header{key = "Accept", value = "application/json;q=0"}},
 	}
 	testing.expect(t, !request_accepts(&req_zero, "application/json"))
 
@@ -124,7 +126,7 @@ test_request_json_binds_struct :: proc(t: ^testing.T) {
 	req: Request
 	req.conn = &c
 	req.body = tb(`{"name":"ada","id":42}`)
-	req.headers = []Header{Header{key = "Content-Type", value = "application/json"}}
+	req.headers = []http.Header{http.Header{key = "Content-Type", value = "application/json"}}
 
 	testing.expect_value(t, request_content_type(&req), "application/json")
 
@@ -154,8 +156,8 @@ test_response_error_and_disposition :: proc(t: ^testing.T) {
 	response_init(&res, &c, conn_scratch(&c))
 
 	response_error(&res, .Not_Found)
-	testing.expect_value(t, res.status, Status.Not_Found)
-	testing.expect_value(t, string(buf_slice(&res.body)), "Not Found\n")
+	testing.expect_value(t, res.status, http.Status.Not_Found)
+	testing.expect_value(t, string(buffer.buf_slice(&res.body)), "Not Found\n")
 	ct, _ := response_header(&res, "Content-Type")
 	testing.expect_value(t, ct, "text/plain; charset=utf-8")
 	testing.expect_value(t, response_body_size(&res), i64(len("Not Found\n")))
@@ -195,8 +197,8 @@ test_response_json_status :: proc(t: ^testing.T) {
 		ok: bool,
 	}
 	testing.expect(t, response_json_status(&res, .Created, Payload{ok = true}) == nil)
-	testing.expect_value(t, res.status, Status.Created)
-	body := string(buf_slice(&res.body))
+	testing.expect_value(t, res.status, http.Status.Created)
+	body := string(buffer.buf_slice(&res.body))
 	testing.expect(t, strings.contains(body, `"ok"`))
 	testing.expect(t, strings.contains(body, "true"))
 }
@@ -212,7 +214,7 @@ test_response_download_missing_file :: proc(t: ^testing.T) {
 	response_init(&res, &c, conn_scratch(&c))
 
 	testing.expect(t, !response_download(&res, "/tmp/web_test_no_such_file.bin", "x.bin"))
-	testing.expect_value(t, res.status, Status.Internal_Error)
+	testing.expect_value(t, res.status, http.Status.Internal_Error)
 	// the failure path must not leave a disposition behind
 	_, has_cd := response_header(&res, "Content-Disposition")
 	testing.expect(t, !has_cd)
@@ -231,9 +233,9 @@ test_request_client_ip_precedence :: proc(t: ^testing.T) {
 	// X-Real-IP wins over X-Forwarded-For
 	req := Request {
 		conn    = &c,
-		headers = []Header {
-			Header{key = "X-Real-IP", value = "203.0.113.9"},
-			Header{key = "X-Forwarded-For", value = "198.51.100.1, 10.0.0.1"},
+		headers = []http.Header {
+			http.Header{key = "X-Real-IP", value = "203.0.113.9"},
+			http.Header{key = "X-Forwarded-For", value = "198.51.100.1, 10.0.0.1"},
 		},
 	}
 	testing.expect_value(t, request_client_ip(&req), "203.0.113.9")
@@ -241,16 +243,16 @@ test_request_client_ip_precedence :: proc(t: ^testing.T) {
 	// without X-Real-IP, the leftmost X-Forwarded-For entry, trimmed
 	req_xff := Request {
 		conn    = &c,
-		headers = []Header{Header{key = "X-Forwarded-For", value = " 198.51.100.2 , 10.0.0.1"}},
+		headers = []http.Header{http.Header{key = "X-Forwarded-For", value = " 198.51.100.2 , 10.0.0.1"}},
 	}
 	testing.expect_value(t, request_client_ip(&req_xff), "198.51.100.2")
 
 	// an empty X-Real-IP is not an address: fall through to X-Forwarded-For
 	req_empty := Request {
 		conn    = &c,
-		headers = []Header {
-			Header{key = "X-Real-IP", value = "   "},
-			Header{key = "X-Forwarded-For", value = "198.51.100.3"},
+		headers = []http.Header {
+			http.Header{key = "X-Real-IP", value = "   "},
+			http.Header{key = "X-Forwarded-For", value = "198.51.100.3"},
 		},
 	}
 	testing.expect_value(t, request_client_ip(&req_empty), "198.51.100.3")
@@ -267,12 +269,12 @@ test_request_client_ip_precedence :: proc(t: ^testing.T) {
 @(test)
 test_request_is_ajax :: proc(t: ^testing.T) {
 	ajax := Request {
-		headers = []Header{Header{key = "X-Requested-With", value = "xmlhttprequest"}},
+		headers = []http.Header{http.Header{key = "X-Requested-With", value = "xmlhttprequest"}},
 	}
 	testing.expect(t, request_is_ajax(&ajax))
 
 	fetch := Request {
-		headers = []Header{Header{key = "X-Requested-With", value = "fetch"}},
+		headers = []http.Header{http.Header{key = "X-Requested-With", value = "fetch"}},
 	}
 	testing.expect(t, !request_is_ajax(&fetch))
 

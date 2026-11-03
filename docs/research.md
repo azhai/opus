@@ -122,6 +122,11 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 
 ## 2. 架构分层
 
+> 下面的框图是 v0.6（单包）时的快照，用来对照 lighttpd2 的分层。v0.7 之后已按
+> 目录拆成根级 `buffer` / `http` / `codecs` / `multipart` / `pattern` / `web`
+> 与根级 `middlewares/*`，实际结构以 README「目录结构」为准。框里的
+> `middlewares/` 指的是当时的 `web/middlewares/`（`import ".."` 那行同理）。
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │ 用户代码：Handler / Router / Middleware / Static /    │  ← Mongoose 式 API
@@ -136,7 +141,7 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 │   auth         Basic / Bearer / API-Key                │
 │   range        Range/ETag（handler 无感）               │
 │   form         middleware_form（解析留在父包）          │
-│   gzip         middleware_gzip / _no_gzip               │
+│   coding       middleware_coding / _no_coding           │
 │   session      签名 Cookie 会话                         │
 │   jwt          HS256 校验与签发                         │
 │   static       目录树挂载（可 SPA 回落）                │
@@ -158,7 +163,7 @@ odin-http（laytan/odin-http，MIT）是 Odin 社区最完整的 HTTP/1.1 实现
 │ filter.odin    Filter 链 + chunked 编解码（可流式交出） │
 │ multipart_stream.odin  增量 multipart 解析            │
 │ upload.odin    Upload_Sink：part 写临时文件 + 清理     │
-│ compress.odin  gzip/deflate 编码器 + 内容协商          │
+│ coding_filter.odin  Coding_Filter：把协商结果落到响应上 │
 │ tls.odin       TLS：OpenSSL 运行时加载 + memory BIO    │
 │ sse.odin       SSE：chunked 帧 + 事件/注释/重连        │
 │ stream.odin    hijack 后的裸 socket 写辅助             │
@@ -269,8 +274,11 @@ Odin 原生版）。收益：
 3. **常量数组不能用变量索引**——`WEEKDAY_NAMES[dow]` 要求 `::` 数组改包级 `:=` 变量。
 4. **`nbio.Handle` 是 FD distinct 类型**，没有 nil 值；需要"可选"语义时配 bool 标志。
 5. **`odin check web/` 对库包误报缺 main**——验证库用 `odin build web -build-mode:static`；  
-   测试用 `odin test web/`。
+   测试按包跑 `odin test web -define:ODIN_TEST_THREADS=1`（中间件同理，
+   `odin test middlewares/auth ...`）。
 6. **子目录 import 不解析包名**——`examples/` 里必须 `import "../../web"` 相对路径。
+   **包名在整个构建里必须唯一**：不同目录同名也报 `Duplicate declaration of
+   'package X'`（所以根级编码器包叫 `codecs` 而不是 `coding`）。
 7. **`transmute([]byte)"字面量"` 不允许**——方向是 `transmute([]byte)string(...)`。
 8. **方法调用糖不存在**——`w.file_pending()` 要写 `file_pending(w)`。
 9. **测试里起服务线程：栈局部变量会悬空**——`integration_spin` 把 `Server`/`done`  
@@ -397,7 +405,7 @@ Odin 原生版）。收益：
   TE、重复/列表型/冲突 CL 一律 400（请求走私防护）；代理侧对上游响应  
   同样严格，违规回 502
 - [x] gzip/deflate 内容编码：greedy LZ77 + 固定 Huffman 的自研编码器（无第三方  
-  依赖），`Compress_Filter` 按 `Accept-Encoding` 协商、与 chunked 串成  
+  依赖），`Coding_Filter` 按 `Accept-Encoding` 协商、与 chunked 串成  
   「先编码后分帧」，跳过 `sendfile` 文件体与不可压缩类型
 - [x] 代理流式化：head 即时下发、body 按帧边收边发，内存不随响应大小增长；  
   增量 chunked 扫描器 + close-delimited 重分帧（HTTP/1.0 回退关闭连接）
@@ -436,9 +444,9 @@ Odin 原生版）。收益：
   「不告诉客户端」的区别
 - [x] 上传落盘：multipart 文件写磁盘（目录按需建、文件名消毒+时间戳），  
   handler 拿路径与大小；非 multipart 正文放行给下一个中间件
-- [x] gzip 开关：`middleware_gzip` / `middleware_no_gzip` 按响应设  
-  「压/不压/阈值」（`Response.compress` / `compress_min`），压缩本身仍由  
-  内置 `Compress_Filter` 做；`Vary: Accept-Encoding` 提前到决策之前加
+- [x] 内容编码开关：`middleware_coding` / `middleware_no_coding` 按响应设  
+  「压/不压/阈值」（`Response.coding` / `coding_min_size`），编码本身仍由  
+  内置 `Coding_Filter` 做；`Vary: Accept-Encoding` 提前到决策之前加
 - [x] 路由表改成 `[dynamic]^Route`：路由堆分配、表只存指针，`router_add`  
   返回的 `^Route` 不再因后续注册而失效（原先会静默写进已释放内存）
 - [x] 测试文件按主题拆分（原 `web_test.odin` 3300+ 行 → 14 个主题文件），  
@@ -462,6 +470,26 @@ Odin 原生版）。收益：
   （超过阈值写临时文件，请求结束由 `teardown` 清理）；`Server.on_head`  
   在正文读之前接管；160 个测试（`web` 118 + `web/middlewares` 42），全过、零泄漏
 
+已实现（v0.7，安全能力 + 目录结构重排）：
+
+- [x] TOTP 两步验证（RFC 6238）：HMAC-SHA1 六位码、`±skew` 窗口、重放记账记
+  **匹配到的那个窗口**（记当前窗口的话，同一个码在 skew 范围内还能再用一次）、
+  恢复码哈希绑定 user id（否则 A 的码在 B 账号上有效）、状态文件 AEAD 加密落盘
+  且 `load_failed` 时**拒绝覆盖**（空状态会静默关掉所有人的 2FA）；
+  `middleware_totp` 是两阶段闸门：只过了密码的会话跳 `/totp`（非导航请求回
+  401 + `X-Totp-Challenge`），两因素齐了才放行
+- [x] 按目录拆包（Odin 一目录一 package，包名在整个构建里唯一）：
+  `buffer` → `http` → {`multipart`, `codecs`, `pattern`} → `web`，中间件独立成
+  根级 `middlewares/*`（11 个子包）+ 根级 `testenv` 测试夹具。判据只有一条：**只凭字节
+  就能回答的下沉，要改 `Conn`（或指向它的 `Request`/`Response`）的留在 `web`**
+  ——因为 Odin 不许循环 import，代理、TLS、异步续延、上传 sink、路由、静态、
+  filter 与状态机同包；`web` 只向下依赖，叶子包互不依赖
+- [x] 内容编码四层分家：规则（`http.negotiate_coding`）→ 编码器（`codecs`）→
+  执行（`web.Coding_Filter`，唯一同时看得到请求头、响应体和 `Conn` 的地方）→
+  路由开关（`middlewares/coding`，只写两个字段，一个字节都不压）。此前同一个
+  概念散在三处，「改一处忘一处」
+- [x] 234 个测试按包跑（根级 168 + 中间件 66），全过、零泄漏
+
 
 后续（按优先级）：
 
@@ -472,7 +500,7 @@ Odin 原生版）。收益：
 3. **非 multipart 正文也走 sink**：现在只有 multipart 装了 sink，其它正文仍  
    受 `max_body_size` 约束；补一个「整包 spool 到临时文件」的 sink（`req.body_file`）  
    就能让任意大正文（JSON 大对象、CSV 导入）也不进军内存。
-4. **chunked 请求体的 part 级流式**：`chunked_try_decode` 已能逐 chunk 交出，  
+4. **chunked 请求体的 part 级流式**：`http.chunked_decode` 已能逐 chunk 交出，  
    但当单个 chunk 本身很大时仍会攒满一块；按「数据段」而非「chunk」交出即可。
 5. **Hub 按主题索引订阅者**：目前 `hub_publish` 广播给所有订阅者；万人级、多  
    channel 的场景需要 per-channel 索引，否则每次发布都要遍历全集。
@@ -481,7 +509,10 @@ Odin 原生版）。收益：
 
 ## 7. 测试策略
 
-`odin test web/`（118 个）+ `odin test web/middlewares`（42 个）覆盖三层：
+按包跑，共 **234** 个用例（根级 168 + 中间件 66），覆盖三层。`ODIN_TEST_THREADS=1`
+不是可选项：集成测试各自在自己线程上跑一个 nbio 事件循环，而 nbio 的操作归创建它的
+线程所有，并行会 panic「nbio.remove called on different thread」，连带把 hub / async
+的用例一起带崩。命令见 README「构建与测试」。
 
 - **纯函数单测**：parser（含畸形输入、OWS 修剪、URL 解码）、chunked 编解码、  
   router（param/405/通配/中间件链顺序）、response 序列化（GET/HEAD/空文件）、  
@@ -529,7 +560,7 @@ Odin 原生版）。收益：
   服务）、以及「1..N 字节窗口逐个喂」的增量解析等价测试（分隔符跨界、正文内含  
   分隔符前缀、空 part、无尾 CRLF、多 part 顺序与 `index`/`size`、前导/后置  
   垃圾、分隔行尾判定与 transport padding）。
-- **中间件测试**（`web/middlewares/*_test.odin`，42 个）：不建 socket，  
+- **中间件测试**（`middlewares/*/*_test.odin`，66 个；夹具在根级 `testenv`）：不建 socket，  
   用合成 `Conn` 走真实 `router_handle` 派发，所以链的顺序、短路与  
   路由级链都按生产路径执行。覆盖 Bearer 的三种 challenge 文案与 principal  
   传递、API-Key 的头/query 两种取法、表单 urlencoded 与 multipart（含  

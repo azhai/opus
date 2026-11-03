@@ -17,6 +17,8 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
+import "../http"
 // ---------------------------------------------------------------------------
 // TLS (OpenSSL loaded at run time)
 // ---------------------------------------------------------------------------
@@ -215,7 +217,7 @@ test_integration_tls_keep_alive :: proc(t: ^testing.T) {
 			break
 		}
 		total += int(n)
-		if bytes_contains(buf[:total], "secure /one") {
+		if buffer.bytes_contains(buf[:total], "secure /one") {
 			break
 		}
 	}
@@ -282,7 +284,7 @@ test_integration_tls_static_file :: proc(t: ^testing.T) {
 	resp := tls_test_read_all(&client)
 	defer delete(resp)
 
-	head_end := bytes_index(resp, "\r\n\r\n")
+	head_end := buffer.bytes_index(resp, "\r\n\r\n")
 	testing.expect(t, head_end > 0)
 	body := resp[head_end + 4:]
 	testing.expectf(t, len(body) == len(content), "body is %d bytes, expected %d", len(body), len(content))
@@ -411,11 +413,11 @@ tls_ticket_probe :: proc(t: ^testing.T, cfg: ^Tls_Config) -> (issued: int, ok: b
 			break
 		}
 		total += int(n)
-		if bytes_contains(buf[:total], "secure /one") {
+		if buffer.bytes_contains(buf[:total], "secure /one") {
 			break
 		}
 	}
-	if !bytes_contains(buf[:total], "secure /one") {
+	if !buffer.bytes_contains(buf[:total], "secure /one") {
 		return 0, false
 	}
 	// bounded wait for the post-handshake ticket when there is one
@@ -481,23 +483,23 @@ test_mime_type_for :: proc(t: ^testing.T) {
 		{"/a/x.unknown", "application/octet-stream"},
 	}
 	for c in cases {
-		testing.expectf(t, mime_type_for(c.path) == c.want, "%s → %s, want %s", c.path, mime_type_for(c.path), c.want)
+		testing.expectf(t, http.mime_type_for(c.path) == c.want, "%s → %s, want %s", c.path, http.mime_type_for(c.path), c.want)
 	}
 
 	// charset=false is the byte-exact form (uhttpd-style headers)
-	testing.expect_value(t, mime_type_for("/a/x.html", false), "text/html")
-	testing.expect_value(t, mime_type_for("/a/x.js", false), "text/javascript")
-	testing.expect_value(t, mime_type_for("/a/x.png", false), "image/png")
+	testing.expect_value(t, http.mime_type_for("/a/x.html", false), "text/html")
+	testing.expect_value(t, http.mime_type_for("/a/x.js", false), "text/javascript")
+	testing.expect_value(t, http.mime_type_for("/a/x.png", false), "image/png")
 }
 
 @(test)
 test_status_text :: proc(t: ^testing.T) {
-	testing.expect_value(t, status_text(.OK), "OK")
-	testing.expect_value(t, status_text(.See_Other), "See Other")
-	testing.expect_value(t, status_text(.Temporary_Redirect), "Temporary Redirect")
-	testing.expect_value(t, status_text(.Length_Required), "Length Required")
-	testing.expect_value(t, status_text(.Header_Too_Large), "Request Header Fields Too Large")
-	testing.expect_value(t, status_text(Status(599)), "Unknown")
+	testing.expect_value(t, http.status_text(.OK), "OK")
+	testing.expect_value(t, http.status_text(.See_Other), "See Other")
+	testing.expect_value(t, http.status_text(.Temporary_Redirect), "Temporary Redirect")
+	testing.expect_value(t, http.status_text(.Length_Required), "Length Required")
+	testing.expect_value(t, http.status_text(.Header_Too_Large), "Request Header Fields Too Large")
+	testing.expect_value(t, http.status_text(http.Status(599)), "Unknown")
 }
 
 /*

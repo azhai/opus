@@ -31,6 +31,9 @@ import "core:strings"
 import "core:time"
 
 import "../web"
+import "../buffer"
+import "../codecs"
+import "../multipart"
 
 // ---------------------------------------------------------------------------
 // measurement primitives
@@ -296,7 +299,7 @@ router_body :: proc(ctx: rawptr) {
 
 Response_Ctx :: struct {
 	res:   web.Response,
-	out:   web.Buf,
+	out:   buffer.Buf,
 	bump:  Bump,
 	alloc: mem.Allocator,
 	body:  []byte,
@@ -305,7 +308,7 @@ Response_Ctx :: struct {
 response_body :: proc(ctx: rawptr) {
 	c := cast(^Response_Ctx) ctx
 	bump_reset(&c.bump)
-	web.buf_reset(&c.out)
+	buffer.buf_reset(&c.out)
 	c.res = {}
 	web.response_init(&c.res, nil, c.alloc)
 	web.response_set_header(&c.res, "Content-Type", "application/json")
@@ -324,7 +327,7 @@ Compress_Ctx :: struct {
 compress_body :: proc(ctx: rawptr) {
 	c := cast(^Compress_Ctx) ctx
 	bump_reset(&c.bump)
-	out := web.gzip_compress(c.src, c.alloc)
+	out := codecs.gzip_compress(c.src, c.alloc)
 	c.out += len(out)
 }
 
@@ -336,21 +339,21 @@ Multipart_Ctx :: struct {
 }
 
 multipart_body_of :: proc(payload_len: int, alloc: mem.Allocator) -> []byte {
-	b: web.Buf
-	web.buf_init(&b, alloc)
-	web.buf_append_string(&b, "--XyZ\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello world\r\n")
-	web.buf_append_string(&b, "--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n")
-	web.buf_append_string(&b, "Content-Type: application/octet-stream\r\n\r\n")
+	b: buffer.Buf
+	buffer.buf_init(&b, alloc)
+	buffer.buf_append_string(&b, "--XyZ\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello world\r\n")
+	buffer.buf_append_string(&b, "--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n")
+	buffer.buf_append_string(&b, "Content-Type: application/octet-stream\r\n\r\n")
 	data := make([]byte, payload_len, alloc)
 	for i in 0 ..< payload_len {
 		data[i] = byte((i * 37 + 11) & 0xff)
 	}
-	web.buf_append(&b, data)
-	web.buf_append_string(&b, "\r\n--XyZ--\r\n")
-	return web.buf_slice(&b)
+	buffer.buf_append(&b, data)
+	buffer.buf_append_string(&b, "\r\n--XyZ--\r\n")
+	return buffer.buf_slice(&b)
 }
 
-mp_count :: proc(ud: rawptr, part: ^web.Stream_Part, chunk: []byte) -> bool {
+mp_count :: proc(ud: rawptr, part: ^multipart.Stream_Part, chunk: []byte) -> bool {
 	c := cast(^Multipart_Ctx) ud
 	c.n += len(chunk)
 	return true
@@ -360,13 +363,13 @@ multipart_body :: proc(ctx: rawptr) {
 	c := cast(^Multipart_Ctx) ctx
 	bump_reset(&c.bump)
 	c.n = 0
-	ms: web.Multipart_Stream
-	if !web.multipart_stream_init(&ms, "XyZ", c.alloc, {}, {on_data = mp_count, ud = c}) {
+	ms: multipart.Multipart_Stream
+	if !multipart.multipart_stream_init(&ms, "XyZ", c.alloc, {}, {on_data = mp_count, ud = c}) {
 		return
 	}
-	defer web.multipart_stream_destroy(&ms)
-	web.multipart_stream_feed(&ms, c.body)
-	web.multipart_stream_finish(&ms)
+	defer multipart.multipart_stream_destroy(&ms)
+	multipart.multipart_stream_feed(&ms, c.body)
+	multipart.multipart_stream_finish(&ms)
 }
 
 micro :: proc() {
@@ -430,7 +433,7 @@ micro_response :: proc() {
 	c := Response_Ctx {
 		body = json_payload(40), // ~4 KiB
 	}
-	web.buf_init(&c.out, context.allocator)
+	buffer.buf_init(&c.out, context.allocator)
 	bump(&c.bump, 256 << 10)
 	c.alloc = bump_allocator(&c.bump)
 	b := Bench{name = "response_build (4 KiB JSON + Date)"}
@@ -448,7 +451,7 @@ micro_compress :: proc() {
 	b := Bench{name = "gzip_compress (64 KiB JSON)"}
 	bench_run(&b, compress_body, &c, 300 * time.Millisecond)
 	bench_report(b, c.bump.allocs, c.bump.bytes)
-	gz := web.gzip_compress(src, c.alloc)
+	gz := codecs.gzip_compress(src, c.alloc)
 	fmt.printf("    ratio %v -> %v bytes (%.1f%%), %.1f MiB/s\n",
 		len(src), len(gz), 100 * f64(len(gz)) / f64(len(src)),
 		f64(len(src)) * f64(b.ops) / f64(b.ns) * 1e9 / (1 << 20))

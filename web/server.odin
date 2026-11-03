@@ -5,6 +5,9 @@ import "core:mem"
 import "core:nbio"
 import "core:net"
 import "core:time"
+import "../buffer"
+import "../codecs"
+import "../http"
 
 // SWEEP_INTERVAL is the maintenance tick period. It doubles as the
 // granularity at which `server_run_until` notices its done flag.
@@ -62,7 +65,7 @@ Server :: struct {
 	// built-in content-coding filter (gzip/deflate via Accept-Encoding),
 	// registered before the chunked filter so bodies are coded first and
 	// framed second
-	compress_filter: Compress_Filter,
+	coding_filter: Coding_Filter,
 
 	// configuration
 	keep_alive:            bool,
@@ -105,7 +108,7 @@ Server :: struct {
 	// date is the cached Date header value, refreshed once per second (see
 	// Date_Cache). Reading it is free; recomputing it once per response was
 	// one allocation and one formatting pass per request.
-	date: Date_Cache,
+	date: http.Date_Cache,
 
 	listen_socket: net.TCP_Socket,
 	listening:     bool,
@@ -134,7 +137,7 @@ server_init :: proc(s: ^Server, address := "0.0.0.0:8080", allocator := context.
 	s.address = address
 	ep, ok := net.parse_endpoint(address)
 	if !ok {
-		log_error("web: invalid listen address: %q", address)
+		buffer.log_error("web: invalid listen address: %q", address)
 		return false
 	}
 	s.endpoint = ep
@@ -155,12 +158,12 @@ server_init :: proc(s: ^Server, address := "0.0.0.0:8080", allocator := context.
 
 server_destroy :: proc(s: ^Server) {
 	if len(s.conns) > 0 {
-		log_error("web: server_destroy with %v live connection(s)", len(s.conns))
+		buffer.log_error("web: server_destroy with %v live connection(s)", len(s.conns))
 	}
-	if s.compress_filter.scratch != nil {
+	if s.coding_filter.scratch != nil {
 		// the match-finder tables are owned by the server, not by a request
-		deflate_state_destroy(s.compress_filter.scratch)
-		s.compress_filter.scratch = nil
+		codecs.deflate_state_destroy(s.coding_filter.scratch)
+		s.coding_filter.scratch = nil
 	}
 	if s.conns != nil {
 		delete(s.conns)
@@ -173,7 +176,7 @@ server_destroy :: proc(s: ^Server) {
 server_listen :: proc(s: ^Server) -> bool {
 	sock, err := server_open_listener(s)
 	if err != nil {
-		log_error("web: listen on %v failed: %v", s.address, err)
+		buffer.log_error("web: listen on %v failed: %v", s.address, err)
 		return false
 	}
 	s.listen_socket = sock
@@ -192,13 +195,13 @@ server_adopt_listener).
 */
 server_arm_listener :: proc(s: ^Server) -> bool {
 	intrinsics.volatile_store(&s.listening, true)
-	filter_compress_init(&s.compress_filter)
-	filter_add(s, &s.compress_filter.filter)
+	filter_coding_init(&s.coding_filter)
+	filter_add(s, &s.coding_filter.filter)
 	filter_chunked_init(&s.chunked_filter)
 	filter_add(s, &s.chunked_filter.filter)
 	s.accept_op = nbio.accept_poly(s.listen_socket, s, on_accept)
 	s.sweep_op = nbio.timeout_poly(SWEEP_INTERVAL, s, on_sweep)
-	log_info("web: listening on %v", s.address)
+	buffer.log_info("web: listening on %v", s.address)
 	return true
 }
 
@@ -241,17 +244,17 @@ server_open_listener :: proc(s: ^Server) -> (socket: net.TCP_Socket, err: net.Ne
 	if !socket_set_reuse_port(socket) {
 		// without the option a second acceptor cannot share the address,
 		// so refuse instead of binding a listener that will not scale
-		log_error("web: SO_REUSEPORT unavailable on %v", s.address)
+		buffer.log_error("web: SO_REUSEPORT unavailable on %v", s.address)
 		nbio.close(socket)
 		return socket, net.Listen_Error.Unsupported_Socket
 	}
 	if berr := net.bind(socket, s.endpoint); berr != nil {
-		log_error("web: bind %v failed: %v", s.address, berr)
+		buffer.log_error("web: bind %v failed: %v", s.address, berr)
 		nbio.close(socket)
 		return socket, net.Bind_Error.Address_In_Use
 	}
 	if !socket_listen(socket, 512) {
-		log_error("web: listen %v failed", s.address)
+		buffer.log_error("web: listen %v failed", s.address)
 		nbio.close(socket)
 		return socket, net.Listen_Error.Unknown
 	}
@@ -267,12 +270,12 @@ on_accept :: proc(op: ^nbio.Operation, s: ^Server) {
 	s.accept_op = nbio.accept_poly(op.accept.socket, s, on_accept)
 
 	if op.accept.err != nil {
-		log_error("web: accept error: %v", op.accept.err)
+		buffer.log_error("web: accept error: %v", op.accept.err)
 		return
 	}
 	client := op.accept.client
 	if len(s.conns) >= s.max_conns {
-		log_debug("web: connection limit reached, refusing %v", op.accept.client_endpoint)
+		buffer.log_debug("web: connection limit reached, refusing %v", op.accept.client_endpoint)
 		nbio.close(client)
 		return
 	}
@@ -328,7 +331,7 @@ server_should_stop :: proc(s: ^Server) -> bool {
 // server_run serves forever (until the process is stopped).
 server_run :: proc(s: ^Server) -> (err: nbio.General_Error) {
 	if err = nbio.acquire_thread_event_loop(); err != nil {
-		log_error("web: cannot acquire event loop: %v", err)
+		buffer.log_error("web: cannot acquire event loop: %v", err)
 		return
 	}
 	defer nbio.release_thread_event_loop()
@@ -343,7 +346,7 @@ server_run :: proc(s: ^Server) -> (err: nbio.General_Error) {
 // supervised deployments.
 server_run_until :: proc(s: ^Server, done: ^bool) -> (err: nbio.General_Error) {
 	if err = nbio.acquire_thread_event_loop(); err != nil {
-		log_error("web: cannot acquire event loop: %v", err)
+		buffer.log_error("web: cannot acquire event loop: %v", err)
 		return
 	}
 	defer nbio.release_thread_event_loop()
@@ -355,4 +358,25 @@ server_run_until :: proc(s: ^Server, done: ^bool) -> (err: nbio.General_Error) {
 	err = nbio.run_until(done)
 	server_release(s)
 	return err
+}
+
+// server_date returns the Date header value for `now`, reformatting it when
+// the second has changed.
+//
+// The returned string is a view into the cache, so it is only valid until the
+// next call on the same server. That is enough here: the only caller stores it
+// in a response header and serializes that header in the same event-loop turn
+// (response_build), never across a suspension point.
+server_date :: proc(s: ^Server, now: time.Time) -> string {
+	sec := time.time_to_unix(now)
+	if s.date.text == "" || s.date.sec != sec {
+		n := http.http_date_buf(now, s.date.buf[:])
+		if n == 0 {
+			return ""
+		}
+		s.date.length = n
+		s.date.text = string(s.date.buf[:n])
+		s.date.sec = sec
+	}
+	return s.date.text
 }

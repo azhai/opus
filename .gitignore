@@ -15,7 +15,7 @@
 
 # Output of the go coverage tool
 bin/
-web.bin.dSYM/
+*.dSYM/
 *.out
 
 # Stray example binaries built at the repo root, and upload spool dirs

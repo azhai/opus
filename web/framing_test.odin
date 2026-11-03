@@ -16,6 +16,7 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../buffer"
 // ---------------------------------------------------------------------------
 // strict request framing (RFC 7230 section 3.3.3, smuggling defense)
 // ---------------------------------------------------------------------------
@@ -130,7 +131,7 @@ test_integration_strict_framing :: proc(t: ^testing.T) {
 				break
 			}
 			total += r
-			if bytes_contains(buf[:total], "\r\n\r\n") {
+			if buffer.bytes_contains(buf[:total], "\r\n\r\n") {
 				break
 			}
 		}
@@ -156,7 +157,7 @@ test_integration_strict_framing :: proc(t: ^testing.T) {
 			break
 		}
 		total += r
-		if bytes_contains(buf[:total], "hello") {
+		if buffer.bytes_contains(buf[:total], "hello") {
 			break
 		}
 	}
