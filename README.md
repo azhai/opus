@@ -217,12 +217,30 @@ curl -s -b /tmp/t -d "code=$CODE" localhost:8093/totp                    # 302 -
 # 多 acceptor 线程（4 线程跑 10 秒，退出时打印每线程请求数）
 odin run examples/threads
 odin run examples/threads -- 8 127.0.0.1:8099 10
+
+# 高可用：同一个进程里 opus 只管服务，tina 督程负责提前失败
+# tina 是外部 checkout，用 -collection 指进来；只在 Linux/BSD 上跑得起来
+odin run examples/ha -collection:tina=/path/to/tina -- 127.0.0.1:8097
+curl -s --noproxy '*' -D- -o/dev/null http://127.0.0.1:8097/health   # X-Opus-Served / X-Opus-Seq
+curl -s --noproxy '*' -X POST http://127.0.0.1:8097/admin/rot        # 让账本自相矛盾
+#   矛盾 -> Sentinel 就地 crash -> 重启 2 次 -> 预算耗尽 -> 分片隔离，opus 照常服务
+curl -s --noproxy '*' http://127.0.0.1:8097/                         # 仍在响应
+curl -s --noproxy '*' -X POST http://127.0.0.1:8097/admin/heal       # 先修好，再
+kill -USR2 <pid>                                                     # 唤醒被隔离的分片
 ```
 
 > 本机 8080 若被其他服务占用，改 `server_init` 里的地址；curl 走代理时加  
 > `--noproxy '*'`。macOS 接受 `SO_REUSEPORT` 但会把所有新连接交给最后 bind 的  
 > listener，多 acceptor 的负载分散只在 Linux/BSD 上成立（`tests` 也只在 Linux  
 > 断言分发）。
+
+> `examples/ha` 是全仓库唯一的外部依赖示例：它要 tina（督程）的源码目录，  
+> 库本身和其余示例仍然零依赖。它只在 Linux/BSD 上跑得起来——dev-2026-10 在  
+> macOS 上编译 `tina_start` 会撞上 Odin 后端断言（`core:sys/info` 的 darwin  
+> 分支走到 Objective-C），tina 自己的示例同样如此；`kill -USR2` 复活分片在  
+> darwin 上会变成杀进程。本机验证到 Linux amd64/arm64 全量代码生成通过  
+> （`-target:linux_* -build-mode:obj`），故障注入流程在 macOS 上实测过：探测、  
+> 就地 crash、预算耗尽、隔离期间照常服务。
 
 ## 性能
 
