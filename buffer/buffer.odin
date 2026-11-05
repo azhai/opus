@@ -41,6 +41,27 @@ buf_reset :: proc(b: ^Buf) {
 }
 
 /*
+buf_trim releases the capacity a buffer grew into.
+
+A dynamic array only ever grows, so a keep-alive connection that served one
+large response (or received one large body) holds that capacity until it
+closes: 200 viewers of a 1 MiB body pin ~200 MiB of idle buffers, and the
+memory is never reused because the next request is small again. Call this at
+the request boundary with a `keep` threshold: buffers below it keep their
+capacity for the next request, outliers start over.
+
+Does nothing while the buffer holds bytes - the caller's data is never
+dropped, so a partially consumed buffer is safe to pass.
+*/
+buf_trim :: proc(b: ^Buf, keep: int, allocator: mem.Allocator) {
+	if len(b.data) != 0 || cap(b.data) <= keep {
+		return
+	}
+	delete(b.data)
+	b.data = make([dynamic]byte, allocator)
+}
+
+/*
 buf_append appends `data`, growing the buffer by one resize.
 
 `append(&b.data, ..data)` goes through the variadic element appender, which

@@ -107,3 +107,44 @@ test_bytes_index_long_needle :: proc(t: ^testing.T) {
 	// absent: the whole buffer is scanned and nothing is found
 	testing.expect_value(t, bytes_index(hay[:len(hay) - 400], sep), -1)
 }
+
+/*
+test_buf_trim: a keep-alive connection reuses its buffers, but the one that
+served a 1 MiB response must not pin that megabyte for the rest of its life.
+`keep` is the line between "reuse next time" and "hand it back"; a buffer that
+still holds unread bytes is never touched, because the caller's data lives
+there.
+*/
+@(test)
+test_buf_trim :: proc(t: ^testing.T) {
+	alloc := context.allocator
+	b: Buf
+	buf_init(&b, alloc)
+	defer buf_destroy(&b)
+
+	// below the threshold: capacity is kept for the next request
+	small := make([]byte, 4 << 10, alloc)
+	defer delete(small)
+	buf_append(&b, small)
+	kept := cap(b.data)
+	buf_reset(&b)
+	buf_trim(&b, 64 << 10, alloc)
+	testing.expect_value(t, cap(b.data), kept)
+
+	// above it: the capacity goes back and the buffer starts empty
+	big := make([]byte, 1 << 20, alloc)
+	defer delete(big)
+	buf_append(&b, big)
+	testing.expect(t, cap(b.data) > 64 << 10, "buffer should have grown")
+	buf_reset(&b)
+	testing.expect_value(t, len(b.data), 0)
+	buf_trim(&b, 64 << 10, alloc)
+	testing.expect_value(t, cap(b.data), 0)
+	testing.expect_value(t, len(b.data), 0)
+
+	// a buffer that still holds bytes is left alone, whatever its capacity
+	buf_append(&b, big)
+	buf_trim(&b, 64 << 10, alloc)
+	testing.expect_value(t, len(b.data), 1 << 20)
+	testing.expect(t, cap(b.data) >= 1 << 20, "unread bytes must not be dropped")
+}

@@ -11,6 +11,19 @@ import "../http"
 RECV_BUF_SIZE :: 16 << 10
 
 /*
+BUF_KEEP_CAP is how much buffer capacity a connection keeps between requests.
+
+inbuf/out/body_buf grow to whatever the largest request or response needed and
+a dynamic array never shrinks, so without a cap one 1 MiB response leaves 1 MiB
+resident per connection for as long as the client keeps the socket open - the
+next request on that connection is usually a few KiB again. Buffers up to this
+size keep their capacity (reused by the next request, no reallocation);
+anything larger is handed back at the request boundary. Trimming happens only
+when a buffer is empty, so buffered pipelined data is never dropped.
+*/
+BUF_KEEP_CAP :: 64 << 10
+
+/*
 Conn_State is the connection-level state machine (lighttpd2's outer state
 machine). One TCP connection walks it once per pipelined request:
 
@@ -1086,10 +1099,19 @@ conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 		// rewinding the arena would hand their bytes to the next request.
 		mem.dynamic_arena_reset(&c.scratch)
 		buffer.buf_reset(&c.out)
+		buffer.buf_trim(&c.out, BUF_KEEP_CAP, c.server.allocator)
+		// inbuf is not reset here: it may already hold the next pipelined
+		// request. buf_trim only acts on an empty buffer, so this hands back
+		// the capacity a large body or pipeline batch left behind without
+		// touching bytes the parser still owns.
+		buffer.buf_trim(&c.inbuf, BUF_KEEP_CAP, c.server.allocator)
 	}
 	buffer.buf_reset(&c.body_buf)
+	buffer.buf_trim(&c.body_buf, BUF_KEEP_CAP, c.server.allocator)
 	buffer.buf_reset(&c.proxy_req)
+	buffer.buf_trim(&c.proxy_req, BUF_KEEP_CAP, c.server.allocator)
 	buffer.buf_reset(&c.proxy_buf)
+	buffer.buf_trim(&c.proxy_buf, BUF_KEEP_CAP, c.server.allocator)
 	c.req = {}
 	c.res = {}
 	c.body_remaining = 0
