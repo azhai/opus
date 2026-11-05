@@ -4,6 +4,7 @@ package web
 // socket so the rules can be read as rules (see conn_batch_next).
 
 import "core:testing"
+import "core:mem"
 import "../buffer"
 
 /*
@@ -106,4 +107,32 @@ test_conn_request_reset_trims_buffers :: proc(t: ^testing.T) {
 	buffer.buf_append_string(&c.inbuf, pipelined)
 	conn_request_reset(&c)
 	testing.expect_value(t, len(c.inbuf.data), len(pipelined))
+}
+
+/*
+test_conn_request_reset_trims_scratch: the scratch arena never shrinks, and
+reset only parks blocks in the unused list. A request that allocates a few
+hundred small objects therefore pins every block it cycled for as long as the
+connection lives; the reset keeps one spare and releases the rest.
+*/
+@(test)
+test_conn_request_reset_trims_scratch :: proc(t: ^testing.T) {
+	srv: Server
+	srv.allocator = context.allocator
+	c: Conn
+	c.server = &srv
+	mem.dynamic_arena_init(&c.scratch, context.allocator)
+	defer mem.dynamic_arena_destroy(&c.scratch)
+
+	// 6 KiB each stays under the out-band threshold, so these fill blocks
+	// instead of getting one allocation apiece
+	for _ in 0 ..< 200 {
+		_, err := mem.dynamic_arena_alloc(&c.scratch, 6 << 10)
+		testing.expect_value(t, err, mem.Allocator_Error.None)
+	}
+	testing.expect(t, len(c.scratch.used_blocks) > SCRATCH_KEEP_BLOCKS, "arena should have cycled blocks")
+
+	conn_request_reset(&c)
+	testing.expect(t, len(c.scratch.unused_blocks) <= SCRATCH_KEEP_BLOCKS, "surplus blocks should be released")
+	testing.expect_value(t, len(c.scratch.used_blocks), 0)
 }

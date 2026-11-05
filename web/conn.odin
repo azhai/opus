@@ -23,6 +23,11 @@ when a buffer is empty, so buffered pipelined data is never dropped.
 */
 BUF_KEEP_CAP :: 64 << 10
 
+// SCRATCH_KEEP_BLOCKS is how many arena blocks a connection keeps between
+// requests. One covers the next request without a reallocation; anything above
+// that is a leftover from a heavier one (see conn_request_reset).
+SCRATCH_KEEP_BLOCKS :: 1
+
 /*
 Conn_State is the connection-level state machine (lighttpd2's outer state
 machine). One TCP connection walks it once per pipelined request:
@@ -1098,6 +1103,15 @@ conn_request_reset :: proc(c: ^Conn, keep_output := false) {
 		// still accumulating: the buffered responses live in arena memory, and
 		// rewinding the arena would hand their bytes to the next request.
 		mem.dynamic_arena_reset(&c.scratch)
+		// Reset parks every block the request cycled in unused_blocks, where
+		// they stay for the life of the connection: a response that churned a
+		// few hundred small allocations leaves megabytes pinned per keep-alive
+		// client, and the next request needs one block. Keep a spare and hand
+		// the rest back.
+		for len(c.scratch.unused_blocks) > SCRATCH_KEEP_BLOCKS {
+			block := pop(&c.scratch.unused_blocks)
+			free(block, c.scratch.block_allocator)
+		}
 		buffer.buf_reset(&c.out)
 		buffer.buf_trim(&c.out, BUF_KEEP_CAP, c.server.allocator)
 		// inbuf is not reset here: it may already hold the next pipelined
